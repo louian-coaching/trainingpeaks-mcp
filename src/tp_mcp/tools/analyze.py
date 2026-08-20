@@ -28,6 +28,7 @@ gracefully to empty on a 404 (some entries — e.g. manually logged, no device
 file — legitimately lack per-second/lap data while still having totals).
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -51,6 +52,19 @@ ANALYSIS_DATA_DIR = Path(tempfile.gettempdir()) / "tp-mcp" / "analysis"
 _SUMMARY_PATH = "/workout-analysis/v2/analyze/summary"
 _CHARTS_PATH = "/workout-analysis/v2/analyze/charts"
 _LAPS_PATH = "/workout-analysis/v2/analyze/laps"
+
+# The charts endpoint caps a full-span response at ~1000 points. For longer
+# workouts that response is a shape-preserving visual downsample that is
+# NOT energy-preserving: on a 90-min ride it under-reports work by ~30% and
+# badly skews NP/VI computed from the saved time-series (verified live
+# 2026-08-20: full-span gave 915 pts / 567 kJ vs the workout's true 807 kJ).
+# Windowed requests (start/stopOffsetSeconds spans <= ~1000s) return true
+# 1s-resolution data, so when the full-span response comes back coarse we
+# refetch it in windows and stitch.
+_CHARTS_WINDOW_SECONDS = 900
+_CHARTS_MAX_WINDOWS = 48  # 12 hours; beyond that keep the downsample
+_CHARTS_COARSE_DT = 1.5  # avg sample spacing (s) that flags downsampling
+_CHARTS_MIN_SPAN_FOR_REFETCH = 120
 
 
 def _save_analysis_json(
@@ -144,6 +158,141 @@ async def _post_analysis(
             "error_code": "API_ERROR",
             "message": "Failed to parse analysis response.",
         }
+
+
+# FORK 2026-10-29: counters that must stay monotonic across windows. If a window
+# restarts them (value drops vs. the previous window's last value), shift the whole
+# window so AccumulatedPower deltas (lo_verify / split_km) and Distance stay valid.
+_CUMULATIVE_CHANNELS = ("AccumulatedPower", "Distance")
+
+
+def _window_offsets(prev: dict[str, float], rows: list[dict[str, Any]]) -> dict[str, float]:
+    offsets: dict[str, float] = {}
+    for key in _CUMULATIVE_CHANNELS:
+        if key not in prev:
+            continue
+        first = next((r[key] for r in rows if isinstance(r.get(key), (int, float))), None)
+        if first is not None and first < prev[key] - 1e-6:
+            offsets[key] = prev[key] - first
+    return offsets
+
+
+def _stitch_windows(windows: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Merge windowed chart rows, deduping boundary samples by time."""
+    merged: list[dict[str, Any]] = []
+    last_time: float | None = None
+    last_cum: dict[str, float] = {}
+    for rows in windows:
+        offsets = _window_offsets(last_cum, rows)
+        for row in rows:
+            if offsets:
+                row = {**row, **{k: row[k] + off for k, off in offsets.items()
+                                 if isinstance(row.get(k), (int, float))}}
+            for key in _CUMULATIVE_CHANNELS:
+                if isinstance(row.get(key), (int, float)):
+                    last_cum[key] = row[key]
+            t = row.get("time")
+            if last_time is not None and t is not None and t <= last_time:
+                continue
+            merged.append(row)
+            if t is not None:
+                last_time = t
+    return merged
+
+
+async def _refetch_full_resolution(
+    http_client: httpx.AsyncClient,
+    headers: dict[str, str],
+    workout_id: int,
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Refetch chart data in windows when the full-span response is coarse.
+
+    Returns the stitched full-resolution rows, or the original rows when they
+    are already fine-grained, the span is trivial, the workout is too long,
+    or any window request fails (never worse than the downsample).
+    """
+    times = [r.get("time") for r in rows if r.get("time") is not None]
+    if len(times) < 2:
+        return rows
+    span = times[-1] - times[0]
+    if span < _CHARTS_MIN_SPAN_FOR_REFETCH:
+        return rows
+    if span / (len(times) - 1) <= _CHARTS_COARSE_DT:
+        return rows
+    if span / _CHARTS_WINDOW_SECONDS > _CHARTS_MAX_WINDOWS:
+        logger.warning(
+            "workout %s: span %ss too long for windowed refetch; keeping downsample",
+            workout_id,
+            span,
+        )
+        return rows
+
+    windows: list[list[dict[str, Any]]] = []
+    start, stop = int(times[0]), int(times[-1])
+    for window_start in range(start, stop + 1, _CHARTS_WINDOW_SECONDS):
+        window_stop = min(window_start + _CHARTS_WINDOW_SECONDS, stop)
+        try:
+            # FORK 2026-10-29: one retry per window on transient failure (429/5xx/network)
+            response = None
+            for attempt in range(2):
+                try:
+                    response = await http_client.post(
+                        f"{ANALYSIS_API_BASE}{_CHARTS_PATH}",
+                        headers=headers,
+                        json={
+                            "workoutId": workout_id,
+                            "startOffsetSeconds": window_start,
+                            "stopOffsetSeconds": window_stop,
+                        },
+                    )
+                except httpx.RequestError:
+                    if attempt == 0:
+                        await asyncio.sleep(1.0)
+                        continue
+                    raise
+                if response.status_code in (429, 502, 503, 504) and attempt == 0:
+                    await asyncio.sleep(1.0)
+                    continue
+                break
+        except httpx.RequestError:
+            logger.warning(
+                "workout %s: charts window %s-%ss errored; keeping downsample",
+                workout_id,
+                window_start,
+                window_stop,
+            )
+            return rows
+        if response.status_code != 200:
+            logger.warning(
+                "workout %s: charts window %s-%ss failed (HTTP %s); keeping downsample",
+                workout_id,
+                window_start,
+                window_stop,
+                response.status_code,
+            )
+            return rows
+        try:
+            window_rows = (response.json() or {}).get("data") or []
+        except Exception:
+            logger.warning(
+                "workout %s: charts window %s-%ss returned bad JSON; keeping downsample",
+                workout_id,
+                window_start,
+                window_stop,
+            )
+            return rows
+        windows.append(window_rows)
+    return _stitch_windows(windows)
+
+
+def _avg_dt(rows: list[Any]) -> float | None:
+    """Average seconds between time-series samples (None if < 2 timed points)."""
+    ts = [r.get("time") for r in rows or [] if isinstance(r, dict)
+          and isinstance(r.get("time"), (int, float))]
+    if len(ts) < 2 or ts[-1] <= ts[0]:
+        return None
+    return round((ts[-1] - ts[0]) / (len(ts) - 1), 2)
 
 
 def _stop_timestamp(start_iso: str | None, elapsed_seconds: Any) -> str | None:
@@ -353,6 +502,7 @@ def _compact(full: dict[str, Any]) -> dict[str, Any]:
         "lap_units": "sec=timer seconds, pace_s/ngp_s=seconds per km, km=distance",
         "single_lap": full.get("single_lap"),
         "time_series_points": full.get("time_series_points"),
+        "time_series_avg_dt": full.get("time_series_avg_dt"),
         **({"splits": full["splits"], "split_units": full.get("split_units")} if full.get("splits") else {}),
         "data_file": full.get("data_file"),
         "detail": "compact (pass detail='full' for zones, all lap columns and channel metadata)",
@@ -435,6 +585,12 @@ async def tp_analyze_workout(workout_id: str, save_to: str | None = None, detail
                 else:
                     return charts_err
 
+            charts_rows = (charts or {}).get("data") or []
+            if charts_rows:
+                charts_rows = await _refetch_full_resolution(
+                    http_client, headers, wid, charts_rows
+                )
+
             laps, laps_err = await _post_analysis(http_client, _LAPS_PATH, headers, wid)
             if laps_err:
                 if laps_err.get("error_code") == "NOT_FOUND":
@@ -471,7 +627,8 @@ async def tp_analyze_workout(workout_id: str, save_to: str | None = None, detail
         for ident, meta in charts_metadata.items()
         if isinstance(meta, dict)
     ]
-    time_series = (charts or {}).get("data") or []
+    # FORK 2026-10-29: upstream PR #165 (windowed full-resolution refetch) + Stryd alias
+    time_series = charts_rows if charts else []
     _alias_developer_power(data_elements, time_series)
 
     lap_column_meta = (laps or {}).get("columnMetadata") or {}
@@ -538,6 +695,8 @@ async def tp_analyze_workout(workout_id: str, save_to: str | None = None, detail
         # to be reconstructed from the prescription (lo_verify_intervals).
         "single_lap": len(analysis.lap_data) <= 1,
         "time_series_points": len(analysis.data),
+        # FORK 2026-10-29: ~1.0 = full 1 s data (PR #165 refetch worked); >1.5 = downsampled
+        "time_series_avg_dt": _avg_dt(analysis.data),
         "data_file": data_file,
     }
     # FORK (2026/10/16): multisport child files keep the whole-race odometer (an IM run
