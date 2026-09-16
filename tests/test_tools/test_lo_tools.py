@@ -208,6 +208,31 @@ class TestUpdateVerified:
         assert r["verified"]["duration_minutes"]["ok"] is True
 
     @pytest.mark.asyncio
+    async def test_description_echo_is_compact_when_ok_and_truncated_when_not(self):
+        fake = FakeTP(_detail())
+        with _wire(fake):
+            r = await lo_update_workout_verified("1001", description="x" * 1000)
+        assert r["verified"]["description"] == {"sent_len": 1000, "landed_len": 1000, "ok": True}
+        fake = FakeTP(_detail(description="old"), stuck={"description"})
+        with _wire(fake):
+            r = await lo_update_workout_verified("1001", description="y" * 1000)
+        d = r["verified"]["description"]
+        assert d["ok"] is False and len(d["sent"]) == 400 and d["landed"] == "old"
+
+    @pytest.mark.asyncio
+    async def test_structure_fingerprint_catches_class_and_cadence_edits(self):
+        base = copy.deepcopy(_SW)
+        base["structure"][0]["steps"][0]["intensityClass"] = "rest"
+        fake = FakeTP(_detail(structured_workout=base), stuck={"structured_workout"})
+        edited = copy.deepcopy(_SW)
+        edited["structure"][0]["steps"][0]["intensityClass"] = "warmUp"
+        with _wire(fake):
+            r = await lo_update_workout_verified("1001", structured_workout=edited)
+        assert r["success"] is False
+        assert r["verified"]["structured_workout"]["sent"]["classes"] == "w?"
+        assert r["verified"]["structured_workout"]["landed"]["classes"] == "r?"
+
+    @pytest.mark.asyncio
     async def test_sport_drift_without_sending_sport_is_caught(self):
         """TECH-16: description-only update flipped Race -> Run."""
         fake = FakeTP(_detail(sport="Race"), drift_sport="Run")

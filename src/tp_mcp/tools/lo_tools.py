@@ -106,11 +106,20 @@ def _structure_fingerprint(sw: Any) -> dict[str, Any] | None:
     steps = sw.get("structure") or []
     poly = sw.get("polyline") or []
     first_begin = last_end = None
+    classes: list[str] = []
+    cadence_targets = 0
     if isinstance(steps, list) and steps:
         if isinstance(steps[0], dict):
             first_begin = steps[0].get("begin")
         if isinstance(steps[-1], dict):
             last_end = steps[-1].get("end")
+        for blk in steps:
+            for st in (blk.get("steps") or []) if isinstance(blk, dict) else []:
+                if isinstance(st, dict):
+                    classes.append(str(st.get("intensityClass") or "?")[:1])
+                    for t in st.get("targets") or []:
+                        if isinstance(t, dict) and t.get("unit") == "roundOrStridePerMinute":
+                            cadence_targets += 1
     return {
         "primaryLengthMetric": sw.get("primaryLengthMetric"),
         "primaryIntensityMetric": sw.get("primaryIntensityMetric"),
@@ -118,6 +127,9 @@ def _structure_fingerprint(sw: Any) -> dict[str, Any] | None:
         "begin": first_begin,
         "end": last_end,
         "polyline_points": len(poly) if isinstance(poly, list) else 0,
+        # w/a/r/c per inner step in order — catches class edits (e.g. rest -> warmUp)
+        "classes": "".join(classes),
+        "cadence_targets": cadence_targets,
     }
 
 
@@ -201,6 +213,17 @@ def _verify(sent: dict[str, Any], detail: dict[str, Any]) -> tuple[dict[str, Any
             continue
         landed = _landed_value(field, detail)
         ok = _compare(field, value, landed)
+        if field == "description" and ok:
+            report[field] = {"sent_len": len(value or ""), "landed_len": len(landed or ""), "ok": True}
+            continue
+        if field == "description" and not ok:
+            report[field] = {
+                "sent": (value or "")[:400], "landed": (landed or "")[:400],
+                "sent_len": len(value or ""), "landed_len": len(landed or ""), "ok": False,
+                "note": "truncated to 400 chars",
+            }
+            bad.append(field)
+            continue
         if field == "structured_workout":
             shown_sent: Any = _structure_fingerprint(value)
         elif field == "structure":
