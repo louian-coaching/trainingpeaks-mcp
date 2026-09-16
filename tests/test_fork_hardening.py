@@ -243,3 +243,56 @@ class TestEstimatedTssRefused:
             )
         assert result["success"] is True
         assert "tssPlanned" not in inst.post.call_args[1]["json"]
+
+
+# ---------------------------------------------------------------------------
+# 5. tp_create_workouts_batch accepts payload_file (tp_build.py --week output)
+# ---------------------------------------------------------------------------
+
+
+class TestBatchPayloadFile:
+    @pytest.mark.asyncio
+    async def test_payload_file_is_merged_under_explicit_args(self, tmp_path):
+        from unittest.mock import AsyncMock, patch
+
+        from tp_mcp import server
+
+        payload = {
+            "athlete": "123",
+            "expect_athlete_name": "Someone",
+            "workouts": [{"date": "2026-09-21", "sport": "Bike", "title": "T", "duration_minutes": 60}],
+            "dry_run": False,
+            "readback_save_to": "/tmp/x.json",
+        }
+        f = tmp_path / "payload.json"
+        f.write_text(json.dumps(payload), encoding="utf-8")
+
+        spy = AsyncMock(return_value={"success": True})
+        with patch.object(server, "tp_create_workouts_batch", spy):
+            out = await server.call_tool(
+                "tp_create_workouts_batch", {"payload_file": str(f), "dry_run": True}
+            )
+        assert json.loads(out[0].text) == {"success": True}
+        kw = spy.call_args.kwargs
+        assert kw["workouts"] == payload["workouts"]
+        assert kw["expect_athlete_name"] == "Someone"
+        assert kw["dry_run"] is True  # explicit arg wins over file
+        assert kw["readback_save_to"] == "/tmp/x.json"
+
+    @pytest.mark.asyncio
+    async def test_missing_workouts_and_file_is_invalid(self):
+        from tp_mcp.server import call_tool
+
+        out = await call_tool("tp_create_workouts_batch", {"dry_run": True})
+        payload = json.loads(out[0].text)
+        assert payload["isError"] is True
+        assert payload["error_code"] == "INVALID_ARGS"
+
+    @pytest.mark.asyncio
+    async def test_unreadable_payload_file(self):
+        from tp_mcp.server import call_tool
+
+        out = await call_tool("tp_create_workouts_batch", {"payload_file": "/nonexistent/x.json"})
+        payload = json.loads(out[0].text)
+        assert payload["error_code"] == "INVALID_ARGS"
+        assert "unreadable" in payload["message"]

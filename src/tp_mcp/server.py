@@ -340,8 +340,19 @@ TOOLS = [
                         "keeping a full week of polylines out of context."
                     ),
                 },
+                "payload_file": {
+                    "type": "string",
+                    "description": (
+                        "FORK: absolute path to a JSON file produced by "
+                        "`tp_build.py --week` (keys: workouts, expect_athlete_name, "
+                        "dry_run, on_error, skip_if_exists, readback, readback_save_to). "
+                        "Values from the file are used unless the same argument is "
+                        "passed explicitly. Lets a whole week (polylines included) "
+                        "stay out of the model context."
+                    ),
+                },
             },
-            "required": ["workouts"],
+            "required": [],
         },
     ),
     Tool(
@@ -1806,6 +1817,23 @@ async def _h_create_workout(args):
 # LOCAL PATCH (羅教練 2026/08/21): batch create
 @_handler("tp_create_workouts_batch")
 async def _h_create_workouts_batch(args):
+    # FORK: payload_file — merge file values under explicit args
+    if args.get("payload_file"):
+        try:
+            with open(args["payload_file"], encoding="utf-8") as fh:
+                file_args = json.load(fh)
+        except (OSError, ValueError) as e:
+            return {"isError": True, "error_code": "INVALID_ARGS",
+                    "message": f"payload_file unreadable: {e}"}
+        if not isinstance(file_args, dict):
+            return {"isError": True, "error_code": "INVALID_ARGS",
+                    "message": "payload_file must contain a JSON object"}
+        file_args.pop("athlete", None)  # athlete is dispatch-level (already applied)
+        merged = {**file_args, **{k: v for k, v in args.items() if k != "payload_file"}}
+        args = merged
+    if "workouts" not in args:
+        return {"isError": True, "error_code": "INVALID_ARGS",
+                "message": "workouts (or payload_file containing workouts) is required"}
     return await tp_create_workouts_batch(
         workouts=args["workouts"],
         expect_athlete_name=args.get("expect_athlete_name"),
