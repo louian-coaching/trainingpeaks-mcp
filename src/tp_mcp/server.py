@@ -2240,7 +2240,14 @@ async def call_tool(name: str, arguments: dict[str, Any] | None = None) -> list[
             args["athlete"] = _file_athlete
     athlete_target = args.pop("athlete", None)
     # LOCAL PATCH: save_to — dump-to-file mode (see _dump_and_summarize)
-    save_to = args.pop("save_to", None)
+    # FORK 2026-09-16: a tool that declares its own `save_to` (lo_get_week_for_validate)
+    # keeps it; popping it here made that tool fail its own required-arg check.
+    _own_save_to = (
+        name not in _SAVE_TO_TOOLS
+        and "save_to" in (_TOOLS_BY_NAME.get(name).input_schema.get("properties", {})
+                          if _TOOLS_BY_NAME.get(name) else {})
+    )
+    save_to = None if _own_save_to else args.pop("save_to", None)
     token = athlete_override.set(athlete_target)
     try:
         handler = _TOOL_HANDLERS.get(name)

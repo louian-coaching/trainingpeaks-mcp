@@ -493,6 +493,8 @@ async def lo_update_workouts_batch(
     on_error: str = "stop",
     verbose: bool = False,
     readback_save_to: str | None = None,
+    readback_week_start: str | None = None,
+    readback_week_end: str | None = None,
 ) -> dict[str, Any]:
     """Run lo_update_workout_verified over a list; one round-trip instead of N.
 
@@ -543,11 +545,29 @@ async def lo_update_workouts_batch(
         "results": rows,
     }
     if readback_save_to:
-        try:
-            _write_json(readback_save_to, {"workouts": readback})
-            out["readback_json_path"] = readback_save_to
-        except OSError as e:
-            out["warnings"] = [f"readback_save_to failed: {e}"]
+        if readback_week_start and readback_week_end:
+            # Whole-week read-back (feedback #2): week-level rules (R6/R14/R45...) see
+            # only the edited rows otherwise and produce false FAILs.
+            week = await lo_get_week_for_validate(
+                start_date=readback_week_start, end_date=readback_week_end, save_to=readback_save_to,
+            )
+            if isinstance(week, dict) and week.get("isError"):
+                out["warnings"] = [f"whole-week readback failed: {week.get('message')}"]
+            else:
+                out["readback_json_path"] = readback_save_to
+                out["readback_scope"] = "week"
+                out["readback_count"] = week.get("count")
+        else:
+            try:
+                _write_json(readback_save_to, {"workouts": readback})
+                out["readback_json_path"] = readback_save_to
+                out["readback_scope"] = "updated_rows_only"
+                out["readback_note"] = (
+                    "Only the updated workouts are in this file; week-level rules "
+                    "(R6/R14/R45...) need readback_week_start/end or lo_get_week_for_validate."
+                )
+            except OSError as e:
+                out["warnings"] = [f"readback_save_to failed: {e}"]
     if not out["success"]:
         out["isError"] = True
         out["error_code"] = "WRITE_NOT_LANDED"
@@ -728,6 +748,15 @@ def register_lo_tools(tools: list[Any], handlers: dict[str, Any]) -> None:
                     "type": "string",
                     "description": "Absolute path; writes {workouts:[...]} in validate_week.py shape.",
                 },
+                "readback_week_start": {
+                    "type": "string",
+                    "description": (
+                        "YYYY-MM-DD. With readback_week_end, readback_save_to gets the WHOLE week "
+                        "(via lo_get_week_for_validate) instead of only the updated rows — required "
+                        "for week-level rules (R6/R14/R45) to validate correctly."
+                    ),
+                },
+                "readback_week_end": {"type": "string", "description": "YYYY-MM-DD"},
             },
             "required": [],
         },
@@ -773,6 +802,8 @@ def register_lo_tools(tools: list[Any], handlers: dict[str, Any]) -> None:
             on_error=a.get("on_error", "stop"),
             verbose=bool(a.get("verbose", False)),
             readback_save_to=a.get("readback_save_to"),
+            readback_week_start=a.get("readback_week_start"),
+            readback_week_end=a.get("readback_week_end"),
         )
 
     async def _h_get_week(args: dict[str, Any]) -> dict[str, Any]:

@@ -562,3 +562,73 @@ class TestGetWeekForValidate:
         assert "lo_get_week_for_validate" in _TOOL_HANDLERS
         assert _TOOLS_BY_NAME["lo_get_week_for_validate"].annotations.read_only_hint is True
         assert _TOOLS_BY_NAME["lo_update_workouts_batch"].annotations.read_only_hint is False
+
+    @pytest.mark.asyncio
+    async def test_save_to_reaches_handler_through_dispatch(self, tmp_path):
+        """Bug 2026-09-16 (2nd session): dispatch popped save_to for every tool, so this
+        tool's own required `save_to` was reported missing."""
+        import json
+
+        from tp_mcp.server import call_tool
+        from tp_mcp.tools import workouts as wmod
+
+        listed = {"workouts": [{"id": "1", "date": "2026-09-21", "sport": "Swim", "title": "T"}]}
+        out = tmp_path / "w.json"
+        with patch.object(wmod, "tp_get_workouts", AsyncMock(return_value=listed)):
+            res = await call_tool(
+                "lo_get_week_for_validate",
+                {"athlete": "1", "start_date": "2026-09-21", "end_date": "2026-09-27", "save_to": str(out)},
+            )
+        payload = json.loads(res[0].text)
+        assert payload.get("success") is True, payload
+        assert payload["saved_to"] == str(out) and out.exists()
+
+    @pytest.mark.asyncio
+    async def test_generic_save_to_dump_still_works_for_other_tools(self, tmp_path):
+        import json
+
+        from tp_mcp.server import _TOOL_HANDLERS, call_tool
+
+        original = _TOOL_HANDLERS["tp_get_workout"]
+        _TOOL_HANDLERS["tp_get_workout"] = AsyncMock(return_value={"id": "1", "title": "x", "metrics": {}})
+        try:
+            out = tmp_path / "d.json"
+            res = await call_tool("tp_get_workout", {"workout_id": "1", "save_to": str(out)})
+        finally:
+            _TOOL_HANDLERS["tp_get_workout"] = original
+        payload = json.loads(res[0].text)
+        assert payload.get("saved_to") == str(out) and out.exists()
+
+
+class TestUpdateBatchWeekReadback:
+    @pytest.mark.asyncio
+    async def test_whole_week_readback_when_range_given(self, tmp_path):
+        import json
+
+        from tp_mcp.tools import workouts as wmod
+        from tp_mcp.tools.lo_tools import lo_update_workouts_batch
+
+        fake = FakeTP(_detail(id="1", sport="Swim"))
+        listed = {"workouts": [
+            {"id": "1", "date": "2026-09-21", "sport": "Swim", "title": "T"},
+            {"id": "9", "date": "2026-09-23", "sport": "Swim", "title": "團練"},
+        ]}
+        rb = tmp_path / "week.json"
+        with _wire(fake), patch.object(wmod, "tp_get_workouts", AsyncMock(return_value=listed)):
+            r = await lo_update_workouts_batch(
+                [{"workout_id": "1", "title": "A"}], readback_save_to=str(rb),
+                readback_week_start="2026-09-21", readback_week_end="2026-09-27",
+            )
+        assert r["success"] is True and r["readback_scope"] == "week" and r["readback_count"] == 2
+        assert [w["id"] for w in json.loads(rb.read_text(encoding="utf-8"))["workouts"]] == ["1", "9"]
+
+    @pytest.mark.asyncio
+    async def test_rows_only_readback_is_labelled(self, tmp_path):
+        from tp_mcp.tools.lo_tools import lo_update_workouts_batch
+
+        fake = FakeTP(_detail(id="1"))
+        with _wire(fake):
+            r = await lo_update_workouts_batch(
+                [{"workout_id": "1", "title": "A"}], readback_save_to=str(tmp_path / "r.json")
+            )
+        assert r["readback_scope"] == "updated_rows_only" and "R14" in r["readback_note"]
