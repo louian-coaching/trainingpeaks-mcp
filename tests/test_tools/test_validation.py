@@ -116,15 +116,22 @@ class TestCreateWorkoutInput:
         with pytest.raises(ValidationError):
             CreateWorkoutInput(date="2025-06-01", sport="Hockey", title="Test", duration_minutes=60)
 
-    def test_description_too_long(self):
-        with pytest.raises(ValidationError):
-            CreateWorkoutInput(
+    def test_description_long_is_allowed(self):
+        # FORK: create used to cap description at 2000 chars; update never did.
+        # TP itself has no such cap, so the create-side cap was removed.
+        params = CreateWorkoutInput(
                 date="2025-06-01",
                 sport="Run",
                 title="Test",
                 duration_minutes=60,
-                description="x" * 2001,
+                description="x" * 5000,
             )
+        assert len(params.description) == 5000
+
+    def test_duration_float_is_allowed(self):
+        # FORK: create used to require int; update accepts float. Aligned to float.
+        params = CreateWorkoutInput(date="2025-06-01", sport="Run", title="Test", duration_minutes=92.5)
+        assert params.duration_minutes == 92.5
 
     def test_distance_km_valid(self):
         result = CreateWorkoutInput(

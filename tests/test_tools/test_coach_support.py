@@ -353,9 +353,9 @@ class TestCallToolAthleteStripping:
         _TOOL_HANDLERS["tp_auth_status"] = spy
         try:
             from tp_mcp.server import call_tool
-            await call_tool("tp_auth_status", {"athlete": "Charlotte Horton", "extra": "val"})
+            await call_tool("tp_auth_status", {"athlete": "Charlotte Horton"})
             assert "athlete" not in captured_args
-            assert captured_args.get("extra") == "val"
+            assert captured_args == {}
         finally:
             if original:
                 _TOOL_HANDLERS["tp_auth_status"] = original

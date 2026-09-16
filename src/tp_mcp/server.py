@@ -245,7 +245,7 @@ TOOLS = [
                 "sport": {"type": "string", "enum": list(SPORT_TYPE_MAP.keys())},
                 "title": {"type": "string", "description": "Workout title"},
                 "duration_minutes": {
-                    "type": "integer",
+                    "type": "number",
                     "description": "Planned duration in minutes (optional if structure provided)",
                 },
                 "description": {"type": "string", "description": "Optional description"},
@@ -2209,11 +2209,24 @@ async def call_tool(name: str, arguments: dict[str, Any] | None = None) -> list[
             }
         else:
             missing = [k for k in tool.input_schema.get("required", []) if k not in args]
+            # FORK: reject unknown keys instead of silently dropping them
+            # (e.g. `tss` vs `tss_planned` used to return success with no effect).
+            unknown = sorted(set(args) - set(tool.input_schema.get("properties", {})))
             if missing:
                 result = {
                     "isError": True,
                     "error_code": "INVALID_ARGS",
                     "message": f"Missing required argument(s) for {name}: {', '.join(missing)}",
+                }
+            elif unknown:
+                allowed = sorted(tool.input_schema.get("properties", {}))
+                result = {
+                    "isError": True,
+                    "error_code": "INVALID_ARGS",
+                    "message": (
+                        f"Unknown argument(s) for {name}: {', '.join(unknown)}. "
+                        f"Allowed: {', '.join(allowed)}"
+                    ),
                 }
             else:
                 result = await handler(args)

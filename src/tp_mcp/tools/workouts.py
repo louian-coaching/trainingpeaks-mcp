@@ -384,7 +384,7 @@ async def tp_create_workout(
     date_str: str,
     sport: str,
     title: str,
-    duration_minutes: int | None = None,
+    duration_minutes: float | None = None,
     description: str | None = None,
     distance_km: float | None = None,
     tss_planned: float | None = None,

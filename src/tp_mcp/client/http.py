@@ -56,6 +56,7 @@ class ErrorCode(Enum):
     API_ERROR = "API_ERROR"
     NETWORK_ERROR = "NETWORK_ERROR"
     FORBIDDEN_ENDPOINT = "FORBIDDEN_ENDPOINT"
+    UNPARSEABLE_RESPONSE = "UNPARSEABLE_RESPONSE"  # FORK: 2xx with non-JSON body
 
 
 # Hard-blocked endpoints — destructive operations the connector must NEVER issue,
@@ -390,19 +391,24 @@ class TPClient:
         Returns:
             APIResponse with data or error.
         """
-        if response.status_code == 200:
+        if response.status_code in (200, 201):
+            # FORK: an empty body is a legitimate "OK, nothing to return";
+            # a non-empty body that is not JSON (login redirect, WAF/Cloudflare
+            # challenge page) is a failure, not a success.
+            if not response.content or not response.content.strip():
+                return APIResponse(success=True, data=None)
             try:
                 data = response.json()
                 return APIResponse(success=True, data=data)
             except Exception:
-                return APIResponse(success=True, data=None)
-
-        if response.status_code == 201:
-            try:
-                data = response.json()
-                return APIResponse(success=True, data=data)
-            except Exception:
-                return APIResponse(success=True, data=None)
+                return APIResponse(
+                    success=False,
+                    error_code=ErrorCode.UNPARSEABLE_RESPONSE,
+                    message=(
+                        f"HTTP {response.status_code} but body is not JSON "
+                        f"(login redirect or challenge page?): {response.text[:300]!r}"
+                    ),
+                )
 
         if response.status_code == 204:
             return APIResponse(success=True, data=None)
@@ -440,7 +446,7 @@ class TPClient:
         return APIResponse(
             success=False,
             error_code=ErrorCode.API_ERROR,
-            message=f"API error: {response.status_code}",
+            message=f"API error: {response.status_code} - {response.text[:300]}",
         )
 
     async def get(self, endpoint: str, params: dict[str, Any] | None = None) -> APIResponse:
