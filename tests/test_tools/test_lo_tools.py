@@ -204,7 +204,8 @@ class TestUpdateVerified:
         assert r["isError"] is True
         assert r["error_code"] == "WRITE_NOT_LANDED"
         assert r["mismatched"] == ["title", "tss_planned"]
-        assert r["verified"]["title"] == {"sent": "T", "landed": "再试试", "ok": False}
+        t = r["verified"]["title"]
+        assert t["ok"] is False and t["len"] == 1 and t["landed_len"] == 3 and t["diff"]
         assert r["verified"]["duration_minutes"]["ok"] is True
 
     @pytest.mark.asyncio
@@ -212,12 +213,17 @@ class TestUpdateVerified:
         fake = FakeTP(_detail())
         with _wire(fake):
             r = await lo_update_workout_verified("1001", description="x" * 1000)
-        assert r["verified"]["description"] == {"sent_len": 1000, "landed_len": 1000, "ok": True}
-        fake = FakeTP(_detail(description="old"), stuck={"description"})
-        with _wire(fake):
-            r = await lo_update_workout_verified("1001", description="y" * 1000)
         d = r["verified"]["description"]
-        assert d["ok"] is False and len(d["sent"]) == 400 and d["landed"] == "old"
+        assert d["ok"] is True and d["len"] == 1000 and len(d["sha8"]) == 8 and "sent" not in d
+        fake = FakeTP(_detail(description="line1\nold\nline3"), stuck={"description"})
+        with _wire(fake):
+            r = await lo_update_workout_verified("1001", description="line1\nnew\nline3")
+        d = r["verified"]["description"]
+        assert d["ok"] is False and "sent" not in d
+        assert any(ln.startswith("-old") for ln in d["diff"]) and any(ln.startswith("+new") for ln in d["diff"])
+        with _wire(fake):
+            r = await lo_update_workout_verified("1001", description="line1\nnew\nline3", verbose=True)
+        assert r["verified"]["description"]["sent"] == "line1\nnew\nline3"
 
     @pytest.mark.asyncio
     async def test_structure_fingerprint_catches_class_and_cadence_edits(self):
@@ -349,7 +355,7 @@ class TestRegistration:
 
         up = set(_TOOLS_BY_NAME["tp_update_workout"].input_schema["properties"])
         lo = set(_TOOLS_BY_NAME["lo_update_workout_verified"].input_schema["properties"])
-        assert lo == up | {"payload_file"}
+        assert lo == up | {"payload_file", "verbose"}
 
     @pytest.mark.asyncio
     async def test_payload_file_merged_under_explicit_args(self, tmp_path):
@@ -387,3 +393,172 @@ class TestRegistration:
         payload = json.loads(out[0].text)
         assert payload["success"] is True
         assert fake.updates == [{"tss_planned": 88}]
+
+
+# ---------------------------------------------------------------------------
+# lo_update_workouts_batch
+# ---------------------------------------------------------------------------
+
+
+class MultiFake:
+    """Several workouts behind one fake TP (id -> FakeTP)."""
+
+    def __init__(self, fakes):
+        self.fakes = fakes
+
+    async def get(self, workout_id):
+        return await self.fakes[str(workout_id)].get(workout_id)
+
+    async def update(self, workout_id, **kw):
+        return await self.fakes[str(workout_id)].update(workout_id, **kw)
+
+
+def _wire_multi(multi):
+    return patch.multiple(
+        lo_tools,
+        tp_get_workout=AsyncMock(side_effect=multi.get),
+        tp_update_workout=AsyncMock(side_effect=multi.update),
+    )
+
+
+class TestUpdateBatch:
+    @pytest.mark.asyncio
+    async def test_all_rows_verified_and_readback_written(self, tmp_path):
+        import json
+
+        from tp_mcp.tools.lo_tools import lo_update_workouts_batch
+
+        multi = MultiFake({"1": FakeTP(_detail(id="1")), "2": FakeTP(_detail(id="2", sport="Run"))})
+        rb = tmp_path / "rb.json"
+        with _wire_multi(multi):
+            r = await lo_update_workouts_batch(
+                [{"workout_id": "1", "title": "A", "tss_planned": 50},
+                 {"workout_id": "2", "description": "d", "structured_workout": _SW}],
+                readback_save_to=str(rb),
+            )
+        assert r["success"] is True
+        assert r["summary"] == {"total": 2, "verified": 2, "failed": 0, "not_attempted": 0}
+        assert [row["steps"] for row in r["results"]] == [["fields"], ["fields", "structure"]]
+        assert "verified" not in r["results"][0]  # compact rows when ok
+        data = json.loads(rb.read_text(encoding="utf-8"))
+        assert [w["id"] for w in data["workouts"]] == ["1", "2"]
+        assert data["workouts"][1]["structured_workout"]["structure"]
+
+    @pytest.mark.asyncio
+    async def test_stop_on_first_failure(self):
+        from tp_mcp.tools.lo_tools import lo_update_workouts_batch
+
+        multi = MultiFake({"1": FakeTP(_detail(id="1"), stuck={"title"}), "2": FakeTP(_detail(id="2"))})
+        with _wire_multi(multi):
+            r = await lo_update_workouts_batch([{"workout_id": "1", "title": "A"}, {"workout_id": "2", "title": "B"}])
+        assert r["success"] is False and r["error_code"] == "WRITE_NOT_LANDED"
+        assert r["summary"] == {"total": 2, "verified": 0, "failed": 1, "not_attempted": 1}
+        assert r["results"][0]["mismatched"] == ["title"]
+        assert r["results"][0]["verified"]["title"]["ok"] is False
+        assert r["results"][1]["status"] == "not_attempted"
+        assert multi.fakes["2"].updates == []
+
+    @pytest.mark.asyncio
+    async def test_continue_mode(self):
+        from tp_mcp.tools.lo_tools import lo_update_workouts_batch
+
+        multi = MultiFake({"1": FakeTP(_detail(id="1"), stuck={"title"}), "2": FakeTP(_detail(id="2"))})
+        with _wire_multi(multi):
+            r = await lo_update_workouts_batch(
+                [{"workout_id": "1", "title": "A"}, {"workout_id": "2", "title": "B"}], on_error="continue"
+            )
+        assert r["summary"] == {"total": 2, "verified": 1, "failed": 1, "not_attempted": 0}
+
+    @pytest.mark.asyncio
+    async def test_payload_file_dispatch_and_athlete(self, tmp_path):
+        import json
+
+        from tp_mcp.client.context import athlete_override
+        from tp_mcp.server import call_tool
+
+        f = tmp_path / "upd.json"
+        f.write_text(json.dumps({"athlete": "777", "updates": [{"workout_id": "1", "title": "A"}]}), encoding="utf-8")
+        seen = {}
+        fake = FakeTP(_detail(id="1"))
+
+        async def get_spy(workout_id):
+            seen["athlete"] = athlete_override.get()
+            return await fake.get(workout_id)
+
+        with patch.multiple(lo_tools, tp_get_workout=AsyncMock(side_effect=get_spy),
+                            tp_update_workout=AsyncMock(side_effect=fake.update)):
+            out = await call_tool("lo_update_workouts_batch", {"payload_file": str(f)})
+        payload = json.loads(out[0].text)
+        assert payload["success"] is True
+        assert seen["athlete"] == "777"
+
+    @pytest.mark.asyncio
+    async def test_row_without_workout_id_rejected(self):
+        from tp_mcp.tools.lo_tools import lo_update_workouts_batch
+
+        r = await lo_update_workouts_batch([{"title": "x"}])
+        assert r["error_code"] == "INVALID_ARGS"
+
+
+# ---------------------------------------------------------------------------
+# lo_get_week_for_validate
+# ---------------------------------------------------------------------------
+
+
+class TestGetWeekForValidate:
+    @pytest.mark.asyncio
+    async def test_structure_sports_get_detail_and_file_is_validate_shaped(self, tmp_path):
+        import json
+
+        from tp_mcp.tools import workouts as wmod
+        from tp_mcp.tools.lo_tools import lo_get_week_for_validate
+
+        listed = {"workouts": [
+            {"id": "1", "date": "2026-09-21", "sport": "Bike", "title": "有氧耐力",
+             "duration_planned": 1.0, "tss_planned": 45},
+            {"id": "2", "date": "2026-09-22", "sport": "Swim", "title": "閾值間歇",
+             "duration_planned": 1.0, "tss_planned": 48},
+            {"id": "3", "date": "2026-09-23", "sport": "Run", "title": "節奏跑",
+             "duration_planned": 1.0, "tss_planned": 60},
+        ]}
+        details = {
+            "1": _detail(id="1", sport="Bike", title="有氧耐力", structured_workout=_SW),
+            "3": _detail(id="3", sport="Run", title="節奏跑", structured_workout=_SW),
+        }
+        calls = []
+
+        async def get_detail(workout_id):
+            calls.append(workout_id)
+            return details[str(workout_id)]
+
+        out = tmp_path / "week.json"
+        with patch.object(wmod, "tp_get_workouts", AsyncMock(return_value=listed)), \
+             patch.object(lo_tools, "tp_get_workout", AsyncMock(side_effect=get_detail)):
+            r = await lo_get_week_for_validate("2026-09-21", "2026-09-27", str(out))
+        assert r["success"] is True
+        assert calls == ["1", "3"]  # swim never needs a detail call
+        assert r["count"] == 3 and r["with_structure"] == 2 and r["detail_calls"] == 2
+        data = json.loads(out.read_text(encoding="utf-8"))
+        ws = data["workouts"]
+        assert [w["id"] for w in ws] == ["1", "2", "3"]
+        assert ws[0]["structured_workout"]["structure"] and "duration_planned" in ws[0] and "tss_planned" in ws[0]
+        assert ws[1]["sport"] == "Swim" and "structured_workout" not in ws[1]
+        assert ws[1]["type"] == "planned"
+
+    @pytest.mark.asyncio
+    async def test_detail_failure_falls_back_to_list_row(self, tmp_path):
+        from tp_mcp.tools import workouts as wmod
+        from tp_mcp.tools.lo_tools import lo_get_week_for_validate
+
+        listed = {"workouts": [{"id": "1", "date": "2026-09-21", "sport": "Bike", "title": "T"}]}
+        with patch.object(wmod, "tp_get_workouts", AsyncMock(return_value=listed)), \
+             patch.object(lo_tools, "tp_get_workout", AsyncMock(return_value={"isError": True, "message": "x"})):
+            r = await lo_get_week_for_validate("2026-09-21", "2026-09-27", str(tmp_path / "w.json"))
+        assert r["detail_failures"] == ["1"] and r["count"] == 1 and r["with_structure"] == 0
+
+    def test_registered_read_only(self):
+        from tp_mcp.server import _TOOL_HANDLERS, _TOOLS_BY_NAME
+
+        assert "lo_get_week_for_validate" in _TOOL_HANDLERS
+        assert _TOOLS_BY_NAME["lo_get_week_for_validate"].annotations.read_only_hint is True
+        assert _TOOLS_BY_NAME["lo_update_workouts_batch"].annotations.read_only_hint is False

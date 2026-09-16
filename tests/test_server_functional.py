@@ -53,6 +53,8 @@ class TestListTools:
             # FORK (羅教練 2026/09/16): verified update + in-place sport change
             "lo_update_workout_verified",
             "lo_set_sport",
+            "lo_update_workouts_batch",
+            "lo_get_week_for_validate",
             "tp_update_workout",
             "tp_delete_workout",
             "tp_copy_workout",

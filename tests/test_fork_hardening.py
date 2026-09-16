@@ -296,3 +296,33 @@ class TestBatchPayloadFile:
         payload = json.loads(out[0].text)
         assert payload["error_code"] == "INVALID_ARGS"
         assert "unreadable" in payload["message"]
+
+    @pytest.mark.asyncio
+    async def test_payload_file_athlete_is_honoured_at_dispatch(self, tmp_path):
+        """Bug 2026-09-16: athlete inside payload_file was ignored -> resolved to coach."""
+        from unittest.mock import AsyncMock, patch
+
+        from tp_mcp import server
+        from tp_mcp.client.context import athlete_override
+
+        f = tmp_path / "payload.json"
+        f.write_text(json.dumps(
+            {"athlete": "1836912",
+             "workouts": [{"date": "2026-09-21", "sport": "Bike", "title": "T", "duration_minutes": 30}]},
+        ), encoding="utf-8")
+        seen = {}
+
+        async def spy(**kw):
+            seen["athlete"] = athlete_override.get()
+            return {"success": True}
+
+        with patch.object(server, "tp_create_workouts_batch", AsyncMock(side_effect=spy)):
+            await server.call_tool("tp_create_workouts_batch", {"payload_file": str(f), "dry_run": True})
+        assert seen["athlete"] == "1836912"
+
+        # explicit athlete still wins over the file
+        with patch.object(server, "tp_create_workouts_batch", AsyncMock(side_effect=spy)):
+            await server.call_tool(
+                "tp_create_workouts_batch", {"payload_file": str(f), "athlete": "999", "dry_run": True}
+            )
+        assert seen["athlete"] == "999"

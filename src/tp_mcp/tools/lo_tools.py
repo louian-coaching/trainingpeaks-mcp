@@ -28,6 +28,34 @@ from tp_mcp.tools.workouts import SPORT_TYPE_MAP, tp_get_workout, tp_update_work
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# payload_file helpers
+# ---------------------------------------------------------------------------
+
+
+def load_payload_file(path: str) -> dict[str, Any]:
+    """Read a JSON object from disk; raises ValueError with a readable message."""
+    import json
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as e:
+        raise ValueError(f"payload_file unreadable: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError("payload_file must contain a JSON object")
+    return data
+
+
+def peek_payload_athlete(path: str) -> str | None:
+    """Return the "athlete" value inside a payload_file, or None (never raises)."""
+    try:
+        val = load_payload_file(path).get("athlete")
+    except ValueError:
+        return None
+    return str(val) if val not in (None, "") else None
+
+
+# ---------------------------------------------------------------------------
 # Parameter aliases (evaluation item B#2)
 # ---------------------------------------------------------------------------
 
@@ -203,8 +231,36 @@ def _compare(field: str, sent: Any, landed: Any) -> bool:
     return sent == landed
 
 
-def _verify(sent: dict[str, Any], detail: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """Field-by-field comparison. Returns (report, mismatched_field_names)."""
+_TEXT_FIELDS = ("description", "title", "tags", "athlete_comment", "coach_comment")
+_DIFF_MAX_LINES = 40
+
+
+def _sha8(text: Any) -> str:
+    import hashlib
+
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()[:8]
+
+
+def _text_diff(sent: str, landed: str) -> list[str]:
+    """Unified diff (landed -> sent), capped, so a mismatch shows *what* differs."""
+    import difflib
+
+    lines = list(difflib.unified_diff(
+        (landed or "").splitlines(), (sent or "").splitlines(),
+        fromfile="landed", tofile="sent", lineterm="", n=1,
+    ))
+    if len(lines) > _DIFF_MAX_LINES:
+        lines = lines[:_DIFF_MAX_LINES] + [f"... ({len(lines) - _DIFF_MAX_LINES} more lines)"]
+    return lines
+
+
+def _verify(sent: dict[str, Any], detail: dict[str, Any], verbose: bool = False) -> tuple[dict[str, Any], list[str]]:
+    """Field-by-field comparison. Returns (report, mismatched_field_names).
+
+    Text fields are reported compactly: ``{ok, len, sha8}`` when they match,
+    a capped unified diff when they do not. ``verbose=True`` adds the full
+    sent/landed text.
+    """
     report: dict[str, Any] = {}
     bad: list[str] = []
     for field, value in sent.items():
@@ -213,16 +269,17 @@ def _verify(sent: dict[str, Any], detail: dict[str, Any]) -> tuple[dict[str, Any
             continue
         landed = _landed_value(field, detail)
         ok = _compare(field, value, landed)
-        if field == "description" and ok:
-            report[field] = {"sent_len": len(value or ""), "landed_len": len(landed or ""), "ok": True}
-            continue
-        if field == "description" and not ok:
-            report[field] = {
-                "sent": (value or "")[:400], "landed": (landed or "")[:400],
-                "sent_len": len(value or ""), "landed_len": len(landed or ""), "ok": False,
-                "note": "truncated to 400 chars",
-            }
-            bad.append(field)
+        if field in _TEXT_FIELDS and isinstance(value, str):
+            entry: dict[str, Any] = {"ok": ok, "len": len(value), "sha8": _sha8(value)}
+            if not ok:
+                entry["landed_len"] = len(landed or "")
+                entry["landed_sha8"] = _sha8(landed)
+                entry["diff"] = _text_diff(value, landed or "")
+                bad.append(field)
+            if verbose:
+                entry["sent"] = value
+                entry["landed"] = landed
+            report[field] = entry
             continue
         if field == "structured_workout":
             shown_sent: Any = _structure_fingerprint(value)
@@ -243,7 +300,14 @@ async def _read(workout_id: str) -> dict[str, Any]:
     return detail
 
 
-async def lo_update_workout_verified(workout_id: str, **fields: Any) -> dict[str, Any]:
+async def lo_update_workout_verified(workout_id: str, verbose: bool = False, **fields: Any) -> dict[str, Any]:
+    """Public wrapper: same as ``_update_verified`` without the ``_after`` detail."""
+    result = await _update_verified(workout_id, verbose=verbose, **fields)
+    result.pop("_after", None)
+    return result
+
+
+async def _update_verified(workout_id: str, verbose: bool = False, **fields: Any) -> dict[str, Any]:
     """Update a workout, then read it back and compare every field.
 
     - Unknown/aliased keys: normalised by the server layer before we get here.
@@ -306,7 +370,7 @@ async def lo_update_workout_verified(workout_id: str, **fields: Any) -> dict[str
         except RuntimeError as e:
             steps.append({"step": label, "sent": sorted(payload), "upstream": upstream, "readback": "failed"})
             return _err("API_ERROR", str(e), workout_id=str(workout_id), steps=steps, verified=report)
-        part_report, part_bad = _verify(payload, after)
+        part_report, part_bad = _verify(payload, after, verbose=verbose)
         report.update(part_report)
         mismatched.extend(part_bad)
         steps.append({
@@ -334,6 +398,7 @@ async def lo_update_workout_verified(workout_id: str, **fields: Any) -> dict[str
         )
 
     result: dict[str, Any] = {
+        "_after": after,  # consumed by lo_update_workouts_batch, stripped before returning
         "success": not mismatched,
         "workout_id": str(workout_id),
         "title": after.get("title"),
@@ -389,6 +454,173 @@ async def lo_set_sport(workout_id: str, sport: str, **fields: Any) -> dict[str, 
 
 
 # ---------------------------------------------------------------------------
+# Batch update (feedback 2026-09-16 #3) and week read-back for validate (#2)
+# ---------------------------------------------------------------------------
+
+_STRUCTURE_SPORTS = {"Bike", "Run", "Brick", "MtnBike"}
+
+
+def _row(result: dict[str, Any]) -> dict[str, Any]:
+    """One compact line per workout for batch output."""
+    row = {
+        "workout_id": result.get("workout_id"),
+        "date": result.get("date"),
+        "sport": result.get("sport"),
+        "title": result.get("title"),
+        "success": bool(result.get("success")),
+        "steps": [s.get("step") for s in result.get("steps") or []],
+    }
+    if result.get("isError"):
+        row["error_code"] = result.get("error_code")
+        row["message"] = result.get("message")
+    if result.get("mismatched"):
+        row["mismatched"] = result["mismatched"]
+        row["verified"] = {k: v for k, v in (result.get("verified") or {}).items() if v.get("ok") is False}
+    if result.get("warnings"):
+        row["warnings"] = result["warnings"]
+    return row
+
+
+def _write_json(path: str, data: Any) -> None:
+    import json
+
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=1)
+
+
+async def lo_update_workouts_batch(
+    updates: list[dict[str, Any]],
+    on_error: str = "stop",
+    verbose: bool = False,
+    readback_save_to: str | None = None,
+) -> dict[str, Any]:
+    """Run lo_update_workout_verified over a list; one round-trip instead of N.
+
+    Each item: ``{"workout_id": ..., <fields as lo_update_workout_verified>}``.
+    Sequential, never retries. ``on_error="stop"`` (default) halts at the first
+    row that is not fully verified; remaining rows are reported as
+    ``not_attempted``. With ``readback_save_to`` the post-update details are
+    written in validate_week.py shape (structured_workout included).
+    """
+    from tp_mcp.tools.workouts_batch import _flatten_readback
+
+    if not isinstance(updates, list) or not updates:
+        return _err("INVALID_ARGS", "updates must be a non-empty list")
+    if on_error not in ("stop", "continue"):
+        return _err("INVALID_ARGS", "on_error must be 'stop' or 'continue'")
+    for i, u in enumerate(updates):
+        if not isinstance(u, dict) or not u.get("workout_id"):
+            return _err("INVALID_ARGS", f"updates[{i}] needs a workout_id")
+
+    rows: list[dict[str, Any]] = []
+    readback: list[dict[str, Any]] = []
+    summary = {"total": len(updates), "verified": 0, "failed": 0, "not_attempted": 0}
+    halted = False
+    for i, u in enumerate(updates):
+        if halted:
+            rows.append({"workout_id": str(u["workout_id"]), "status": "not_attempted"})
+            summary["not_attempted"] += 1
+            continue
+        fields = {k: v for k, v in u.items() if k not in ("workout_id", "athlete")}
+        try:
+            res = await _update_verified(str(u["workout_id"]), verbose=verbose, **fields)
+        except Exception as e:  # noqa: BLE001 — a crash on one row must not lose the others
+            res = _err("API_ERROR", f"exception: {e}", workout_id=str(u["workout_id"]))
+        after = res.pop("_after", None)
+        if isinstance(after, dict):
+            readback.append(_flatten_readback(after))
+        rows.append({"index": i, **_row(res)})
+        if res.get("success"):
+            summary["verified"] += 1
+        else:
+            summary["failed"] += 1
+            if on_error == "stop":
+                halted = True
+
+    out: dict[str, Any] = {
+        "success": summary["failed"] == 0 and summary["not_attempted"] == 0,
+        "summary": summary,
+        "results": rows,
+    }
+    if readback_save_to:
+        try:
+            _write_json(readback_save_to, {"workouts": readback})
+            out["readback_json_path"] = readback_save_to
+        except OSError as e:
+            out["warnings"] = [f"readback_save_to failed: {e}"]
+    if not out["success"]:
+        out["isError"] = True
+        out["error_code"] = "WRITE_NOT_LANDED"
+        out["message"] = (
+            f"{summary['failed']} of {summary['total']} update(s) did not fully land"
+            + (f"; {summary['not_attempted']} not attempted (on_error=stop)" if summary["not_attempted"] else "")
+            + ". Inspect results[].verified before resending."
+        )
+    return out
+
+
+async def lo_get_week_for_validate(
+    start_date: str,
+    end_date: str,
+    save_to: str,
+    workout_filter: str = "planned",
+) -> dict[str, Any]:
+    """Read a date range back in the exact shape validate_week.py consumes.
+
+    tp_get_workouts (list) lacks structured_workout, so R2/R3/R4/R12 cannot be
+    checked from it. This tool lists the range, then fetches the detail of
+    every Bike/Run/Brick/MtnBike workout (the sports that carry a structure),
+    flattens everything with the same helper the batch-create tool uses, and
+    writes the file. Only a summary is returned.
+    """
+    from tp_mcp.tools.workouts import tp_get_workouts
+    from tp_mcp.tools.workouts_batch import _flatten_readback
+
+    listed = await tp_get_workouts(start_date=start_date, end_date=end_date, workout_filter=workout_filter)
+    if isinstance(listed, dict) and listed.get("isError"):
+        return listed
+    workouts = listed.get("workouts") or []
+    out_rows: list[dict[str, Any]] = []
+    detail_failures: list[str] = []
+    fetched = 0
+    for w in workouts:
+        wid = str(w.get("id"))
+        if w.get("sport") in _STRUCTURE_SPORTS:
+            detail = await tp_get_workout(workout_id=wid)
+            if isinstance(detail, dict) and not detail.get("isError"):
+                out_rows.append(_flatten_readback(detail))
+                fetched += 1
+                continue
+            detail_failures.append(wid)
+        row = dict(w)
+        row.setdefault("type", "planned")
+        out_rows.append(row)
+    try:
+        _write_json(save_to, {"workouts": out_rows, "date_range": {"start": start_date, "end": end_date}})
+    except OSError as e:
+        return _err("API_ERROR", f"save_to failed: {e}")
+    per_sport: dict[str, int] = {}
+    for r in out_rows:
+        per_sport[str(r.get("sport"))] = per_sport.get(str(r.get("sport")), 0) + 1
+    return {
+        "success": True,
+        "saved_to": save_to,
+        "date_range": {"start": start_date, "end": end_date},
+        "count": len(out_rows),
+        "with_structure": sum(1 for r in out_rows if r.get("structured_workout")),
+        "detail_calls": fetched,
+        "detail_failures": detail_failures,
+        "per_sport": per_sport,
+        "workouts": [
+            {"id": r.get("id"), "date": r.get("date"), "sport": r.get("sport"), "title": r.get("title"),
+             "tss_planned": r.get("tss_planned")}
+            for r in out_rows
+        ],
+        "next": f"python3 tp-ai-layer/tools/validate_week.py {save_to} <flags>",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Registration (the only hook into server.py)
 # ---------------------------------------------------------------------------
 
@@ -406,6 +638,14 @@ def register_lo_tools(tools: list[Any], handlers: dict[str, Any]) -> None:
     props = dict(base.get("properties", {}))
 
     verified_props = dict(props)
+    verified_props["verbose"] = {
+        "type": "boolean",
+        "default": False,
+        "description": (
+            "Also return full sent/landed text for text fields "
+            "(default: only ok/len/sha8, or a diff on mismatch)."
+        ),
+    }
     verified_props["payload_file"] = {
         "type": "string",
         "description": (
@@ -454,19 +694,104 @@ def register_lo_tools(tools: list[Any], handlers: dict[str, Any]) -> None:
         },
     ))
 
+    tools.append(Tool(
+        name="lo_update_workouts_batch",
+        description=(
+            "Update MANY workouts in one call, each verified by read-back exactly "
+            "like lo_update_workout_verified (split writes, sport-drift check, "
+            "per-field sent/landed). Pass `updates` inline or a `payload_file` "
+            "produced by `tp_build.py --week --update`. Sequential, never retries; "
+            "on_error=stop halts at the first row that did not land. With "
+            "readback_save_to the post-update details are written in "
+            "validate_week.py shape (structure included) so Step 5 needs no extra read."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "athlete": props.get("athlete", {"type": "string"}),
+                "updates": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Each item: {workout_id, ...fields of lo_update_workout_verified}.",
+                },
+                "payload_file": {
+                    "type": "string",
+                    "description": (
+                        "Absolute path to a JSON file {athlete?, updates:[...], on_error?, "
+                        "readback_save_to?}. File values are used unless the same argument is "
+                        "passed explicitly."
+                    ),
+                },
+                "on_error": {"type": "string", "enum": ["stop", "continue"], "default": "stop"},
+                "verbose": {"type": "boolean", "default": False},
+                "readback_save_to": {
+                    "type": "string",
+                    "description": "Absolute path; writes {workouts:[...]} in validate_week.py shape.",
+                },
+            },
+            "required": [],
+        },
+    ))
+
+    tools.append(Tool(
+        name="lo_get_week_for_validate",
+        description=(
+            "Read a date range back in the exact shape validate_week.py consumes, "
+            "structured_workout INCLUDED (tp_get_workouts alone lacks it, which is why "
+            "R2/R3/R4/R12 kept landing in the skipped list). Lists the range, fetches "
+            "the detail of every Bike/Run/Brick/MtnBike workout, flattens, writes "
+            "save_to, returns only a summary. Use for sop-weekly Step 5 after any "
+            "manual edits, or whenever a week must be re-validated."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "athlete": props.get("athlete", {"type": "string"}),
+                "start_date": {"type": "string", "description": "YYYY-MM-DD"},
+                "end_date": {"type": "string", "description": "YYYY-MM-DD"},
+                "save_to": {"type": "string", "description": "Absolute path for the validate-ready JSON."},
+                "type": {"type": "string", "enum": ["planned", "completed", "all"], "default": "planned"},
+            },
+            "required": ["start_date", "end_date", "save_to"],
+        },
+    ))
+
+    async def _h_update_batch(args: dict[str, Any]) -> dict[str, Any]:
+        a = dict(args)
+        payload_file = a.pop("payload_file", None)
+        if payload_file:
+            try:
+                file_args = load_payload_file(payload_file)
+            except ValueError as e:
+                return _err("INVALID_ARGS", str(e))
+            file_args.pop("athlete", None)
+            a = {**file_args, **a}
+        if "updates" not in a:
+            return _err("INVALID_ARGS", "updates (or payload_file containing updates) is required")
+        return await lo_update_workouts_batch(
+            updates=a["updates"],
+            on_error=a.get("on_error", "stop"),
+            verbose=bool(a.get("verbose", False)),
+            readback_save_to=a.get("readback_save_to"),
+        )
+
+    async def _h_get_week(args: dict[str, Any]) -> dict[str, Any]:
+        return await lo_get_week_for_validate(
+            start_date=args["start_date"], end_date=args["end_date"],
+            save_to=args["save_to"], workout_filter=args.get("type", "planned"),
+        )
+
+    handlers["lo_update_workouts_batch"] = _h_update_batch
+    handlers["lo_get_week_for_validate"] = _h_get_week
+
     async def _h_update_verified(args: dict[str, Any]) -> dict[str, Any]:
         a = dict(args)
         payload_file = a.pop("payload_file", None)
         if payload_file:
-            import json
-
             try:
-                with open(payload_file, encoding="utf-8") as fh:
-                    file_args = json.load(fh)
-            except (OSError, ValueError) as e:
-                return _err("INVALID_ARGS", f"payload_file unreadable: {e}")
-            if not isinstance(file_args, dict):
-                return _err("INVALID_ARGS", "payload_file must contain a JSON object")
+                file_args = load_payload_file(payload_file)
+            except ValueError as e:
+                return _err("INVALID_ARGS", str(e))
             file_args.pop("athlete", None)
             a = {**file_args, **a}
         if "workout_id" not in a:

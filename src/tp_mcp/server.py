@@ -1653,7 +1653,7 @@ def _dump_and_summarize(name: str, result: Any, save_to: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _READ_ONLY_PREFIXES = ("tp_get_", "tp_list_", "tp_download_", "tp_search_", "tp_validate_", "tp_analyze_")
-_READ_ONLY_EXTRA = {"tp_auth_status"}
+_READ_ONLY_EXTRA = {"tp_auth_status", "lo_get_week_for_validate"}  # FORK: lo_ read tool
 
 # Irrecoverable data removal. Everything else that writes is recoverable by a
 # follow-up call (update/re-add), so destructiveHint stays False there.
@@ -1712,7 +1712,7 @@ def _derive_title(name: str) -> str:
 # FORK (羅教練): lo_* tools live in tools/lo_tools.py. Registered here so the
 # metadata loop below stamps them like every other tool; handlers are merged
 # into _TOOL_HANDLERS right after it is created.
-from tp_mcp.tools.lo_tools import normalize_aliases, register_lo_tools  # noqa: E402
+from tp_mcp.tools.lo_tools import normalize_aliases, peek_payload_athlete, register_lo_tools  # noqa: E402
 
 _LO_HANDLERS: dict[str, Any] = {}
 register_lo_tools(TOOLS, _LO_HANDLERS)
@@ -2231,6 +2231,13 @@ async def call_tool(name: str, arguments: dict[str, Any] | None = None) -> list[
     # A client may legally omit arguments entirely for no-arg tools.
     args = dict(arguments or {})
     # Extract athlete targeting for coach accounts and set context var
+    # FORK: a payload_file may carry "athlete"; it must be honoured here, before
+    # the contextvar is set, or the whole batch resolves to the coach's own
+    # account (bug report 2026-09-16: ATHLETE_MISMATCH 'Coach Lo').
+    if "athlete" not in args and args.get("payload_file"):
+        _file_athlete = peek_payload_athlete(args["payload_file"])
+        if _file_athlete:
+            args["athlete"] = _file_athlete
     athlete_target = args.pop("athlete", None)
     # LOCAL PATCH: save_to — dump-to-file mode (see _dump_and_summarize)
     save_to = args.pop("save_to", None)
