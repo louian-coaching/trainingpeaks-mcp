@@ -150,6 +150,43 @@ class TestUpdateVerified:
         assert r["verified"]["structured_workout"]["landed"]["blocks"] == 2
 
     @pytest.mark.asyncio
+    async def test_simplified_structure_is_verified_by_total_length(self):
+        fake = FakeTP(_detail())
+        simplified = {
+            "primaryIntensityMetric": "percentOfFtp",
+            "steps": [
+                {"name": "WU", "duration_seconds": 600, "intensity_min": 50, "intensity_max": 60},
+                {"type": "repetition", "reps": 2, "steps": [
+                    {"name": "on", "duration_seconds": 900, "intensity_min": 84, "intensity_max": 90},
+                    {"name": "off", "duration_seconds": 300, "intensity_min": 50, "intensity_max": 55},
+                ]},
+            ],
+        }
+
+        async def update_converting(workout_id, **kw):
+            # upstream converts simplified -> native; emulate with matching end
+            if "structure" in kw:
+                fake.state["structured_workout"] = {
+                    "structure": [{"begin": 0, "end": 600}, {"begin": 600, "end": 3000}],
+                    "polyline": [[0, 0]], "primaryLengthMetric": "duration",
+                    "primaryIntensityMetric": "percentOfFtp",
+                }
+                kw = {k: v for k, v in kw.items() if k != "structure"}
+            return await fake.update(workout_id, **kw)
+
+        with patch.multiple(
+            lo_tools,
+            tp_get_workout=AsyncMock(side_effect=fake.get),
+            tp_update_workout=AsyncMock(side_effect=update_converting),
+        ):
+            r = await lo_update_workout_verified("1001", structure=simplified, tss_planned=60)
+        assert r["success"] is True
+        assert r["verified"]["structure"]["ok"] is True
+        assert r["verified"]["structure"]["sent"] == {"total_seconds": 3000}
+        assert r["verified"]["structure"]["landed"]["end"] == 3000
+        assert r["unverifiable"] == []
+
+    @pytest.mark.asyncio
     async def test_structured_workout_alone_is_one_write(self):
         fake = FakeTP(_detail())
         with _wire(fake):

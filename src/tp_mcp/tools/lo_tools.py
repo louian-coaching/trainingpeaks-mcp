@@ -82,7 +82,7 @@ _UPDATE_FIELDS = (
 )
 
 #: Fields tp_get_workout does not echo, so they can be sent but not verified.
-_UNVERIFIABLE = {"subtype_id", "tags", "athlete_comment", "coach_comment", "is_hidden", "structure"}
+_UNVERIFIABLE = {"subtype_id", "tags", "athlete_comment", "coach_comment", "is_hidden"}
 
 #: These must go in their own PUT (TECH-37).
 _STRUCTURE_KEYS = ("structured_workout", "structure")
@@ -121,6 +121,36 @@ def _structure_fingerprint(sw: Any) -> dict[str, Any] | None:
     }
 
 
+def _simplified_total_seconds(structure: Any) -> int | None:
+    """Total seconds of a simplified `structure` (steps × reps), or None."""
+    if isinstance(structure, str):
+        import json
+
+        try:
+            structure = json.loads(structure)
+        except ValueError:
+            return None
+    if not isinstance(structure, dict):
+        return None
+    total = 0
+    for step in structure.get("steps") or []:
+        if not isinstance(step, dict):
+            return None
+        if step.get("type") == "repetition":
+            reps = step.get("reps") or 1
+            inner = 0
+            for s in step.get("steps") or []:
+                if not isinstance(s, dict) or not isinstance(s.get("duration_seconds"), (int, float)):
+                    return None
+                inner += s["duration_seconds"]
+            total += inner * reps
+        elif isinstance(step.get("duration_seconds"), (int, float)):
+            total += step["duration_seconds"]
+        else:
+            return None
+    return int(total)
+
+
 def _landed_value(field: str, detail: dict[str, Any]) -> Any:
     metrics = detail.get("metrics") or {}
     if field == "duration_minutes":
@@ -133,7 +163,7 @@ def _landed_value(field: str, detail: dict[str, Any]) -> Any:
     if field == "date":
         d = detail.get("date")
         return d[:10] if isinstance(d, str) else d
-    if field == "structured_workout":
+    if field in ("structured_workout", "structure"):
         return _structure_fingerprint(detail.get("structured_workout"))
     return detail.get(field)
 
@@ -149,6 +179,13 @@ def _compare(field: str, sent: Any, landed: Any) -> bool:
         return str(sent)[:10] == str(landed)[:10]
     if field == "structured_workout":
         return _structure_fingerprint(sent) == landed
+    if field == "structure":
+        # simplified structure is converted upstream; verify the converted
+        # result is present and its total length matches what we described.
+        if not isinstance(landed, dict) or not landed.get("blocks"):
+            return False
+        total = _simplified_total_seconds(sent)
+        return total is None or landed.get("end") == total
     if field in ("feeling", "rpe"):
         return _num_close(sent, landed, 0)
     return sent == landed
@@ -164,7 +201,12 @@ def _verify(sent: dict[str, Any], detail: dict[str, Any]) -> tuple[dict[str, Any
             continue
         landed = _landed_value(field, detail)
         ok = _compare(field, value, landed)
-        shown_sent = _structure_fingerprint(value) if field == "structured_workout" else value
+        if field == "structured_workout":
+            shown_sent: Any = _structure_fingerprint(value)
+        elif field == "structure":
+            shown_sent = {"total_seconds": _simplified_total_seconds(value)}
+        else:
+            shown_sent = value
         report[field] = {"sent": shown_sent, "landed": landed, "ok": ok}
         if not ok:
             bad.append(field)
