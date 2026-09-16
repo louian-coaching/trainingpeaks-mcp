@@ -32,17 +32,46 @@ class TestUnknownArgsRejected:
         original = _TOOL_HANDLERS.get("tp_update_workout")
         _TOOL_HANDLERS["tp_update_workout"] = spy
         try:
-            # `tss` is the classic typo for `tss_planned` (TECH-35)
-            out = await call_tool("tp_update_workout", {"workout_id": 1, "tss": 70})
+            out = await call_tool("tp_update_workout", {"workout_id": 1, "tss_plan": 70})
         finally:
             _TOOL_HANDLERS["tp_update_workout"] = original
 
         payload = json.loads(out[0].text)
         assert payload["isError"] is True
         assert payload["error_code"] == "INVALID_ARGS"
-        assert "tss" in payload["message"]
+        assert "tss_plan" in payload["message"]
         assert "tss_planned" in payload["message"]  # allowed list is echoed back
         assert called["n"] == 0  # handler never ran
+
+    @pytest.mark.asyncio
+    async def test_alias_tss_is_normalised_to_tss_planned(self):
+        """`tss` is the classic typo for `tss_planned` (TECH-35): now mapped, not dropped."""
+        from tp_mcp.server import _TOOL_HANDLERS, call_tool
+
+        captured = {}
+
+        async def spy(args):
+            captured.update(args)
+            return {"status": "ok"}
+
+        original = _TOOL_HANDLERS.get("tp_update_workout")
+        _TOOL_HANDLERS["tp_update_workout"] = spy
+        try:
+            out = await call_tool("tp_update_workout", {"workout_id": 1, "tss": 70})
+        finally:
+            _TOOL_HANDLERS["tp_update_workout"] = original
+
+        assert json.loads(out[0].text).get("isError") is not True
+        assert captured == {"workout_id": 1, "tss_planned": 70}
+
+    @pytest.mark.asyncio
+    async def test_alias_plus_canonical_is_rejected_as_ambiguous(self):
+        from tp_mcp.server import call_tool
+
+        out = await call_tool("tp_update_workout", {"workout_id": 1, "tss": 70, "tss_planned": 72})
+        payload = json.loads(out[0].text)
+        assert payload["isError"] is True
+        assert payload["error_code"] == "INVALID_ARGS"
 
     @pytest.mark.asyncio
     async def test_athlete_and_save_to_are_not_unknown(self):

@@ -50,6 +50,9 @@ class TestListTools:
         v2_tools = {
             # LOCAL PATCH (羅教練 2026/08/21): batch create
             "tp_create_workouts_batch",
+            # FORK (羅教練 2026/09/16): verified update + in-place sport change
+            "lo_update_workout_verified",
+            "lo_set_sport",
             "tp_update_workout",
             "tp_delete_workout",
             "tp_copy_workout",

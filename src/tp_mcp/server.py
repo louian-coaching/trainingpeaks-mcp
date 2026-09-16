@@ -1693,10 +1693,17 @@ _TITLE_OVERRIDES = {
 
 
 def _derive_title(name: str) -> str:
-    words = name.removeprefix("tp_").split("_")
+    words = name.removeprefix("tp_").removeprefix("lo_").split("_")
     words = [_TITLE_ACRONYMS.get(w, w) for w in words]
     return (words[0].capitalize() + " " + " ".join(words[1:])).strip()
 
+
+# FORK (羅教練): lo_* tools live in tools/lo_tools.py. Registered here so the
+# metadata loop below stamps them like every other tool; handlers are merged
+# into _TOOL_HANDLERS right after it is created.
+from tp_mcp.tools.lo_tools import normalize_aliases, register_lo_tools  # noqa: E402
+_LO_HANDLERS: dict[str, Any] = {}
+register_lo_tools(TOOLS, _LO_HANDLERS)
 
 for _tool in TOOLS:
     _read_only = _tool.name.startswith(_READ_ONLY_PREFIXES) or _tool.name in _READ_ONLY_EXTRA
@@ -1720,6 +1727,7 @@ async def list_tools() -> list[Tool]:
 
 # Map tool names to handler functions for cleaner dispatch
 _TOOL_HANDLERS: dict[str, Any] = {}
+_TOOL_HANDLERS.update(_LO_HANDLERS)  # FORK
 
 
 def _handler(name: str):
@@ -2209,8 +2217,12 @@ async def call_tool(name: str, arguments: dict[str, Any] | None = None) -> list[
             }
         else:
             missing = [k for k in tool.input_schema.get("required", []) if k not in args]
-            # FORK: reject unknown keys instead of silently dropping them
+            # FORK: normalise known aliases (tss -> tss_planned, ...) first, then
+            # reject unknown keys instead of silently dropping them
             # (e.g. `tss` vs `tss_planned` used to return success with no effect).
+            args, alias_notes = normalize_aliases(tool.input_schema.get("properties"), args)
+            if alias_notes:
+                logger.info("Tool %s: normalised aliases %s", name, alias_notes)
             unknown = sorted(set(args) - set(tool.input_schema.get("properties", {})))
             if missing:
                 result = {
