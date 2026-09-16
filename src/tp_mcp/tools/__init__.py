@@ -98,10 +98,14 @@ from tp_mcp.tools.workouts import (
     tp_unpair_workout,
     tp_update_workout,
 )
+
+# LOCAL PATCH (羅教練 2026/08/21): batch create — 見 workouts_batch.py 檔頭
+from tp_mcp.tools.workouts_batch import tp_create_workouts_batch
 from tp_mcp.tools.zone_methods import tp_get_zone_methods
 
 __all__ = [
     "tp_add_note_comment",
+    "tp_create_workouts_batch",
     "tp_add_workout_comment",
     "tp_analyze_workout",
     "tp_auth_status",

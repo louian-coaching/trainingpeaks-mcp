@@ -48,6 +48,8 @@ class TestListTools:
         assert core_tools.issubset(names)
         # v2.0 tools
         v2_tools = {
+            # LOCAL PATCH (羅教練 2026/08/21): batch create
+            "tp_create_workouts_batch",
             "tp_update_workout",
             "tp_delete_workout",
             "tp_copy_workout",

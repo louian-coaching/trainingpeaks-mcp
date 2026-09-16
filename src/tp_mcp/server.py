@@ -44,6 +44,7 @@ from tp_mcp.tools import (
     tp_create_note,
     tp_create_strength_workout,
     tp_create_workout,
+    tp_create_workouts_batch,
     tp_create_zones,
     tp_delete_availability,
     tp_delete_equipment,
@@ -272,6 +273,75 @@ TOOLS = [
                 },
             },
             "required": ["date", "sport", "title"],
+        },
+    ),
+    # --- LOCAL PATCH (羅教練 2026/08/21): tp_create_workouts_batch ----------
+    Tool(
+        name="tp_create_workouts_batch",
+        description=(
+            "Create a whole week of planned workouts in ONE call, then read each "
+            "one back. Prefer this over repeated tp_create_workout when building "
+            "more than two workouts for the same athlete. Every row is "
+            "syntax-checked before anything is written, so a bad payload creates "
+            "nothing. Returns landed-value proof per workout plus a readback "
+            "block shaped for validate_week.py. Never retries on timeout — an "
+            "uncertain row is reported, not resent. Does not create "
+            "Strength-Builder gym workouts (use tp_create_strength_workout)."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "athlete": {"type": "string", "description": "Target athlete name or ID (coach accounts)"},
+                "workouts": {
+                    "type": "array",
+                    "description": (
+                        "Workouts to create. Each item takes the same fields as "
+                        "tp_create_workout (date, sport, title, description, "
+                        "structured_workout, tss_planned, duration_minutes, …)."
+                    ),
+                    "items": {"type": "object"},
+                },
+                "expect_athlete_name": {
+                    "type": "string",
+                    "description": (
+                        "Safety check. If this does not match the resolved athlete, "
+                        "the whole batch is rejected and nothing is created."
+                    ),
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Validate and identity-check only; create nothing.",
+                    "default": False,
+                },
+                "on_error": {
+                    "type": "string",
+                    "enum": ["stop", "continue"],
+                    "description": "Stop at the first failure (default) or keep going.",
+                    "default": "stop",
+                },
+                "skip_if_exists": {
+                    "type": "boolean",
+                    "description": (
+                        "Skip a workout when same day + sport + title already exists, "
+                        "making a re-run of the same payload safe after an interruption."
+                    ),
+                    "default": True,
+                },
+                "readback": {
+                    "type": "boolean",
+                    "description": "Re-read each created workout and return landed values.",
+                    "default": True,
+                },
+                "readback_save_to": {
+                    "type": "string",
+                    "description": (
+                        "Optional absolute path. Writes the readback block there "
+                        "(ready for validate_week.py) and returns only the path, "
+                        "keeping a full week of polylines out of context."
+                    ),
+                },
+            },
+            "required": ["workouts"],
         },
     ),
     Tool(
@@ -1544,6 +1614,9 @@ _NON_IDEMPOTENT_WRITES = {
     "tp_create_note",
     "tp_create_strength_workout",
     "tp_create_workout",
+    # LOCAL PATCH (羅教練 2026/08/21): idempotent only while skip_if_exists is
+    # left on (its default), so it is classed with the appending writes.
+    "tp_create_workouts_batch",
     "tp_create_zones",
     "tp_log_metrics",
     "tp_schedule_library_workout",
@@ -1657,6 +1730,19 @@ async def _h_create_workout(args):
         subtype_id=args.get("subtype_id"), tags=args.get("tags"),
         feeling=args.get("feeling"), rpe=args.get("rpe"),
         is_hidden=args.get("is_hidden", False),
+    )
+
+# LOCAL PATCH (羅教練 2026/08/21): batch create
+@_handler("tp_create_workouts_batch")
+async def _h_create_workouts_batch(args):
+    return await tp_create_workouts_batch(
+        workouts=args["workouts"],
+        expect_athlete_name=args.get("expect_athlete_name"),
+        dry_run=args.get("dry_run", False),
+        on_error=args.get("on_error", "stop"),
+        skip_if_exists=args.get("skip_if_exists", True),
+        readback=args.get("readback", True),
+        readback_save_to=args.get("readback_save_to"),
     )
 
 @_handler("tp_update_workout")
