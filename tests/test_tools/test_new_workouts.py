@@ -63,7 +63,7 @@ class TestCreateWorkoutWithStructure:
 
             result = await tp_create_workout(
                 date_str="2026-03-01", sport="Bike", title="Structured",
-                structure=structure,
+                structure=structure, tss_planned=40,  # FORK: explicit TSS required
             )
 
         assert result["success"] is True
@@ -71,12 +71,9 @@ class TestCreateWorkoutWithStructure:
         # Duration auto-computed from structure: 2400s = 40min = 0.667 hours
         assert "totalTimePlanned" in payload
         assert abs(payload["totalTimePlanned"] - 40.0 / 60.0) < 0.01
-        # TSS and IF auto-computed with correct semantic mapping (issue #41)
-        assert payload["tssPlanned"] == pytest.approx(39.6, abs=0.1)
-        assert payload["ifPlanned"] == pytest.approx(0.771, abs=0.001)
-        # Guard against IF/TSS swap: IF must be < 1, TSS must be >> 1
-        assert payload["ifPlanned"] < 1
-        assert payload["tssPlanned"] > 1
+        # FORK: the explicit TSS is what lands; the structure estimate is never uploaded
+        assert payload["tssPlanned"] == 40
+        assert "ifPlanned" not in payload
         # Structure serialised to JSON string
         assert isinstance(payload["structure"], str)
         parsed = json.loads(payload["structure"])
@@ -112,6 +109,7 @@ class TestCreateWorkoutWithStructure:
                 date_str="2026-03-01", sport="Bike", title="Override",
                 duration_minutes=90,  # Override the 10min structure
                 structure=structure,
+                tss_planned=50,  # FORK: explicit TSS required with structure
             )
 
         assert result["success"] is True
@@ -573,6 +571,7 @@ class TestUpdateWorkout:
             result = await tp_update_workout(
                 workout_id="1001",
                 structure=structure,
+                tss_planned=50,  # FORK: explicit TSS required with structure
             )
 
         assert result["success"] is True
@@ -582,11 +581,9 @@ class TestUpdateWorkout:
         assert "structure" in parsed
         assert "polyline" in parsed
         assert abs(put_payload["totalTimePlanned"] - 40.0 / 60.0) < 0.01
-        # Exact IF/TSS values with swap guard (issue #41)
-        assert put_payload["tssPlanned"] == pytest.approx(39.6, abs=0.1)
-        assert put_payload["ifPlanned"] == pytest.approx(0.771, abs=0.001)
-        assert put_payload["ifPlanned"] < 1
-        assert put_payload["tssPlanned"] > 1
+        # FORK: explicit TSS lands; structure estimate is never uploaded
+        assert put_payload["tssPlanned"] == 50
+        assert "ifPlanned" not in put_payload
 
     @pytest.mark.asyncio
     async def test_update_with_structure_explicit_duration_and_tss_override(self):

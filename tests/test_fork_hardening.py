@@ -138,3 +138,76 @@ class TestResponseHandling:
         response = httpx.Response(status_code=500, content=b"x" * 5000)
         result = client._handle_response(response)
         assert len(result.message) < 400
+
+
+# ---------------------------------------------------------------------------
+# 4. Structure-estimated TSS is never uploaded (coach decision 2026-09-16)
+# ---------------------------------------------------------------------------
+
+_STRUCTURE = {
+    "primaryIntensityMetric": "percentOfThresholdPace",
+    "steps": [
+        {"name": "WU", "duration_seconds": 600, "intensity_min": 60, "intensity_max": 70, "intensityClass": "warmUp"},
+        {"name": "Main", "duration_seconds": 1200, "intensity_min": 90, "intensity_max": 100, "intensityClass": "active"},
+    ],
+}
+
+
+class TestEstimatedTssRefused:
+    @pytest.mark.asyncio
+    async def test_create_with_structure_but_no_tss_is_refused(self):
+        from unittest.mock import AsyncMock, patch
+
+        from tp_mcp.tools.workouts import tp_create_workout
+
+        with patch("tp_mcp.tools.workouts.TPClient") as mock_client:
+            inst = AsyncMock()
+            inst.ensure_athlete_id = AsyncMock(return_value=123)
+            inst.post = AsyncMock()
+            mock_client.return_value.__aenter__.return_value = inst
+            result = await tp_create_workout(
+                date_str="2026-09-20", sport="Run", title="T", structure=_STRUCTURE
+            )
+        assert result["isError"] is True
+        assert result["error_code"] == "VALIDATION_ERROR"
+        assert "tss_planned" in result["message"]
+        inst.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_with_structure_but_no_tss_is_refused(self):
+        from unittest.mock import AsyncMock, patch
+
+        from tp_mcp.tools.workouts import tp_update_workout
+
+        with patch("tp_mcp.tools.workouts.TPClient") as mock_client:
+            inst = AsyncMock()
+            inst.ensure_athlete_id = AsyncMock(return_value=123)
+            inst.get = AsyncMock()
+            inst.put = AsyncMock()
+            mock_client.return_value.__aenter__.return_value = inst
+            result = await tp_update_workout(workout_id="1", structure=_STRUCTURE)
+        assert result["isError"] is True
+        assert result["error_code"] == "VALIDATION_ERROR"
+        inst.get.assert_not_called()
+        inst.put.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_without_structure_needs_no_tss(self):
+        """Plain duration-only workouts (rest days, itineraries) are unaffected."""
+        from unittest.mock import AsyncMock, patch
+
+        from tp_mcp.client.http import APIResponse
+        from tp_mcp.tools.workouts import tp_create_workout
+
+        with patch("tp_mcp.tools.workouts.TPClient") as mock_client:
+            inst = AsyncMock()
+            inst.ensure_athlete_id = AsyncMock(return_value=123)
+            inst.post = AsyncMock(
+                return_value=APIResponse(success=True, data={"workoutId": 1, "title": "T", "workoutDay": "2026-09-20T00:00:00"})
+            )
+            mock_client.return_value.__aenter__.return_value = inst
+            result = await tp_create_workout(
+                date_str="2026-09-20", sport="Run", title="T", duration_minutes=30
+            )
+        assert result["success"] is True
+        assert "tssPlanned" not in inst.post.call_args[1]["json"]

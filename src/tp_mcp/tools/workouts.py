@@ -380,6 +380,25 @@ def _m_to_km(metres: float | None) -> float | None:
     return metres / 1000 if metres is not None else None
 
 
+_TSS_ESTIMATE_REFUSED = (
+    "structure was given without tss_planned. This fork refuses to upload the "
+    "structure-estimated TSS: the estimate uses a single power-style NP^4 formula "
+    "for every sport, so swim/run estimates are not comparable with TP's sTSS/rTSS "
+    "and would pollute CTL/ATL. Pass tss_planned explicitly (hand-computed)."
+)
+
+
+def _refuse_estimated_tss(structure: Any, tss_planned: float | None) -> dict[str, Any] | None:
+    """FORK: never let the structure-derived TSS estimate reach TP silently."""
+    if structure is not None and tss_planned is None:
+        return {
+            "isError": True,
+            "error_code": "VALIDATION_ERROR",
+            "message": _TSS_ESTIMATE_REFUSED,
+        }
+    return None
+
+
 async def tp_create_workout(
     date_str: str,
     sport: str,
@@ -460,6 +479,10 @@ async def tp_create_workout(
             "error_code": "VALIDATION_ERROR",
             "message": raw_structure_error,
         }
+
+    refused = _refuse_estimated_tss(params.structure, params.tss_planned)
+    if refused is not None:
+        return refused
 
     # Use explicit duration if provided, otherwise use structure-computed
     effective_duration: float | None = float(params.duration_minutes) if params.duration_minutes is not None else None
@@ -620,6 +643,10 @@ async def tp_update_workout(
             "error_code": "VALIDATION_ERROR",
             "message": raw_structure_error,
         }
+
+    refused = _refuse_estimated_tss(params.structure, params.tss_planned)
+    if refused is not None:
+        return refused
 
     effective_duration = params.duration_minutes
     if effective_duration is None and structure_payload.duration_minutes is not None:
