@@ -1702,6 +1702,7 @@ def _derive_title(name: str) -> str:
 # metadata loop below stamps them like every other tool; handlers are merged
 # into _TOOL_HANDLERS right after it is created.
 from tp_mcp.tools.lo_tools import normalize_aliases, register_lo_tools  # noqa: E402
+
 _LO_HANDLERS: dict[str, Any] = {}
 register_lo_tools(TOOLS, _LO_HANDLERS)
 

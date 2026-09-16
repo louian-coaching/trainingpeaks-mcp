@@ -10,7 +10,6 @@ import pytest
 from tp_mcp.tools import lo_tools
 from tp_mcp.tools.lo_tools import lo_set_sport, lo_update_workout_verified, normalize_aliases
 
-
 # ---------------------------------------------------------------------------
 # A fake TP: tp_get_workout reads from a dict, tp_update_workout mutates it —
 # unless `stuck` is set, which reproduces "success: true but nothing landed".

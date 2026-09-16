@@ -12,7 +12,6 @@ import pytest
 
 from tp_mcp.client.http import ErrorCode, TPClient
 
-
 # ---------------------------------------------------------------------------
 # 1. Unknown argument keys are rejected instead of silently dropped
 # ---------------------------------------------------------------------------
@@ -177,7 +176,10 @@ _STRUCTURE = {
     "primaryIntensityMetric": "percentOfThresholdPace",
     "steps": [
         {"name": "WU", "duration_seconds": 600, "intensity_min": 60, "intensity_max": 70, "intensityClass": "warmUp"},
-        {"name": "Main", "duration_seconds": 1200, "intensity_min": 90, "intensity_max": 100, "intensityClass": "active"},
+        {
+            "name": "Main", "duration_seconds": 1200, "intensity_min": 90, "intensity_max": 100,
+            "intensityClass": "active",
+        },
     ],
 }
 
@@ -232,7 +234,8 @@ class TestEstimatedTssRefused:
             inst = AsyncMock()
             inst.ensure_athlete_id = AsyncMock(return_value=123)
             inst.post = AsyncMock(
-                return_value=APIResponse(success=True, data={"workoutId": 1, "title": "T", "workoutDay": "2026-09-20T00:00:00"})
+                return_value=APIResponse(success=True, data={"workoutId": 1,
+                    "title": "T", "workoutDay": "2026-09-20T00:00:00"})
             )
             mock_client.return_value.__aenter__.return_value = inst
             result = await tp_create_workout(

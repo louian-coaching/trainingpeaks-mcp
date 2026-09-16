@@ -263,7 +263,10 @@ async def lo_update_workout_verified(workout_id: str, **fields: Any) -> dict[str
             "(TECH-26); treat the landed value as authoritative for weekly totals."
         )
     if before.get("sport") == "Strength" or after.get("sport") == "Strength":
-        warnings.append("Strength via tp_update_workout is the China-region text path; Strength Builder workouts are not visible here (TECH-18).")
+        warnings.append(
+            "Strength via tp_update_workout is the China-region text path; "
+            "Strength Builder workouts are not visible here (TECH-18)."
+        )
 
     result: dict[str, Any] = {
         "success": not mismatched,
@@ -285,7 +288,8 @@ async def lo_update_workout_verified(workout_id: str, **fields: Any) -> dict[str
             f"(see `verified`). Do NOT resend blindly — inspect first."
         )
     else:
-        result["message"] = f"All {len(sent)} field(s) sent and {len(sent) - len(result['unverifiable'])} verified on read-back."
+        n_verified = len(sent) - len(result["unverifiable"])
+        result["message"] = f"All {len(sent)} field(s) sent and {n_verified} verified on read-back."
     return result
 
 
