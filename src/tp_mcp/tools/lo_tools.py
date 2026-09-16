@@ -383,6 +383,15 @@ def register_lo_tools(tools: list[Any], handlers: dict[str, Any]) -> None:
     props = dict(base.get("properties", {}))
 
     verified_props = dict(props)
+    verified_props["payload_file"] = {
+        "type": "string",
+        "description": (
+            "Absolute path to a JSON file holding the fields to update (same keys as "
+            "this tool; may include workout_id). File values are used unless the same "
+            "argument is passed explicitly. Keeps a full structured_workout out of the "
+            "model context."
+        ),
+    }
     tools.append(Tool(
         name="lo_update_workout_verified",
         description=(
@@ -397,7 +406,7 @@ def register_lo_tools(tools: list[Any], handlers: dict[str, Any]) -> None:
         input_schema={
             "type": "object",
             "properties": verified_props,
-            "required": ["workout_id"],
+            "required": [],
         },
     ))
 
@@ -424,6 +433,21 @@ def register_lo_tools(tools: list[Any], handlers: dict[str, Any]) -> None:
 
     async def _h_update_verified(args: dict[str, Any]) -> dict[str, Any]:
         a = dict(args)
+        payload_file = a.pop("payload_file", None)
+        if payload_file:
+            import json
+
+            try:
+                with open(payload_file, encoding="utf-8") as fh:
+                    file_args = json.load(fh)
+            except (OSError, ValueError) as e:
+                return _err("INVALID_ARGS", f"payload_file unreadable: {e}")
+            if not isinstance(file_args, dict):
+                return _err("INVALID_ARGS", "payload_file must contain a JSON object")
+            file_args.pop("athlete", None)
+            a = {**file_args, **a}
+        if "workout_id" not in a:
+            return _err("INVALID_ARGS", "workout_id is required (directly or via payload_file)")
         return await lo_update_workout_verified(a.pop("workout_id"), **a)
 
     async def _h_set_sport(args: dict[str, Any]) -> dict[str, Any]:

@@ -324,7 +324,31 @@ class TestRegistration:
 
         up = set(_TOOLS_BY_NAME["tp_update_workout"].input_schema["properties"])
         lo = set(_TOOLS_BY_NAME["lo_update_workout_verified"].input_schema["properties"])
-        assert lo == up
+        assert lo == up | {"payload_file"}
+
+    @pytest.mark.asyncio
+    async def test_payload_file_merged_under_explicit_args(self, tmp_path):
+        import json
+
+        from tp_mcp.server import call_tool
+
+        f = tmp_path / "fix.json"
+        f.write_text(json.dumps({"workout_id": "1001", "title": "from file", "tss_planned": 70}), encoding="utf-8")
+        fake = FakeTP(_detail())
+        with _wire(fake):
+            out = await call_tool("lo_update_workout_verified", {"payload_file": str(f), "tss_planned": 75})
+        payload = json.loads(out[0].text)
+        assert payload["success"] is True
+        assert fake.updates == [{"title": "from file", "tss_planned": 75}]
+
+    @pytest.mark.asyncio
+    async def test_missing_workout_id_is_invalid(self):
+        import json
+
+        from tp_mcp.server import call_tool
+
+        out = await call_tool("lo_update_workout_verified", {"title": "x"})
+        assert json.loads(out[0].text)["error_code"] == "INVALID_ARGS"
 
     @pytest.mark.asyncio
     async def test_dispatch_through_call_tool(self):
