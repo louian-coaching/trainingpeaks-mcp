@@ -1568,6 +1568,68 @@ for _tool in TOOLS:
     if _tool.name not in _ATHLETE_EXEMPT_TOOLS:
         _tool.input_schema["properties"]["athlete"] = _ATHLETE_PARAM
 
+# --- LOCAL PATCH (羅教練 2026/08/19): save_to ------------------------------
+# 目的：大量抓數的排程任務（weekly-athlete-monday）不必把完整 JSON 讀進
+# context 再重新輸出成檔——帶 save_to 時工具端直接落地，只回傳小摘要。
+# git pull 後若本段消失，用專案資料夾 tp-ai-layer/tools/tp-mcp-save-to.patch
+# 重套（git apply）。
+_SAVE_TO_TOOLS = {"tp_get_workouts", "tp_get_fitness", "tp_get_metrics"}
+
+_SAVE_TO_PARAM = {
+    "type": "string",
+    "description": (
+        "Optional absolute file path. If set, the full JSON response is "
+        "written to this file and only a compact summary is returned "
+        "(saves context for bulk fetches)."
+    ),
+}
+
+for _tool in TOOLS:
+    if _tool.name in _SAVE_TO_TOOLS:
+        _tool.input_schema["properties"]["save_to"] = _SAVE_TO_PARAM
+
+
+def _dump_and_summarize(name: str, result: Any, save_to: str) -> dict[str, Any]:
+    """Write full result JSON to save_to; return a compact summary."""
+    from pathlib import Path
+
+    p = Path(os.path.expanduser(save_to))
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
+    summary: dict[str, Any] = {"saved_to": str(p), "tool": name}
+    if not isinstance(result, dict):
+        return summary
+    if name == "tp_get_workouts":
+        ws = result.get("workouts", [])
+        per: dict[str, int] = {}
+        for w in ws:
+            k = f"{w.get('sport', '?')}/{w.get('type', '?')}"
+            per[k] = per.get(k, 0) + 1
+        sample = next((w for w in ws if w.get("type") == "completed"),
+                      ws[0] if ws else None)
+        summary.update({
+            "count": result.get("count", len(ws)),
+            "date_range": result.get("date_range"),
+            "per_sport_type": per,
+            # 身分核對用：首堂已完成課的處方區間（對照深檔 FTP／閾值）
+            "identity_sample": None if sample is None else {
+                "date": sample.get("date"), "sport": sample.get("sport"),
+                "title": sample.get("title"),
+                "description_head": (sample.get("description") or "")[:160],
+            },
+        })
+    elif name == "tp_get_fitness":
+        summary.update({
+            "start_date": result.get("start_date"),
+            "end_date": result.get("end_date"),
+            "current": result.get("current"),
+            "daily_count": len(result.get("daily_data", [])),
+        })
+    else:
+        summary["top_level_keys"] = list(result)[:10]
+    return summary
+# --- END LOCAL PATCH -------------------------------------------------------
+
 
 # ---------------------------------------------------------------------------
 # Tool metadata: display titles + behaviour annotations
@@ -2133,6 +2195,8 @@ async def call_tool(name: str, arguments: dict[str, Any] | None = None) -> list[
     args = dict(arguments or {})
     # Extract athlete targeting for coach accounts and set context var
     athlete_target = args.pop("athlete", None)
+    # LOCAL PATCH: save_to — dump-to-file mode (see _dump_and_summarize)
+    save_to = args.pop("save_to", None)
     token = athlete_override.set(athlete_target)
     try:
         handler = _TOOL_HANDLERS.get(name)
@@ -2153,6 +2217,9 @@ async def call_tool(name: str, arguments: dict[str, Any] | None = None) -> list[
                 }
             else:
                 result = await handler(args)
+                # LOCAL PATCH: save_to — write full payload to file, return summary
+                if save_to and not (isinstance(result, dict) and result.get("isError")):
+                    result = _dump_and_summarize(name, result, save_to)
 
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
