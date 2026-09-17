@@ -458,6 +458,42 @@ async def lo_set_sport(workout_id: str, sport: str, **fields: Any) -> dict[str, 
 # ---------------------------------------------------------------------------
 
 _STRUCTURE_SPORTS = {"Bike", "Run", "Brick", "MtnBike"}
+_TSS_SPORTS = ("Swim", "Bike", "Run", "Brick", "MtnBike")
+
+
+def _parse_target(text: Any) -> tuple[float, float] | None:
+    if not text:
+        return None
+    s = str(text).replace("~", "-").replace("–", "-")
+    parts = [p for p in s.split("-") if p.strip()]
+    try:
+        vals = [float(p) for p in parts]
+    except ValueError:
+        return None
+    return (vals[0], vals[0]) if len(vals) == 1 else (min(vals), max(vals))
+
+
+def week_load_line(rows: list[dict[str, Any]], target_tss: Any = None) -> dict[str, Any]:
+    """One-line weekly load from validate-shaped rows (feedback P6)."""
+    per: dict[str, float] = {}
+    for w in rows:
+        sp = str(w.get("sport"))
+        per[sp] = round(per.get(sp, 0.0) + float(w.get("tss_planned") or 0), 1)
+    tri = round(sum(v for k, v in per.items() if k in _TSS_SPORTS), 1)
+    out: dict[str, Any] = {"tri_tss": tri, "per_sport": per}
+    tgt = _parse_target(target_tss)
+    if tgt:
+        lo, hi = tgt
+        out["target"] = f"{lo:g}-{hi:g}"
+        out["in_range"] = lo <= tri <= hi
+        out["gap"] = 0 if out["in_range"] else round(lo - tri, 1) if tri < lo else round(tri - hi, 1)
+    other = "／".join(f"{k} {v}" for k, v in sorted(per.items()) if k not in _TSS_SPORTS)
+    out["line"] = (
+        f"三項合計 {tri}（" + "／".join(f"{k} {v}" for k, v in sorted(per.items()) if k in _TSS_SPORTS) + "）"
+        + (f"；另計 {other}" if other else "")
+        + (f"｜目標 {out['target']} " + ("✓" if out["in_range"] else f"✗ 差 {out['gap']}") if tgt else "")
+    )
+    return out
 
 
 def _row(result: dict[str, Any]) -> dict[str, Any]:
@@ -495,6 +531,7 @@ async def lo_update_workouts_batch(
     readback_save_to: str | None = None,
     readback_week_start: str | None = None,
     readback_week_end: str | None = None,
+    target_tss: str | None = None,
 ) -> dict[str, Any]:
     """Run lo_update_workout_verified over a list; one round-trip instead of N.
 
@@ -557,6 +594,7 @@ async def lo_update_workouts_batch(
                 out["readback_json_path"] = readback_save_to
                 out["readback_scope"] = "week"
                 out["readback_count"] = week.get("count")
+                out["week_load"] = week_load_line(week.get("rows") or [], target_tss)
         else:
             try:
                 _write_json(readback_save_to, {"workouts": readback})
@@ -627,6 +665,8 @@ async def lo_get_week_for_validate(
         "saved_to": save_to,
         "date_range": {"start": start_date, "end": end_date},
         "count": len(out_rows),
+        "week_load": week_load_line(out_rows),
+        "rows": out_rows,  # stripped by the handler; used by lo_update_workouts_batch
         "with_structure": sum(1 for r in out_rows if r.get("structured_workout")),
         "detail_calls": fetched,
         "detail_failures": detail_failures,
@@ -757,6 +797,12 @@ def register_lo_tools(tools: list[Any], handlers: dict[str, Any]) -> None:
                     ),
                 },
                 "readback_week_end": {"type": "string", "description": "YYYY-MM-DD"},
+                "target_tss": {
+                    "type": "string",
+                    "description": (
+                        "e.g. '740-760': with whole-week readback, returns week_load {tri_tss, in_range, gap}."
+                    ),
+                },
             },
             "required": [],
         },
@@ -780,6 +826,7 @@ def register_lo_tools(tools: list[Any], handlers: dict[str, Any]) -> None:
                 "end_date": {"type": "string", "description": "YYYY-MM-DD"},
                 "save_to": {"type": "string", "description": "Absolute path for the validate-ready JSON."},
                 "type": {"type": "string", "enum": ["planned", "completed", "all"], "default": "planned"},
+                "target_tss": {"type": "string", "description": "e.g. '740-760': week_load reports in_range/gap."},
             },
             "required": ["start_date", "end_date", "save_to"],
         },
@@ -804,13 +851,21 @@ def register_lo_tools(tools: list[Any], handlers: dict[str, Any]) -> None:
             readback_save_to=a.get("readback_save_to"),
             readback_week_start=a.get("readback_week_start"),
             readback_week_end=a.get("readback_week_end"),
+            target_tss=a.get("target_tss"),
         )
 
     async def _h_get_week(args: dict[str, Any]) -> dict[str, Any]:
-        return await lo_get_week_for_validate(
+        res = await lo_get_week_for_validate(
             start_date=args["start_date"], end_date=args["end_date"],
             save_to=args["save_to"], workout_filter=args.get("type", "planned"),
         )
+        if isinstance(res, dict):
+            res.pop("rows", None)
+            if args.get("target_tss") and res.get("success"):
+                # recompute with target from the file just written
+                res["week_load"] = week_load_line(load_payload_file(args["save_to"]).get("workouts") or [],
+                                                  args["target_tss"])
+        return res
 
     handlers["lo_update_workouts_batch"] = _h_update_batch
     handlers["lo_get_week_for_validate"] = _h_get_week

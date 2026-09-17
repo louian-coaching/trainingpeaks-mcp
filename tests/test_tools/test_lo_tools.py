@@ -632,3 +632,32 @@ class TestUpdateBatchWeekReadback:
                 [{"workout_id": "1", "title": "A"}], readback_save_to=str(tmp_path / "r.json")
             )
         assert r["readback_scope"] == "updated_rows_only" and "R14" in r["readback_note"]
+
+
+class TestWeekLoad:
+    def test_week_load_line(self):
+        from tp_mcp.tools.lo_tools import week_load_line
+
+        rows = [{"sport": "Bike", "tss_planned": 100}, {"sport": "Run", "tss_planned": 50.5},
+                {"sport": "Swim", "tss_planned": 40}, {"sport": "Strength", "tss_planned": 20}]
+        wl = week_load_line(rows, "180-200")
+        assert wl["tri_tss"] == 190.5 and wl["in_range"] is True and wl["gap"] == 0
+        assert "另計 Strength 20" in wl["line"] and "✓" in wl["line"]
+        wl = week_load_line(rows, "200-220")
+        assert wl["in_range"] is False and wl["gap"] == 9.5 and "差 9.5" in wl["line"]
+        assert "target" not in week_load_line(rows)
+
+    @pytest.mark.asyncio
+    async def test_batch_week_readback_returns_load(self, tmp_path):
+        from tp_mcp.tools import workouts as wmod
+        from tp_mcp.tools.lo_tools import lo_update_workouts_batch
+
+        fake = FakeTP(_detail(id="1", sport="Swim"))
+        listed = {"workouts": [{"id": "1", "date": "2026-09-21", "sport": "Swim", "title": "T", "tss_planned": 48},
+                               {"id": "9", "date": "2026-09-23", "sport": "Swim", "title": "團練", "tss_planned": 30}]}
+        with _wire(fake), patch.object(wmod, "tp_get_workouts", AsyncMock(return_value=listed)):
+            r = await lo_update_workouts_batch(
+                [{"workout_id": "1", "tss_planned": 48}], readback_save_to=str(tmp_path / "w.json"),
+                readback_week_start="2026-09-21", readback_week_end="2026-09-27", target_tss="70-90",
+            )
+        assert r["week_load"]["tri_tss"] == 78 and r["week_load"]["in_range"] is True

@@ -1326,13 +1326,21 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Exercise name substring (case-insensitive)."},
+                "queries": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "FORK: several names in one call. Returns {results: {name: {count, exercises}}}. "
+                        "Use instead of query when looking up a whole session's exercises."
+                    ),
+                },
                 "limit": {"type": "integer", "description": "Max results, 1-100 (default 20)."},
                 "muscle_group": {
                     "type": "string",
                     "description": "Optional muscle-group filter, e.g. 'glute', 'hamstring', 'chest'.",
                 },
             },
-            "required": ["query"],
+            "required": [],
         },
     ),
     Tool(
@@ -1575,6 +1583,17 @@ _ATHLETE_PARAM = {
     "description": "Target athlete name or ID (coach accounts only). Omit to use your own profile.",
 }
 
+# FORK (羅教練): lo_* tools live in tools/lo_tools.py and tools/lo_strength.py.
+# Registered here, before the athlete-param injection and the metadata loop,
+# so both treat them like every other tool; handlers are merged into
+# _TOOL_HANDLERS right after it is created.
+from tp_mcp.tools.lo_strength import register_lo_strength  # noqa: E402
+from tp_mcp.tools.lo_tools import normalize_aliases, peek_payload_athlete, register_lo_tools  # noqa: E402
+
+_LO_HANDLERS: dict[str, Any] = {}
+register_lo_tools(TOOLS, _LO_HANDLERS)
+register_lo_strength(TOOLS, _LO_HANDLERS)
+
 for _tool in TOOLS:
     if _tool.name not in _ATHLETE_EXEMPT_TOOLS:
         _tool.input_schema["properties"]["athlete"] = _ATHLETE_PARAM
@@ -1584,7 +1603,13 @@ for _tool in TOOLS:
 # context 再重新輸出成檔——帶 save_to 時工具端直接落地，只回傳小摘要。
 # git pull 後若本段消失，用專案資料夾 tp-ai-layer/tools/tp-mcp-save-to.patch
 # 重套（git apply）。
-_SAVE_TO_TOOLS = {"tp_get_workouts", "tp_get_fitness", "tp_get_metrics"}
+_SAVE_TO_TOOLS = {
+    "tp_get_workouts", "tp_get_fitness", "tp_get_metrics",
+    # FORK 2026-09-17: the dump mode always worked for any tool (it is applied at
+    # dispatch); listing it in the schema is what makes it discoverable.
+    "tp_get_workout", "tp_get_strength_workout", "tp_get_strength_workouts",
+    "tp_get_events", "tp_get_weekly_summary", "tp_get_workout_comments", "tp_get_atp",
+}
 
 _SAVE_TO_PARAM = {
     "type": "string",
@@ -1708,14 +1733,6 @@ def _derive_title(name: str) -> str:
     words = [_TITLE_ACRONYMS.get(w, w) for w in words]
     return (words[0].capitalize() + " " + " ".join(words[1:])).strip()
 
-
-# FORK (羅教練): lo_* tools live in tools/lo_tools.py. Registered here so the
-# metadata loop below stamps them like every other tool; handlers are merged
-# into _TOOL_HANDLERS right after it is created.
-from tp_mcp.tools.lo_tools import normalize_aliases, peek_payload_athlete, register_lo_tools  # noqa: E402
-
-_LO_HANDLERS: dict[str, Any] = {}
-register_lo_tools(TOOLS, _LO_HANDLERS)
 
 for _tool in TOOLS:
     _read_only = _tool.name.startswith(_READ_ONLY_PREFIXES) or _tool.name in _READ_ONLY_EXTRA
@@ -1938,6 +1955,17 @@ async def _h_analyze(args): return await tp_analyze_workout(workout_id=args["wor
 # --- Structured strength / gym ---
 @_handler("tp_search_exercises")
 async def _h_search_exercises(args):
+    # FORK: batch mode
+    if args.get("queries"):
+        results = {}
+        for q in args["queries"]:
+            results[str(q)] = await tp_search_exercises(
+                query=str(q), limit=args.get("limit", 5), muscle_group=args.get("muscle_group"))
+        return {"batch": True, "results": results,
+                "not_found": [q for q, r in results.items() if not (r.get("count") or 0)]}
+    if not args.get("query") and not args.get("muscle_group"):
+        return {"isError": True, "error_code": "INVALID_ARGS",
+                "message": "Provide query, queries[] or muscle_group."}
     return await tp_search_exercises(
         query=args.get("query", ""), limit=args.get("limit", 20),
         muscle_group=args.get("muscle_group"))
