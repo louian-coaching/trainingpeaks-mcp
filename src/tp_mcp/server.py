@@ -335,17 +335,36 @@ TOOLS = [
                 "readback_save_to": {
                     "type": "string",
                     "description": (
-                        "Optional absolute path. Writes the readback block there "
-                        "(ready for validate_week.py) and returns only the path, "
-                        "keeping a full week of polylines out of context."
+                        "Optional absolute path ON THE MACHINE RUNNING THIS SERVER. "
+                        "Writes the readback block there (ready for validate_week.py) "
+                        "and returns only the path, keeping a full week of polylines "
+                        "out of context."
+                    ),
+                },
+                "readback_week_start": {
+                    "type": "string",
+                    "description": (
+                        "YYYY-MM-DD. With readback_week_end, readback_save_to gets the "
+                        "WHOLE week (via lo_get_week_for_validate) instead of only the "
+                        "rows just created — week-level rules (R6/R14/R45) read a "
+                        "partial file as false FAILs."
+                    ),
+                },
+                "readback_week_end": {"type": "string", "description": "YYYY-MM-DD"},
+                "target_tss": {
+                    "type": "string",
+                    "description": (
+                        "e.g. '470-515': with a whole-week readback, returns "
+                        "week_load {tri_tss, in_range, gap}."
                     ),
                 },
                 "payload_file": {
                     "type": "string",
                     "description": (
-                        "FORK: absolute path to a JSON file produced by "
-                        "`tp_build.py --week` (keys: workouts, expect_athlete_name, "
-                        "dry_run, on_error, skip_if_exists, readback, readback_save_to). "
+                        "FORK: absolute path (ON THE MACHINE RUNNING THIS SERVER) to a "
+                        "JSON file produced by `tp_build.py --week` (keys: workouts, "
+                        "expect_athlete_name, dry_run, on_error, skip_if_exists, readback, "
+                        "readback_save_to, readback_week_start/end, target_tss). "
                         "Values from the file are used unless the same argument is "
                         "passed explicitly. Lets a whole week (polylines included) "
                         "stay out of the model context."
@@ -1589,11 +1608,13 @@ _ATHLETE_PARAM = {
 # _TOOL_HANDLERS right after it is created.
 from tp_mcp.tools.lo_strength import register_lo_strength  # noqa: E402
 from tp_mcp.tools.lo_tools import normalize_aliases, peek_payload_athlete, register_lo_tools  # noqa: E402
+from tp_mcp.tools.lo_review import register_lo_review  # noqa: E402
 from tp_mcp.tools.lo_verify import register_lo_verify  # noqa: E402
 
 _LO_HANDLERS: dict[str, Any] = {}
 register_lo_tools(TOOLS, _LO_HANDLERS)
 register_lo_strength(TOOLS, _LO_HANDLERS)
+register_lo_review(TOOLS, _LO_HANDLERS)
 register_lo_verify(TOOLS, _LO_HANDLERS)
 
 for _tool in TOOLS:
@@ -1611,14 +1632,20 @@ _SAVE_TO_TOOLS = {
     # dispatch); listing it in the schema is what makes it discoverable.
     "tp_get_workout", "tp_get_strength_workout", "tp_get_strength_workouts",
     "tp_get_events", "tp_get_weekly_summary", "tp_get_workout_comments", "tp_get_atp",
+    # FORK 2026-09-21: analysis already writes its own /tmp file, but that path is
+    # only reachable from inside this process — save_to puts the time series
+    # somewhere the caller can actually read (e.g. a synced project folder).
+    "tp_analyze_workout",
 }
 
 _SAVE_TO_PARAM = {
     "type": "string",
     "description": (
-        "Optional absolute file path. If set, the full JSON response is "
-        "written to this file and only a compact summary is returned "
-        "(saves context for bulk fetches)."
+        "Optional absolute file path ON THE MACHINE RUNNING THIS SERVER (the "
+        "coach's Mac) — not the caller's filesystem, which is a common source "
+        "of 'file not found' when a helper script then tries to read it back. "
+        "If set, the full JSON response is written to this file and only a "
+        "compact summary is returned (saves context for bulk fetches)."
     ),
 }
 
@@ -1655,6 +1682,17 @@ def _dump_and_summarize(name: str, result: Any, save_to: str) -> dict[str, Any]:
                 "title": sample.get("title"),
                 "description_head": (sample.get("description") or "")[:160],
             },
+        })
+    elif name == "tp_analyze_workout":
+        laps = result.get("lapData") or []
+        summary.update({
+            "workoutId": result.get("workoutId"),
+            "totals": result.get("totals"),
+            "lap_count": len(laps),
+            "time_series_points": result.get("time_series_points"),
+            # A single lap means per-segment review has to come from the
+            # prescription instead — see lo_verify_intervals.
+            "single_lap": len(laps) <= 1,
         })
     elif name == "tp_get_fitness":
         summary.update({
@@ -1861,6 +1899,9 @@ async def _h_create_workouts_batch(args):
         skip_if_exists=args.get("skip_if_exists", True),
         readback=args.get("readback", True),
         readback_save_to=args.get("readback_save_to"),
+        readback_week_start=args.get("readback_week_start"),
+        readback_week_end=args.get("readback_week_end"),
+        target_tss=args.get("target_tss"),
     )
 
 @_handler("tp_update_workout")

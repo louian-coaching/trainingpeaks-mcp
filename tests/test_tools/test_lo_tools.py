@@ -600,6 +600,52 @@ class TestGetWeekForValidate:
         assert payload.get("saved_to") == str(out) and out.exists()
 
 
+    @pytest.mark.asyncio
+    async def test_analyze_save_to_summary_flags_single_lap(self, tmp_path):
+        """2026/09/21: the analysis time series only ever lived in this process's
+        /tmp, unreachable from a helper script. save_to puts it somewhere real,
+        and the summary says up front whether per-segment review can come from
+        laps at all."""
+        import json
+
+        from tp_mcp.server import _TOOL_HANDLERS, call_tool
+
+        full = {
+            "workoutId": 3942453978,
+            "totals": {"TSS": {"value": 169}},
+            "lapData": [{"Name": "Lap 1", "LapTrigger": "SessionEnd"}],
+            "time_series_points": 997,
+            "data_file": "/tmp/tp-mcp/analysis/workout_3942453978.json",
+        }
+        original = _TOOL_HANDLERS["tp_analyze_workout"]
+        _TOOL_HANDLERS["tp_analyze_workout"] = AsyncMock(return_value=full)
+        try:
+            out = tmp_path / "a.json"
+            res = await call_tool("tp_analyze_workout",
+                                  {"workout_id": "3942453978", "save_to": str(out)})
+        finally:
+            _TOOL_HANDLERS["tp_analyze_workout"] = original
+
+        payload = json.loads(res[0].text)
+        assert payload["saved_to"] == str(out) and out.exists()
+        assert payload["lap_count"] == 1
+        assert payload["single_lap"] is True
+        assert payload["time_series_points"] == 997
+
+    @pytest.mark.asyncio
+    async def test_analyze_save_to_is_advertised_in_schema(self):
+        """The dump mode always worked at dispatch; listing it is what makes it
+        findable (same reasoning as the 2026-09-17 batch)."""
+        from tp_mcp.server import list_tools
+
+        tools = await list_tools()
+        analyze = next(t for t in tools if t.name == "tp_analyze_workout")
+        assert "save_to" in analyze.input_schema["properties"]
+        assert "MACHINE RUNNING THIS SERVER" in (
+            analyze.input_schema["properties"]["save_to"]["description"]
+        )
+
+
 class TestUpdateBatchWeekReadback:
     @pytest.mark.asyncio
     async def test_whole_week_readback_when_range_given(self, tmp_path):

@@ -191,6 +191,9 @@ async def tp_create_workouts_batch(
     skip_if_exists: bool = True,
     readback: bool = True,
     readback_save_to: str | None = None,
+    readback_week_start: str | None = None,
+    readback_week_end: str | None = None,
+    target_tss: str | None = None,
 ) -> dict[str, Any]:
     """Create a whole week of planned workouts in one call.
 
@@ -204,6 +207,13 @@ async def tp_create_workouts_batch(
         skip_if_exists: Skip a workout when same day + sport + title already
             exists in the target range (R7 duplicate guard, makes reruns safe).
         readback: Re-read each created workout and return landed-value proof.
+        readback_week_start: With readback_week_end, readback_save_to receives the
+            WHOLE week instead of only the rows just created — week-level rules
+            (R6/R14/R45) read the partial file as false FAILs otherwise.
+        readback_week_end: See readback_week_start.
+        target_tss: e.g. "470-515". With a whole-week readback, returns
+            week_load {tri_tss, in_range, gap} so the week does not need a
+            separate lo_get_week_for_validate call to be weighed.
         readback_save_to: Absolute path. When set, the readback block is written
             there (ready for `validate_week.py <path>`) and only the path is
             returned — keeps a full week of polylines out of the model context.
@@ -313,6 +323,7 @@ async def tp_create_workouts_batch(
 
     # --- 3. 冪等：先讀既有 planned 課，同鍵跳過（讓中斷後可安全重跑）-------
     existing: set[tuple[str, str, str]] = set()
+    preexisting: list[dict[str, Any]] = []
     if skip_if_exists:
         found = await tp_get_workouts(
             start_date=date_range["start"],
@@ -328,6 +339,25 @@ async def tp_create_workouts_batch(
             )
         for w in found.get("workouts", []):
             existing.add(_dup_key(w.get("date"), w.get("sport"), w.get("title")))
+
+        # 同一批的日期上，已經有別的課了嗎？（2026/09/21 加）
+        # skip_if_exists 只擋「同日＋同項目＋同標題」；教練或選手自己先建的
+        # 行程課、賽事佔位、團練，標題不同就完全不會被提到，於是同一天長出
+        # 兩堂內容重疊的課（2026/09/21 Mark Huang 10/1 兩堂「移動日」）。
+        # 這裡不擋、只把它們列出來——判斷是重複還是本來就該共存，是教練的事。
+        batch_keys = {
+            _dup_key(w.get("date"), w.get("sport"), w.get("title")) for w in workouts
+        }
+        target_days = {_day(w.get("date")) for w in workouts}
+        preexisting = [
+            {
+                "id": w.get("id"), "date": w.get("date"), "sport": w.get("sport"),
+                "title": w.get("title"), "tss_planned": w.get("tss_planned"),
+            }
+            for w in found.get("workouts", [])
+            if _day(w.get("date")) in target_days
+            and _dup_key(w.get("date"), w.get("sport"), w.get("title")) not in batch_keys
+        ]
 
     # --- 4. 循序建課（不併發：TP 端無交易語意，出錯時要能說清楚建到哪）----
     results: list[dict[str, Any]] = []
@@ -418,9 +448,35 @@ async def tp_create_workouts_batch(
         "results": results,
     }
 
+    if preexisting:
+        out["preexisting_on_target_days"] = preexisting
+        out["preexisting_note"] = (
+            f"目標日期上另有 {len(preexisting)} 堂既有課（標題與本批不同，未被 "
+            "skip_if_exists 擋下）。確認是刻意共存還是重複——刪課屬「先問再做」。"
+        )
+
     # 直接餵 validate_week.py：欄位已攤平成該腳本讀的形狀
     readback_block = {"workouts": readback_rows, "count": len(readback_rows)}
-    if readback_save_to:
+    if readback_save_to and readback_week_start and readback_week_end:
+        # 整週讀回（2026/09/21 加，與 lo_update_workouts_batch 同一個理由）：
+        # 只寫剛建的幾堂，R6／R14／R45 這類週層級規則看不到同週其他課，
+        # 會報假 FAIL；週量也還要再跑一次 lo_get_week_for_validate 才算得出來。
+        from tp_mcp.tools.lo_tools import lo_get_week_for_validate, week_load_line
+
+        week = await lo_get_week_for_validate(
+            start_date=readback_week_start,
+            end_date=readback_week_end,
+            save_to=readback_save_to,
+        )
+        if isinstance(week, dict) and week.get("isError"):
+            out["warnings"] = [f"whole-week readback failed: {week.get('message')}"]
+            out["readback"] = readback_block
+        else:
+            out["readback_json_path"] = readback_save_to
+            out["readback_scope"] = "week"
+            out["readback_count"] = week.get("count")
+            out["week_load"] = week_load_line(week.get("rows") or [], target_tss)
+    elif readback_save_to:
         try:
             import json
             import os
@@ -434,6 +490,11 @@ async def tp_create_workouts_batch(
             )
             out["readback_json_path"] = str(path)
             out["readback_count"] = len(readback_rows)
+            out["readback_scope"] = "created_rows_only"
+            out["readback_note"] = (
+                "檔案裡只有這批剛建的課；R6／R14／R45 這類週層級規則要帶 "
+                "readback_week_start/end，或另跑 lo_get_week_for_validate。"
+            )
         except OSError as exc:
             out["readback"] = readback_block
             out["readback_save_error"] = f"寫檔失敗，改回傳內容：{exc}"

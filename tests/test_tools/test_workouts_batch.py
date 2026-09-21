@@ -173,6 +173,103 @@ class TestIdempotency:
         assert create.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_preexisting_other_workout_on_a_target_day_is_reported(self):
+        """skip_if_exists only matches day+sport+title. A workout the coach
+        already put on that day under a different title slips through, and the
+        day quietly ends up with two overlapping sessions (2026/09/21: Mark
+        Huang had two 移動日 on 10/1). Report it; deciding is the coach's."""
+        existing = AsyncMock(return_value={"workouts": [
+            {"id": "77", "date": "2026-08-24", "sport": "Other",
+             "title": "移動日", "tss_planned": None},
+        ]})
+        p1, p2, p3, p4 = _patches(get_many=existing)
+        with p1, p2, p3, p4:
+            result = await tp_create_workouts_batch(workouts=[_wo("2026-08-24")])
+
+        assert result["summary"]["created"] == 1          # not blocked
+        assert [w["id"] for w in result["preexisting_on_target_days"]] == ["77"]
+        assert "先問再做" in result["preexisting_note"]
+
+    @pytest.mark.asyncio
+    async def test_preexisting_excludes_rows_this_batch_already_skips(self):
+        """A same-key row is already reported as `skipped`; listing it again
+        under preexisting would double-count it."""
+        existing = AsyncMock(return_value={"workouts": [
+            {"id": "5", "date": "2026-08-24", "sport": "Bike", "title": "閾值間歇"},
+        ]})
+        p1, p2, p3, p4 = _patches(get_many=existing)
+        with p1, p2, p3, p4:
+            result = await tp_create_workouts_batch(workouts=[_wo("2026-08-24")])
+
+        assert result["summary"]["skipped"] == 1
+        assert "preexisting_on_target_days" not in result
+
+    @pytest.mark.asyncio
+    async def test_preexisting_ignores_days_outside_this_batch(self):
+        existing = AsyncMock(return_value={"workouts": [
+            {"id": "88", "date": "2026-08-26", "sport": "Run", "title": "跑步團練"},
+        ]})
+        p1, p2, p3, p4 = _patches(get_many=existing)
+        with p1, p2, p3, p4:
+            result = await tp_create_workouts_batch(workouts=[_wo("2026-08-24")])
+
+        assert "preexisting_on_target_days" not in result
+
+    @pytest.mark.asyncio
+    async def test_whole_week_readback_replaces_created_rows_only(self, tmp_path):
+        """Week-level rules (R6/R14/R45) read a created-rows-only file as false
+        FAILs, and the week load then needs a second call to compute."""
+        week = AsyncMock(return_value={
+            "success": True, "count": 11,
+            "rows": [{"sport": "Bike", "tss_planned": 60.9},
+                     {"sport": "Run", "tss_planned": 65.0}],
+        })
+        p1, p2, p3, p4 = _patches()
+        with p1, p2, p3, p4, patch(
+            "tp_mcp.tools.lo_tools.lo_get_week_for_validate", week
+        ):
+            result = await tp_create_workouts_batch(
+                workouts=[_wo("2026-08-24")],
+                readback_save_to=str(tmp_path / "week.json"),
+                readback_week_start="2026-08-24",
+                readback_week_end="2026-08-30",
+                target_tss="100-150",
+            )
+
+        assert result["readback_scope"] == "week"
+        assert result["readback_count"] == 11
+        assert result["week_load"]["tri_tss"] == 125.9
+        assert result["week_load"]["in_range"] is True
+        assert "readback" not in result          # payload stayed out of context
+
+    @pytest.mark.asyncio
+    async def test_created_rows_only_readback_says_so(self, tmp_path):
+        p1, p2, p3, p4 = _patches()
+        with p1, p2, p3, p4:
+            result = await tp_create_workouts_batch(
+                workouts=[_wo("2026-08-24")],
+                readback_save_to=str(tmp_path / "rows.json"),
+            )
+        assert result["readback_scope"] == "created_rows_only"
+        assert "readback_week_start/end" in result["readback_note"]
+
+    @pytest.mark.asyncio
+    async def test_whole_week_readback_failure_falls_back(self, tmp_path):
+        week = AsyncMock(return_value={"isError": True, "message": "boom"})
+        p1, p2, p3, p4 = _patches()
+        with p1, p2, p3, p4, patch(
+            "tp_mcp.tools.lo_tools.lo_get_week_for_validate", week
+        ):
+            result = await tp_create_workouts_batch(
+                workouts=[_wo("2026-08-24")],
+                readback_save_to=str(tmp_path / "week.json"),
+                readback_week_start="2026-08-24",
+                readback_week_end="2026-08-30",
+            )
+        assert "whole-week readback failed" in result["warnings"][0]
+        assert result["readback"]["count"] == 1   # the created row is still returned
+
+    @pytest.mark.asyncio
     async def test_precheck_failure_blocks_batch(self):
         create = AsyncMock()
         broken = AsyncMock(return_value={"isError": True, "message": "boom"})

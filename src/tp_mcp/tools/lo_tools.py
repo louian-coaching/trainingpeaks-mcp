@@ -709,10 +709,10 @@ def register_lo_tools(tools: list[Any], handlers: dict[str, Any]) -> None:
     verified_props["payload_file"] = {
         "type": "string",
         "description": (
-            "Absolute path to a JSON file holding the fields to update (same keys as "
-            "this tool; may include workout_id). File values are used unless the same "
-            "argument is passed explicitly. Keeps a full structured_workout out of the "
-            "model context."
+            "Absolute path ON THE MACHINE RUNNING THIS SERVER to a JSON file holding "
+            "the fields to update (same keys as this tool; may include workout_id). "
+            "File values are used unless the same argument is passed explicitly. "
+            "Keeps a full structured_workout out of the model context."
         ),
     }
     tools.append(Tool(
