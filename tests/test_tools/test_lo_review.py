@@ -186,3 +186,106 @@ async def test_tool_propagates_api_error():
     with patch("tp_mcp.tools.workouts.tp_get_workouts", AsyncMock(return_value=err)):
         out = await lo_get_workouts_summary("2026-09-14", "2026-09-20")
     assert out["error_code"] == "AUTH_EXPIRED"
+
+
+# ---------------------------------------------------------------------------
+# Planned distance from the body — TP's distancePlanned is empty on every
+# workout this fork creates, so without this the whole distance basis is dead
+# ---------------------------------------------------------------------------
+
+from tp_mcp.tools.lo_review import planned_distance_m  # noqa: E402
+
+_REAL_SWIM = """- 下水前｜肩胸動態熱身：靠牆天使10下、開書式（側臥開書）左右各10下、四足跪姿胸椎伸展左右各10下、棍棒繞肩10個來回
+==
+- 暖身游200公尺
+- 浮板打腿100公尺, 4組
+- 指尖划水自由泳50公尺+慢游50公尺
+- 25公尺加速游+25公尺放鬆, 2組
+==
+- 500公尺@80-85%, 2趟, 間休30秒
+- 休息1~2分鐘
+- 200公尺@85-90%, 5趟, 間休25秒
+==
+- 緩游200公尺
+－－
+2x500公尺@80-85%、間休30秒，這一段請把每100公尺壓在1:52~1:55。
+5x200公尺@85-90%、間休25秒，每100公尺目標1:44~1:46。"""
+
+_REAL_RUN = """- 伸展
+- 8公里@6:35~6:20/km
+- 2公里@6:15~5:53/km
+- 2公里@6:35~6:20/km
+- 2公里@6:15~5:53/km
+- 3公里@6:35~6:20/km
+- 緩跑5分鐘
+- 伸展
+－－
+第 9 公里起進 6:15~5:53/km 兩公里，每100公尺不要想太多。"""
+
+
+def test_swim_body_metres_match_the_prescription():
+    """The 2026/09/18 閾值間歇: 3000m, which the athlete swam exactly."""
+    assert planned_distance_m(_REAL_SWIM) == 3000.0
+
+
+def test_run_body_kilometres_sum_the_distance_segments():
+    """17km of prescribed running; the closing 緩跑5分鐘 carries no distance."""
+    assert planned_distance_m(_REAL_RUN) == 17000.0
+
+
+def test_coaching_writeup_numbers_are_never_counted():
+    """Everything after 「－－」 is prose full of 每100公尺 targets."""
+    assert planned_distance_m("- 400公尺\n－－\n每100公尺壓在1:52，200公尺後再加速") == 400.0
+
+
+def test_reps_multiply_only_with_an_explicit_marker():
+    assert planned_distance_m("- 100公尺, 4組") == 400.0
+    assert planned_distance_m("- 100公尺, 4趟") == 400.0
+    assert planned_distance_m("- 100公尺") == 100.0
+    # 間休25秒 is not a rep count
+    assert planned_distance_m("- 200公尺, 間休25秒") == 200.0
+
+
+def test_a_rep_split_into_pieces_adds_up_within_the_rep():
+    assert planned_distance_m("- 25公尺加速游+25公尺放鬆, 2組") == 100.0
+
+
+def test_time_only_body_has_no_prescribed_distance():
+    assert planned_distance_m("- 伸展\n- 輕鬆慢跑20分鐘，配速不限\n- 伸展") is None
+    assert planned_distance_m(None) is None
+    assert planned_distance_m("") is None
+
+
+def test_body_distance_is_used_when_tp_field_is_empty():
+    rows = summarize_workouts([{
+        "id": "1", "date": "2026-09-18", "sport": "Swim", "title": "閾值間歇",
+        "type": "completed", "duration_planned": 1.2, "duration_actual": 1.33,
+        "distance_planned_km": None, "distance_actual_km": 3.0,
+        "description": _REAL_SWIM,
+    }])
+    row = rows["workouts"][0]
+    assert row["basis"] == "distance"
+    assert row["planned_source"] == "body"
+    assert (row["planned"], row["actual"], row["unit"]) == (3000, 3000, "m")
+    assert row["done_pct"] == 100.0          # time-based read said 110.6%
+    assert "incomplete" not in rows
+
+
+def test_tp_field_wins_when_it_is_populated():
+    rows = summarize_workouts([{
+        "id": "1", "date": "2026-09-20", "sport": "Run", "title": "長跑",
+        "type": "completed", "distance_planned_km": 17.65,
+        "distance_actual_km": 17.32, "description": _REAL_RUN,
+    }])
+    row = rows["workouts"][0]
+    assert row["planned_source"] == "tp"
+    assert row["planned"] == 17.65
+
+
+def test_bike_stays_on_time_even_with_distances_in_the_body():
+    rows = summarize_workouts([{
+        "id": "1", "date": "2026-09-19", "sport": "Bike", "title": "長距離騎乘",
+        "type": "completed", "duration_planned": 3.0, "duration_actual": 2.98,
+        "distance_actual_km": 95.0, "description": "- 50公里@50-65%",
+    }])
+    assert rows["workouts"][0]["basis"] == "duration"

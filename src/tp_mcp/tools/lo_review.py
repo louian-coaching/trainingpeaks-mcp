@@ -27,6 +27,7 @@ ratio. Getting that wrong is not a style issue — it inverts the conclusion.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -45,11 +46,77 @@ _NOTE = (
     "done_pct 依 method/0 原則五＋method/5 §5.0 排課前置①：游泳看公尺、騎車看時間、"
     "跑步看距離（時間制課看時間）、肌力看時間。TSS 欄位只供量級規劃與 CTL 走勢，"
     "不得用來判斷完成度或訓練品質。"
+    "｜planned_source=body 表示 TP 的 distancePlanned 是空的、計畫距離由課表本體加總而來；"
+    "本體裡的時間制段落（如長跑收尾的緩跑5分鐘）不計入，故該堂 done_pct 會略為偏高。"
 )
+
+
+# --------------------------------------------------------------------------
+# Planned distance from the workout body
+# --------------------------------------------------------------------------
+# TrainingPeaks' `distancePlanned` field is empty on every workout this fork
+# creates: the prescription travels as a structured workout and as the body
+# text, and neither writes that field. So the read that is supposed to judge
+# swims by metres and runs by kilometres had nothing to compare against and
+# quietly fell back to time for every single workout — the exact substitution
+# 原則五 forbids, just one step removed from TSS.
+#
+# The numbers are in the body, in the same notation the coach's own validators
+# already parse (validate_week.swim_row and its `N趟／N組` multiplier):
+#
+#     - 500公尺@80-85%, 2趟, 間休30秒      → 1000 m
+#     - 25公尺加速游+25公尺放鬆, 2組        →  100 m   (a rep split into pieces)
+#     - 8公里@6:35~6:20/km                 → 8000 m
+#
+# Everything after 「－－」 is the coaching write-up, which is full of numbers
+# that are not volume (每100公尺1:52), so it is cut off first.
+_BODY_SPLIT = "－－"
+_REPS_RX = re.compile(r"[,，]\s*(\d+)\s*[趟組]")
+_METRE_RX = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*公尺")
+_KM_RX = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*公里")
+
+
+def planned_distance_m(description: str | None) -> float | None:
+    """Prescribed distance in metres, summed from the workout body.
+
+    Returns None when the body prescribes no distance at all (a time-based
+    easy run, a bike session) — the caller then judges on time, which is
+    correct for those.
+
+    Time-based segments inside a distance session (「緩跑5分鐘」at the end of a
+    long run) contribute nothing, so the figure is the distance the *prescribed
+    distance segments* add up to, not the odometer reading the athlete will
+    finish on. done_pct therefore reads a little high on runs that close with a
+    timed cool-down; it is the main set that the review is judging.
+    """
+    if not description:
+        return None
+    body, _, _ = description.partition(_BODY_SPLIT)
+    total = 0.0
+    for line in body.splitlines():
+        line = line.strip().lstrip("-－ 　")
+        if not line:
+            continue
+        metres = sum(float(x) for x in _METRE_RX.findall(line))
+        metres += sum(float(x) * 1000 for x in _KM_RX.findall(line))
+        if not metres:
+            continue
+        reps = _REPS_RX.search(line)
+        total += metres * (int(reps.group(1)) if reps else 1)
+    return round(total, 1) if total else None
 
 
 def _err(code: str, message: str) -> dict[str, Any]:
     return {"isError": True, "error_code": code, "message": message}
+
+
+def _planned_km(w: dict[str, Any]) -> tuple[float | None, str]:
+    """(planned km, where it came from) — TP's own field first, body second."""
+    tp_km = w.get("distance_planned_km")
+    if isinstance(tp_km, (int, float)) and tp_km:
+        return float(tp_km), "tp"
+    metres = planned_distance_m(w.get("description"))
+    return (metres / 1000.0, "body") if metres else (None, "none")
 
 
 def _basis_for(w: dict[str, Any]) -> str:
@@ -57,20 +124,20 @@ def _basis_for(w: dict[str, Any]) -> str:
     sport = w.get("sport") or ""
     fixed = _BASIS_BY_SPORT.get(sport)
     if fixed:
-        # A swim with no prescribed distance has nothing to compare metres
+        # A swim whose body prescribes no metres either has nothing to compare
         # against; fall back rather than report a meaningless 0%.
-        if fixed == "distance" and not w.get("distance_planned_km"):
+        if fixed == "distance" and _planned_km(w)[0] is None:
             return "duration"
         return fixed
     if sport == "Run":
-        return "distance" if w.get("distance_planned_km") else "duration"
+        return "distance" if _planned_km(w)[0] is not None else "duration"
     return "duration"
 
 
 def _pair(w: dict[str, Any], basis: str) -> tuple[float | None, float | None, str]:
     """(planned, actual, unit) on the completion basis, in reader-friendly units."""
     if basis == "distance":
-        pl, ac = w.get("distance_planned_km"), w.get("distance_actual_km")
+        pl, ac = _planned_km(w)[0], w.get("distance_actual_km")
         if (w.get("sport") or "") == "Swim":
             return (
                 round(pl * 1000) if isinstance(pl, (int, float)) else None,
@@ -119,6 +186,7 @@ def summarize_workouts(
             "title": w.get("title"),
             "type": w.get("type"),
             "basis": basis,
+            "planned_source": _planned_km(w)[1] if basis == "distance" else "tp",
             "planned": planned,
             "actual": actual,
             "unit": unit,
