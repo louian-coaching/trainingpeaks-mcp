@@ -260,14 +260,37 @@ def _segment_stats(points: list[dict[str, Any]],
     return stats
 
 
+# How far the sampled mean may sit from the accumulated one before the sample
+# series is too thin to answer any time-in-band question at all.
+_BIAS_TOLERANCE = 0.10
+
+
+def _power_bias(points: list[dict[str, Any]],
+                closing: dict[str, Any] | None = None) -> float | None:
+    """How far the sampled mean sits below the true (accumulated) one, as a
+    fraction. None when there is no counter to check against."""
+    acc, basis = _mean_power(points, closing)
+    if basis != "accumulated" or not acc:
+        return None
+    vals = [p["Power"] for p in points if isinstance(p.get("Power"), (int, float))]
+    sampled = _mean(vals)
+    return None if sampled is None else abs(sampled / acc - 1.0)
+
+
 def _in_range_pct(points: list[dict[str, Any]], lo: float | None, hi: float | None,
                   ftp: float | None) -> float | None:
     """Share of SAMPLES whose power sits inside the prescribed %FTP window.
 
-    Sample-based on purpose: this answers "how much of the segment was spent in
-    the band", which is a time question, not a work question. It is therefore
-    sensitive to the downsampling in a way ``avg_power`` no longer is — read it
-    as an indication, and let avg_power carry the verdict.
+    Sample-based by nature: this asks "how much of the segment was spent in the
+    band", which is a time question, not a work question, so there is no
+    accumulated counter that can answer it.
+
+    That makes it only as good as the sampling. On a thinned series it is not a
+    weak indication but an actively wrong one — a 25-minute block whose true
+    average is 172.6W inside a 173~196W band reported 3.2%. The caller
+    therefore drops it whenever the sampled mean disagrees with the accumulated
+    mean by more than ``_BIAS_TOLERANCE``, and says why instead of printing a
+    number that reads as a failure.
     """
     if lo is None or hi is None or not ftp:
         return None
@@ -395,7 +418,15 @@ async def lo_verify_intervals(
         row.update(_segment_stats(in_seg, closing))
         pct = _in_range_pct(in_seg, seg.get("target_min"), seg.get("target_max"), ftp)
         if pct is not None:
-            row["in_range_pct"] = pct
+            bias = _power_bias(in_seg, closing)
+            if bias is None or bias <= _BIAS_TOLERANCE:
+                row["in_range_pct"] = pct
+            else:
+                row["in_range_note"] = (
+                    f"in_range_pct withheld: the sampled series sits {bias * 100:.0f}% "
+                    f"off the accumulated average, so it cannot say how much of this "
+                    f"segment was spent in the band. Judge by avg_power."
+                )
         rows.append(row)
 
     out: dict[str, Any] = {

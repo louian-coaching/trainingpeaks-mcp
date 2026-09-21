@@ -395,3 +395,29 @@ async def test_power_zeros_are_kept_because_tp_keeps_them(tmp_path):
     with a, w:
         res = await lo_verify_intervals("1", ftp=270)
     assert res["segments"][0]["avg_power"] == 105.0
+
+
+@pytest.mark.asyncio
+async def test_in_range_pct_is_withheld_when_the_series_is_too_thin(tmp_path):
+    """The 2026/09/19 長騎: a 25min block averaging 172.6W inside a 173~196W
+    band reported in_range_pct 3.2%. A number that wrong is worse than none."""
+    a, w = _patched(detail_sw=_sw(), series=_thinned_ride(), tmp_path=tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1", ftp=270)
+    first = res["segments"][0]
+    assert "in_range_pct" not in first
+    assert "withheld" in first["in_range_note"]
+    assert first["avg_power"] == 210.0     # the verdict still lands
+
+
+@pytest.mark.asyncio
+async def test_in_range_pct_survives_when_the_sampling_is_honest(tmp_path):
+    """1s data: sampled and accumulated agree, so the time-in-band answer holds."""
+    def acc_series(total_s=3600):
+        return [{"time": t, "Power": _truth_w(t), "AccumulatedPower": _accumulated(t)}
+                for t in range(0, total_s)]
+    a, w = _patched(detail_sw=_sw(), series=acc_series(), tmp_path=tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1", ftp=270)
+    assert res["segments"][0]["in_range_pct"] == 100.0
+    assert res["segments"][0]["power_basis"] == "accumulated"
