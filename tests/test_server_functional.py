@@ -56,6 +56,7 @@ class TestListTools:
             "lo_update_workouts_batch",
             "lo_get_week_for_validate",
             "lo_update_strength_verified",
+            "lo_verify_intervals",
             "tp_update_workout",
             "tp_delete_workout",
             "tp_copy_workout",

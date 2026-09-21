@@ -1589,10 +1589,12 @@ _ATHLETE_PARAM = {
 # _TOOL_HANDLERS right after it is created.
 from tp_mcp.tools.lo_strength import register_lo_strength  # noqa: E402
 from tp_mcp.tools.lo_tools import normalize_aliases, peek_payload_athlete, register_lo_tools  # noqa: E402
+from tp_mcp.tools.lo_verify import register_lo_verify  # noqa: E402
 
 _LO_HANDLERS: dict[str, Any] = {}
 register_lo_tools(TOOLS, _LO_HANDLERS)
 register_lo_strength(TOOLS, _LO_HANDLERS)
+register_lo_verify(TOOLS, _LO_HANDLERS)
 
 for _tool in TOOLS:
     if _tool.name not in _ATHLETE_EXEMPT_TOOLS:
