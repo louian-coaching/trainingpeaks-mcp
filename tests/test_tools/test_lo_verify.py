@@ -281,3 +281,117 @@ async def test_analysis_error_propagates(tmp_path):
     with patch("tp_mcp.tools.analyze.tp_analyze_workout", AsyncMock(return_value=err)):
         res = await lo_verify_intervals("1")
     assert res["error_code"] == "NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
+# Average power: the 2026/09/19 bug — charts downsamples, cycling power is
+# right-skewed, so a sampled mean read 85W where TP read 135W for the same ride
+# ---------------------------------------------------------------------------
+
+
+def _truth_w(t: int) -> int:
+    """The power actually produced at second `t` — same profile as _flat_ride."""
+    if t < 600:
+        return 140
+    if t < 1800:
+        return 210
+    if t < 2100:
+        return 140
+    if t < 2700:
+        return 210
+    if t < 3300:
+        return 190
+    return 140
+
+
+def _accumulated(t: int) -> int:
+    """Joules of work up to `t` — the counter TP's TotalWork equals."""
+    return sum(_truth_w(x) for x in range(t))
+
+
+def _thinned_ride(step: int = 12, sampled_w=lambda t: 0 if (t // 12) % 2 else 210):
+    """One sample per `step`s. The instantaneous `Power` values are deliberately
+    a poor sample of the truth (alternating coast/spike, mean ~105W); only
+    `AccumulatedPower` carries the real work."""
+    return [
+        {"time": t, "Power": sampled_w(t), "AccumulatedPower": _accumulated(t),
+         "HeartRate": 130, "Cadence": 0 if (t // step) % 2 else 85}
+        for t in range(0, 3600, step)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_accumulated_counter_beats_downsampled_sampling(tmp_path):
+    a, w = _patched(detail_sw=_sw(), series=_thinned_ride(), tmp_path=tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1", ftp=270)
+    first, second = res["segments"]
+    assert first["power_basis"] == "accumulated"
+    # sampled mean of the same points is ~105W — half the truth
+    assert first["avg_power"] == 210.0
+    assert second["avg_power"] == 200.0
+
+
+@pytest.mark.asyncio
+async def test_accumulated_window_closes_at_the_segment_edge(tmp_path):
+    """Without the closing sample the last 12s interval belongs to no segment
+    and a 1200s block is averaged over 1188s — 210W would read 207.9W."""
+    a, w = _patched(detail_sw=_sw(), series=_thinned_ride(step=60), tmp_path=tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1", ftp=270)
+    assert res["segments"][0]["avg_power"] == 210.0
+
+
+@pytest.mark.asyncio
+async def test_half_split_uses_the_same_accumulated_basis(tmp_path):
+    a, w = _patched(detail_sw=_sw(), series=_thinned_ride(), tmp_path=tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1", ftp=270)
+    second = res["segments"][1]
+    assert (second["first_half_power"], second["second_half_power"]) == (210.0, 190.0)
+    assert second["half_split_w"] == -20.0
+
+
+@pytest.mark.asyncio
+async def test_power_basis_says_sampled_when_the_counter_is_absent(tmp_path):
+    a, w = _patched(detail_sw=_sw(), tmp_path=tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1", ftp=270)
+    assert res["segments"][0]["power_basis"] == "sampled"
+    assert res["segments"][0]["avg_power"] == 210.0  # 1s data, nothing to lose
+
+
+@pytest.mark.asyncio
+async def test_falls_back_to_sampling_when_the_counter_runs_backwards(tmp_path):
+    """A device reset mid-ride makes the difference meaningless — take the
+    weaker number rather than a negative one, and label it."""
+    series = _thinned_ride(step=12, sampled_w=lambda t: 210)
+    for p in series:
+        if p["time"] >= 1200:
+            p["AccumulatedPower"] = 0
+    a, w = _patched(detail_sw=_sw(), series=series, tmp_path=tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1", ftp=270)
+    first = res["segments"][0]
+    assert first["power_basis"] == "sampled"
+    assert first["avg_power"] == 210.0
+
+
+@pytest.mark.asyncio
+async def test_zero_cadence_samples_are_not_averaged_in(tmp_path):
+    """A coasting zero is 'not pedalling', not a 0rpm reading — TP drops it."""
+    a, w = _patched(detail_sw=_sw(), series=_thinned_ride(), tmp_path=tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1", ftp=270)
+    assert res["segments"][0]["avg_cadence"] == 85.0
+
+
+@pytest.mark.asyncio
+async def test_power_zeros_are_kept_because_tp_keeps_them(tmp_path):
+    """Unlike cadence, a 0W sample is a real reading: TP's average is
+    TotalWork/elapsed, coasting included."""
+    series = [{"time": t, "Power": 0 if t % 2 else 210} for t in range(0, 3600)]
+    a, w = _patched(detail_sw=_sw(), series=series, tmp_path=tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1", ftp=270)
+    assert res["segments"][0]["avg_power"] == 105.0

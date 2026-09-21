@@ -601,49 +601,31 @@ class TestGetWeekForValidate:
 
 
     @pytest.mark.asyncio
-    async def test_analyze_save_to_summary_flags_single_lap(self, tmp_path):
-        """2026/09/21: the analysis time series only ever lived in this process's
-        /tmp, unreachable from a helper script. save_to puts it somewhere real,
-        and the summary says up front whether per-segment review can come from
-        laps at all."""
-        import json
+    async def test_analyze_save_to_is_the_tools_own_not_the_dispatch_dump(self):
+        """2026/09/21: analysis was first added to the generic save_to list, but
+        that writes the tool's RETURN VALUE — which deliberately has no time
+        series in it, so the file was useless for the thing it was added for.
+        It now declares its own save_to, which dispatch must leave alone."""
+        from tp_mcp.server import _SAVE_TO_TOOLS, list_tools
 
-        from tp_mcp.server import _TOOL_HANDLERS, call_tool
-
-        full = {
-            "workoutId": 3942453978,
-            "totals": {"TSS": {"value": 169}},
-            "lapData": [{"Name": "Lap 1", "LapTrigger": "SessionEnd"}],
-            "time_series_points": 997,
-            "data_file": "/tmp/tp-mcp/analysis/workout_3942453978.json",
-        }
-        original = _TOOL_HANDLERS["tp_analyze_workout"]
-        _TOOL_HANDLERS["tp_analyze_workout"] = AsyncMock(return_value=full)
-        try:
-            out = tmp_path / "a.json"
-            res = await call_tool("tp_analyze_workout",
-                                  {"workout_id": "3942453978", "save_to": str(out)})
-        finally:
-            _TOOL_HANDLERS["tp_analyze_workout"] = original
-
-        payload = json.loads(res[0].text)
-        assert payload["saved_to"] == str(out) and out.exists()
-        assert payload["lap_count"] == 1
-        assert payload["single_lap"] is True
-        assert payload["time_series_points"] == 997
-
-    @pytest.mark.asyncio
-    async def test_analyze_save_to_is_advertised_in_schema(self):
-        """The dump mode always worked at dispatch; listing it is what makes it
-        findable (same reasoning as the 2026-09-17 batch)."""
-        from tp_mcp.server import list_tools
-
+        assert "tp_analyze_workout" not in _SAVE_TO_TOOLS
         tools = await list_tools()
         analyze = next(t for t in tools if t.name == "tp_analyze_workout")
-        assert "save_to" in analyze.input_schema["properties"]
-        assert "MACHINE RUNNING THIS SERVER" in (
-            analyze.input_schema["properties"]["save_to"]["description"]
-        )
+        desc = analyze.input_schema["properties"]["save_to"]["description"]
+        assert "time series" in desc and "MACHINE RUNNING THIS SERVER" in desc
+
+    @pytest.mark.asyncio
+    async def test_analyze_save_to_reaches_the_tool(self, tmp_path):
+        from unittest.mock import AsyncMock as _AM
+
+        from tp_mcp.server import call_tool
+
+        out = tmp_path / "ts.json"
+        with patch("tp_mcp.server.tp_analyze_workout",
+                   _AM(return_value={"workoutId": 1, "single_lap": True})) as m:
+            await call_tool("tp_analyze_workout",
+                            {"workout_id": "1", "save_to": str(out)})
+        assert m.await_args.kwargs["save_to"] == str(out)
 
 
 class TestUpdateBatchWeekReadback:

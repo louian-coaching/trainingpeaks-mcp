@@ -641,10 +641,28 @@ TOOLS = [
     ),
     Tool(
         name="tp_analyze_workout",
-        description="Get workout analysis: metrics, zones, laps. Saves full time-series to JSON file.",
+        description=(
+            "Get workout analysis: metrics, zones, laps. Saves the full time series "
+            "to a JSON file. `single_lap: true` in the response means the device "
+            "recorded one lap, so per-segment review has to be reconstructed from "
+            "the prescription — use lo_verify_intervals."
+        ),
         input_schema={
             "type": "object",
-            "properties": {"workout_id": {"type": "string"}},
+            "properties": {
+                "workout_id": {"type": "string"},
+                "save_to": {
+                    "type": "string",
+                    "description": (
+                        "FORK: absolute path ON THE MACHINE RUNNING THIS SERVER for the "
+                        "FULL dump, time series included. Without it the dump lands in "
+                        "this process's tempdir, which nothing outside the server can "
+                        "open. This is the tool's own save_to — it writes the time "
+                        "series, unlike the generic dispatch-level save_to, which "
+                        "writes the (deliberately time-series-free) return value."
+                    ),
+                },
+            },
             "required": ["workout_id"],
         },
     ),
@@ -1632,10 +1650,6 @@ _SAVE_TO_TOOLS = {
     # dispatch); listing it in the schema is what makes it discoverable.
     "tp_get_workout", "tp_get_strength_workout", "tp_get_strength_workouts",
     "tp_get_events", "tp_get_weekly_summary", "tp_get_workout_comments", "tp_get_atp",
-    # FORK 2026-09-21: analysis already writes its own /tmp file, but that path is
-    # only reachable from inside this process — save_to puts the time series
-    # somewhere the caller can actually read (e.g. a synced project folder).
-    "tp_analyze_workout",
 }
 
 _SAVE_TO_PARAM = {
@@ -1682,17 +1696,6 @@ def _dump_and_summarize(name: str, result: Any, save_to: str) -> dict[str, Any]:
                 "title": sample.get("title"),
                 "description_head": (sample.get("description") or "")[:160],
             },
-        })
-    elif name == "tp_analyze_workout":
-        laps = result.get("lapData") or []
-        summary.update({
-            "workoutId": result.get("workoutId"),
-            "totals": result.get("totals"),
-            "lap_count": len(laps),
-            "time_series_points": result.get("time_series_points"),
-            # A single lap means per-segment review has to come from the
-            # prescription instead — see lo_verify_intervals.
-            "single_lap": len(laps) <= 1,
         })
     elif name == "tp_get_fitness":
         summary.update({
@@ -1993,7 +1996,8 @@ async def _h_get_peaks(args):
     return await tp_get_peaks(sport=args["sport"], pr_type=args["pr_type"], days=args.get("days", 3650))
 
 @_handler("tp_analyze_workout")
-async def _h_analyze(args): return await tp_analyze_workout(workout_id=args["workout_id"])
+async def _h_analyze(args):
+    return await tp_analyze_workout(workout_id=args["workout_id"], save_to=args.get("save_to"))
 
 # --- Structured strength / gym ---
 @_handler("tp_search_exercises")

@@ -48,6 +48,12 @@ logger = logging.getLogger(__name__)
 # Channels we report per segment, in output order. Key = time-series key.
 _CHANNELS = ("Power", "HeartRate", "Cadence", "Speed")
 
+# Channels where a zero sample means "not pedalling / sensor dropped", not a
+# real reading — averaging them in drags the number below every other tool's.
+# Power is deliberately NOT here: its zeros are real (coasting), and TP's own
+# average includes them (TotalWork / elapsed).
+_ZERO_MEANS_MISSING = ("Cadence", "HeartRate")
+
 _DRIFT_WARN = 0.05  # |actual/planned - 1| above this ⇒ boundaries unreliable
 
 
@@ -172,23 +178,81 @@ def _mean(vals: list[float]) -> float | None:
     return round(sum(vals) / len(vals), 1) if vals else None
 
 
-def _segment_stats(points: list[dict[str, Any]]) -> dict[str, Any]:
+def _mean_power(points: list[dict[str, Any]],
+                closing: dict[str, Any] | None = None) -> tuple[float | None, str]:
+    """Average power for a segment, matching TrainingPeaks' own definition.
+
+    The charts endpoint downsamples — ~one sample per 12s on a 3.5h ride — and
+    cycling power is heavily right-skewed (long stretches of coasting zeros,
+    short spikes). Averaging the sampled instantaneous values therefore
+    underestimates badly: on 2026/09/19 it gave 85W against TP's 135W for the
+    same ride, which would have made every segment look like a failure.
+
+    ``AccumulatedPower`` is the work counter in joules, and its final value is
+    exactly TP's TotalWork — so differencing it across the segment gives the
+    true average over that window regardless of how the samples were thinned.
+    That is what TP means by average power (TotalWork / elapsed), zeros
+    included. Fall back to the sampled mean only when the channel is absent,
+    and say so in ``power_basis`` rather than quietly reporting a weaker number.
+
+    ``closing`` is the first sample AFTER the segment. The counter has to be
+    read at the segment's closing edge, not at its last interior sample, or the
+    final sampling interval (≈12s) belongs to no segment at all. It feeds the
+    accumulated branch only — averaging it into the sampled fallback would pull
+    a work block's number towards the recovery that follows it.
+    """
+    acc = [
+        (p["time"], p["AccumulatedPower"])
+        for p in (points if closing is None else [*points, closing])
+        if isinstance(p.get("AccumulatedPower"), (int, float))
+        and isinstance(p.get("time"), (int, float))
+    ]
+    if len(acc) >= 2:
+        (t0, j0), (t1, j1) = acc[0], acc[-1]
+        span = t1 - t0
+        if span > 0 and j1 >= j0:
+            return round((j1 - j0) / span, 1), "accumulated"
+    vals = [p["Power"] for p in points if isinstance(p.get("Power"), (int, float))]
+    return (_mean(vals), "sampled") if vals else (None, "sampled")
+
+
+def _segment_stats(points: list[dict[str, Any]],
+                   closing: dict[str, Any] | None = None) -> dict[str, Any]:
     """Averages for one segment, plus the first-half/second-half split.
 
     The split is what PER-24 actually asks for: a 25-minute race-power block
     that fades 12W from first half to second half was not held, even when its
     overall average lands inside the prescribed range.
+
+    ``closing`` — the first sample after the segment — closes the
+    accumulated-work window; see ``_mean_power``.
     """
     stats: dict[str, Any] = {"samples": len(points)}
     for ch in _CHANNELS:
+        if ch == "Power":
+            continue  # handled by _mean_power below
         vals = [p[ch] for p in points if isinstance(p.get(ch), (int, float))]
+        if ch in _ZERO_MEANS_MISSING:
+            vals = [v for v in vals if v > 0]
         avg = _mean(vals)
         if avg is not None:
             stats[f"avg_{ch.lower()}"] = avg
-    pw = [p["Power"] for p in points if isinstance(p.get("Power"), (int, float))]
-    if len(pw) >= 4:
-        mid = len(pw) // 2
-        first, second = _mean(pw[:mid]), _mean(pw[mid:])
+
+    avg_power, basis = _mean_power(points, closing)
+    if avg_power is not None:
+        stats["avg_power"] = avg_power
+        stats["power_basis"] = basis
+
+    # The first-half/second-half split is the PER-24 判準, so it has to use the
+    # same (accumulated) basis as the average — otherwise a segment's halves
+    # would be computed one way and its average another.
+    if len(points) >= 4:
+        mid = len(points) // 2
+        # points[mid] closes the first half and opens the second, so no
+        # sampling interval belongs to neither half; `closing` does the same
+        # job at the segment's tail.
+        first, _ = _mean_power(points[:mid], points[mid])
+        second, _ = _mean_power(points[mid:], closing)
         if first is not None and second is not None:
             stats["first_half_power"] = first
             stats["second_half_power"] = second
@@ -198,7 +262,13 @@ def _segment_stats(points: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _in_range_pct(points: list[dict[str, Any]], lo: float | None, hi: float | None,
                   ftp: float | None) -> float | None:
-    """Share of samples whose power sits inside the prescribed %FTP window."""
+    """Share of SAMPLES whose power sits inside the prescribed %FTP window.
+
+    Sample-based on purpose: this answers "how much of the segment was spent in
+    the band", which is a time question, not a work question. It is therefore
+    sensitive to the downsampling in a way ``avg_power`` no longer is — read it
+    as an indication, and let avg_power carry the verdict.
+    """
     if lo is None or hi is None or not ftp:
         return None
     lo_w, hi_w = ftp * float(lo) / 100.0, ftp * float(hi) / 100.0
@@ -317,7 +387,12 @@ async def lo_verify_intervals(
                     _round_half_up(ftp * float(seg["target_min"]) / 100.0),
                     _round_half_up(ftp * float(seg["target_max"]) / 100.0),
                 ]
-        row.update(_segment_stats(in_seg))
+        after = [
+            (v, p) for p in points
+            if (v := _axis_value(p, axis)) is not None and v >= seg["end"]
+        ]
+        closing = min(after, key=lambda vp: vp[0])[1] if after else None
+        row.update(_segment_stats(in_seg, closing))
         pct = _in_range_pct(in_seg, seg.get("target_min"), seg.get("target_max"), ftp)
         if pct is not None:
             row["in_range_pct"] = pct

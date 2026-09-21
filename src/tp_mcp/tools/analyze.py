@@ -30,6 +30,7 @@ file — legitimately lack per-second/lap data while still having totals).
 
 import json
 import logging
+import os
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -52,14 +53,27 @@ _CHARTS_PATH = "/workout-analysis/v2/analyze/charts"
 _LAPS_PATH = "/workout-analysis/v2/analyze/laps"
 
 
-def _save_analysis_json(workout_id: int, data: dict[str, Any]) -> str:
+def _save_analysis_json(
+    workout_id: int, data: dict[str, Any], save_to: str | None = None
+) -> str:
     """Save full analysis data (including time-series) to a JSON file.
+
+    FORK 2026-09-21: ``save_to`` redirects the dump out of this process's
+    private tempdir. The default path is only reachable from inside the server,
+    so anything wanting to check the time series itself (a validation script, a
+    coach's notebook) could never open it. The generic dispatch-level ``save_to``
+    is no help here — it writes the tool's *return value*, which deliberately
+    leaves the time series out.
 
     Returns:
         Absolute path to the saved file.
     """
-    ANALYSIS_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    filepath = ANALYSIS_DATA_DIR / f"workout_{workout_id}.json"
+    if save_to:
+        filepath = Path(os.path.expanduser(save_to))
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        ANALYSIS_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        filepath = ANALYSIS_DATA_DIR / f"workout_{workout_id}.json"
     filepath.write_text(json.dumps(data, indent=2))
     return str(filepath)
 
@@ -146,13 +160,16 @@ def _stop_timestamp(start_iso: str | None, elapsed_seconds: Any) -> str | None:
     return (start_dt + timedelta(seconds=float(elapsed_seconds))).isoformat()
 
 
-async def tp_analyze_workout(workout_id: str) -> dict[str, Any]:
+async def tp_analyze_workout(workout_id: str, save_to: str | None = None) -> dict[str, Any]:
     """Get detailed workout analysis including metrics, zones, and lap data.
 
     Full time-series data is saved to a JSON file for further analysis.
 
     Args:
         workout_id: The workout ID (from tp_get_workouts).
+        save_to: Absolute path for the full dump (time series included). Without
+            it the dump lands in this process's tempdir, which nothing outside
+            the server can open.
 
     Returns:
         Dict with totals, data channels, lap data, and path to full data file.
@@ -286,7 +303,7 @@ async def tp_analyze_workout(workout_id: str) -> dict[str, Any]:
         }
 
     # Save full raw data (including time-series) to file
-    data_file = _save_analysis_json(wid, raw_data)
+    data_file = _save_analysis_json(wid, raw_data, save_to)
 
     # Return summary inline, point to file for full data
     totals_out = {t.name: {"value": t.value, "unit": t.unit} for t in analysis.totals}
@@ -316,6 +333,9 @@ async def tp_analyze_workout(workout_id: str) -> dict[str, Any]:
         "dataChannels": channels,
         "lapData": analysis.lap_data,
         "lapColumns": analysis.lap_columns,
+        # One lap means per-segment review cannot come from the device; it has
+        # to be reconstructed from the prescription (lo_verify_intervals).
+        "single_lap": len(analysis.lap_data) <= 1,
         "time_series_points": len(analysis.data),
         "data_file": data_file,
     }
