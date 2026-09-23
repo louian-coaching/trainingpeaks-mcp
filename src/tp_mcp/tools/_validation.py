@@ -92,10 +92,14 @@ class CreateWorkoutInput(BaseModel):
     def check_duration_or_structure(self) -> "CreateWorkoutInput":
         if self.structure is not None and self.structured_workout is not None:
             raise ValueError("Provide only one of structure or structured_workout")
+        # FORK: Other ＝行程標記課（移動日／上班／比賽週提醒…），TP 本身接受
+        # 不帶 totalTimePlanned，教練在 TP 網頁建的就是時長空白。不再要求
+        # 「先建 1 分鐘再改 0」（TECH-15 舊作法）。
         if (
             self.duration_minutes is None
             and self.structure is None
             and self.structured_workout is None
+            and self.sport != "Other"
         ):
             raise ValueError(
                 "Either duration_minutes, structure, or structured_workout must be provided",

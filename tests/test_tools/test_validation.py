@@ -128,6 +128,16 @@ class TestCreateWorkoutInput:
             )
         assert len(params.description) == 5000
 
+    def test_other_without_duration_is_allowed(self):
+        # FORK: Other ＝行程標記課（移動日等），TP 接受時長空白，不必先建 1 分鐘再改 0。
+        params = CreateWorkoutInput(date="2025-06-01", sport="Other", title="移動日", description="x")
+        assert params.duration_minutes is None
+
+    def test_non_other_without_duration_still_rejected(self):
+        for sport in ("Run", "Bike", "Swim", "DayOff"):
+            with pytest.raises(ValidationError):
+                CreateWorkoutInput(date="2025-06-01", sport=sport, title="Test")
+
     def test_duration_float_is_allowed(self):
         # FORK: create used to require int; update accepts float. Aligned to float.
         params = CreateWorkoutInput(date="2025-06-01", sport="Run", title="Test", duration_minutes=92.5)
