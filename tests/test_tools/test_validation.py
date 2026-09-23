@@ -133,8 +133,12 @@ class TestCreateWorkoutInput:
         params = CreateWorkoutInput(date="2025-06-01", sport="Other", title="移動日", description="x")
         assert params.duration_minutes is None
 
+    def test_dayoff_without_duration_is_allowed(self):
+        params = CreateWorkoutInput(date="2025-06-01", sport="DayOff", title="休息日")
+        assert params.duration_minutes is None
+
     def test_non_other_without_duration_still_rejected(self):
-        for sport in ("Run", "Bike", "Swim", "DayOff"):
+        for sport in ("Run", "Bike", "Swim"):
             with pytest.raises(ValidationError):
                 CreateWorkoutInput(date="2025-06-01", sport=sport, title="Test")
 

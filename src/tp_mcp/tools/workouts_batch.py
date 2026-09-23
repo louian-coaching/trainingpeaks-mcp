@@ -143,44 +143,27 @@ def _row_warnings(item: dict[str, Any], flat: dict[str, Any] | None,
     return warnings
 
 
-def _wants_zero_duration(item: dict[str, Any]) -> bool:
-    """DayOff 的 duration 不能是 0 或空 → 先建 1 分鐘、建完再改 0（既有眉角）。"""
-    return str(item.get("sport") or "") == "DayOff" and not item.get("duration_minutes")
-
-
 def _effective_fields(item: dict[str, Any]) -> dict[str, Any]:
-    """Passthrough fields with the DayOff placeholder applied.
+    """Passthrough fields.
 
-    預驗與實際建課走同一份欄位，否則 DayOff 會在預驗被
-    CreateWorkoutInput 的「duration 或 structure 至少要有一個」擋下來。
+    FORK 2026/09/23：DayOff／Other 可不帶時長（時長空白＝教練在 TP 網頁建的樣子），
+    舊的「先建 1 分鐘、建完再改 0」已拿掉；傳 0 也視同空白。
     """
     fields = {f: item.get(f) for f in _PASSTHROUGH_FIELDS}
-    if _wants_zero_duration(item):
-        fields["duration_minutes"] = 1
+    if str(item.get("sport") or "") in ("DayOff", "Other") and not fields.get("duration_minutes"):
+        fields["duration_minutes"] = None
     return fields
 
 
 async def _create_one(item: dict[str, Any]) -> dict[str, Any]:
-    """Create one workout, handling the DayOff zero-duration quirk."""
-    wants_zero = _wants_zero_duration(item)
-
+    """Create one workout."""
     kwargs: dict[str, Any] = {
         "date_str": item["date"],
         "sport": str(item.get("sport") or ""),
         "title": item["title"],
     }
     kwargs.update({k: v for k, v in _effective_fields(item).items() if v is not None})
-
-    created = await tp_create_workout(**kwargs)
-    if created.get("isError"):
-        return created
-
-    if wants_zero and created.get("workout_id") is not None:
-        zeroed = await tp_update_workout(
-            workout_id=str(created["workout_id"]), duration_minutes=0,
-        )
-        created["dayoff_zeroed"] = not zeroed.get("isError")
-    return created
+    return await tp_create_workout(**kwargs)
 
 
 async def tp_create_workouts_batch(
@@ -406,8 +389,6 @@ async def tp_create_workouts_batch(
             continue
 
         row.update({"status": "created", "workout_id": created.get("workout_id")})
-        if created.get("dayoff_zeroed") is not None:
-            row["dayoff_zeroed"] = created["dayoff_zeroed"]
         existing.add(key)
         results.append(row)
 

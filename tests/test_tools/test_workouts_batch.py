@@ -414,7 +414,8 @@ class TestReadback:
 
 class TestDayOff:
     @pytest.mark.asyncio
-    async def test_dayoff_is_created_at_one_minute_then_zeroed(self):
+    async def test_dayoff_is_created_without_duration(self):
+        # FORK 2026/09/23: DayOff／Other 時長空白直接建，不再 1 分鐘佔位→改 0
         create = AsyncMock(return_value={"success": True, "workout_id": 5})
         update = AsyncMock(return_value={"success": True})
         p1, p2, p3, p4 = _patches(
@@ -425,14 +426,17 @@ class TestDayOff:
         with p1, p2, p3, p4, patch(
             "tp_mcp.tools.workouts_batch.tp_update_workout", update,
         ):
-            result = await tp_create_workouts_batch(workouts=[{
-                "date": "2026-08-24", "sport": "DayOff", "title": "休息日",
-                "description": "三條式",
-            }])
+            result = await tp_create_workouts_batch(workouts=[
+                {"date": "2026-08-24", "sport": "DayOff", "title": "休息日",
+                 "description": "三條式", "duration_minutes": 0},
+                {"date": "2026-08-25", "sport": "Other", "title": "比賽週提醒",
+                 "description": "標準文"},
+            ])
 
-        assert create.call_args.kwargs["duration_minutes"] == 1
-        assert update.call_args.kwargs["duration_minutes"] == 0
-        assert result["results"][0]["dayoff_zeroed"] is True
+        for call in create.call_args_list:
+            assert "duration_minutes" not in call.kwargs
+        update.assert_not_called()
+        assert all(r["status"] == "created" for r in result["results"])
 
 
 # ---------------------------------------------------------------------------
