@@ -622,8 +622,13 @@ async def lo_get_week_for_validate(
     end_date: str,
     save_to: str,
     workout_filter: str = "planned",
+    _snapshot: bool = True,
 ) -> dict[str, Any]:
     """Read a date range back in the exact shape validate_week.py consumes.
+
+    FORK 2026-09-23: a planned read-back also refreshes the per-athlete snapshot
+    that ``lo_diff_week`` compares against (tools/lo_sync.py), and the parent
+    folder of ``save_to`` is created if missing (two failures on 09/23).
 
     tp_get_workouts (list) lacks structured_workout, so R2/R3/R4/R12 cannot be
     checked from it. This tool lists the range, then fetches the detail of
@@ -654,9 +659,19 @@ async def lo_get_week_for_validate(
         row.setdefault("type", "planned")
         out_rows.append(row)
     try:
+        import os
+        from pathlib import Path
+
+        save_to = str(Path(os.path.expanduser(save_to)))
+        Path(save_to).parent.mkdir(parents=True, exist_ok=True)
         _write_json(save_to, {"workouts": out_rows, "date_range": {"start": start_date, "end": end_date}})
     except OSError as e:
         return _err("API_ERROR", f"save_to failed: {e}")
+    snapshot_path = None
+    if _snapshot and workout_filter == "planned":
+        from tp_mcp.tools.lo_sync import save_snapshot
+
+        snapshot_path = save_snapshot(out_rows, start_date, end_date)
     per_sport: dict[str, int] = {}
     for r in out_rows:
         per_sport[str(r.get("sport"))] = per_sport.get(str(r.get("sport")), 0) + 1
@@ -676,6 +691,7 @@ async def lo_get_week_for_validate(
              "tss_planned": r.get("tss_planned")}
             for r in out_rows
         ],
+        "snapshot": snapshot_path,
         "next": f"python3 tp-ai-layer/tools/validate_week.py {save_to} <flags>",
     }
 

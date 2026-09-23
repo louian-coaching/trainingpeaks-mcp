@@ -1628,12 +1628,14 @@ from tp_mcp.tools.lo_strength import register_lo_strength  # noqa: E402
 from tp_mcp.tools.lo_tools import normalize_aliases, peek_payload_athlete, register_lo_tools  # noqa: E402
 from tp_mcp.tools.lo_review import register_lo_review  # noqa: E402
 from tp_mcp.tools.lo_verify import register_lo_verify  # noqa: E402
+from tp_mcp.tools.lo_sync import register_lo_sync  # noqa: E402
 
 _LO_HANDLERS: dict[str, Any] = {}
 register_lo_tools(TOOLS, _LO_HANDLERS)
 register_lo_strength(TOOLS, _LO_HANDLERS)
 register_lo_review(TOOLS, _LO_HANDLERS)
 register_lo_verify(TOOLS, _LO_HANDLERS)
+register_lo_sync(TOOLS, _LO_HANDLERS)
 
 for _tool in TOOLS:
     if _tool.name not in _ATHLETE_EXEMPT_TOOLS:
@@ -1721,7 +1723,7 @@ def _dump_and_summarize(name: str, result: Any, save_to: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _READ_ONLY_PREFIXES = ("tp_get_", "tp_list_", "tp_download_", "tp_search_", "tp_validate_", "tp_analyze_")
-_READ_ONLY_EXTRA = {"tp_auth_status", "lo_get_week_for_validate"}  # FORK: lo_ read tool
+_READ_ONLY_EXTRA = {"tp_auth_status", "lo_get_week_for_validate", "lo_diff_week"}  # FORK: lo_ read tool
 
 # Irrecoverable data removal. Everything else that writes is recoverable by a
 # follow-up call (update/re-add), so destructiveHint stays False there.
