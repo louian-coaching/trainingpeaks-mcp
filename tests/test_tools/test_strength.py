@@ -194,7 +194,7 @@ class TestCreate:
             mtp.return_value.__aenter__.return_value = _mock_tp_client()
             with patch("tp_mcp.tools.strength.httpx.AsyncClient") as mh:
                 mh.return_value.__aenter__.return_value = http
-                r = await tp_create_strength_workout(date="2027-01-06", title="Day", blocks=blocks)
+                r = await tp_create_strength_workout(date="2027-01-06", title="Day", blocks=blocks, force=True)
         assert r["workout_id"] == "555"
         assert r["total_sets"] == 1
 
@@ -213,7 +213,7 @@ class TestCreate:
             mtp.return_value.__aenter__.return_value = _mock_tp_client()
             with patch("tp_mcp.tools.strength.httpx.AsyncClient") as mh:
                 mh.return_value.__aenter__.return_value = http
-                r = await tp_create_strength_workout(date="2027-01-06", title="Day", blocks=blocks)
+                r = await tp_create_strength_workout(date="2027-01-06", title="Day", blocks=blocks, force=True)
         assert r["error_code"] == "API_ERROR"
         assert "bad" in r["message"]
 
@@ -222,7 +222,7 @@ class TestCreate:
         blocks = [{"type": "SingleExercise", "exercises": [{"id": "1", "sets": [{"Reps": "10"}]}]}]
         with patch("tp_mcp.tools.strength.TPClient") as mtp:
             mtp.return_value.__aenter__.return_value = _mock_tp_client(athlete_id=None)
-            r = await tp_create_strength_workout(date="2027-01-06", title="Day", blocks=blocks)
+            r = await tp_create_strength_workout(date="2027-01-06", title="Day", blocks=blocks, force=True)
         assert r["error_code"] == "AUTH_INVALID"
 
 
@@ -621,3 +621,42 @@ class TestUpdateStrength:
         r = await self._run(http, workout_id="24373159", blocks=_BLOCKS)
         assert r["error_code"] == "API_ERROR"
         assert "bad" in r["message"]
+
+
+class TestLint:
+    """FORK: coaching checks at write time (FMT-51/52)."""
+
+    def test_warmup_first_required(self):
+        from tp_mcp.tools.strength import _lint_blocks
+        r = _lint_blocks([{"type": "SingleExercise", "exercises": [{"id": "71", "sets": [{"Duration": "45"}]}]}])
+        assert any("WarmUp" in e for e in r["errors"])
+        r = _lint_blocks([{"type": "SingleExercise", "exercises": [{"id": "71", "sets": [{"Duration": "45"}]}]}],
+                         mobility=True)
+        assert not r["errors"]
+
+    def test_loaded_exercise_needs_weight(self):
+        from tp_mcp.tools.strength import _lint_blocks
+        blocks = [{"type": "WarmUp", "exercises": [{"id": "475", "sets": [{"Reps": "10"}]}]},
+                  {"type": "SingleExercise", "exercises": [{"id": "844", "sets": [{"RepsPerSide": "12"}]}]}]
+        r = _lint_blocks(blocks)
+        assert any("Split Squat with KB" in e for e in r["errors"])
+        blocks[1]["exercises"][0]["sets"] = [{"RepsPerSide": "12", "WeightPerSideKg": "8"}]
+        r = _lint_blocks(blocks)
+        assert not r["errors"]
+        assert r["resolved"][1]["title"] == "Split Squat with KB"
+
+    def test_equipment_warning(self):
+        from tp_mcp.tools.strength import _lint_blocks
+        r = _lint_blocks([{"type": "WarmUp", "exercises": [{"id": "5209", "sets": [{"RepsPerSide": "5"}]}]}])
+        assert r["warnings"] and "Banded" in r["warnings"][0]
+
+    @pytest.mark.asyncio
+    async def test_create_blocked_without_force(self):
+        blocks = [{"type": "SingleExercise", "exercises": [{"id": "1", "sets": [{"Reps": "10"}]}]}]
+        r = await tp_create_strength_workout(date="2027-01-06", title="Day", blocks=blocks)
+        assert r["error_code"] == "LINT_FAILED" and r["errors"]
+
+    def test_lookup_ids(self):
+        from tp_mcp.tools.strength import tp_lookup_exercise_ids
+        r = tp_lookup_exercise_ids(["5209", "nope"])
+        assert r["ids"]["5209"]["title"].startswith("Banded") and r["not_found"] == ["nope"]

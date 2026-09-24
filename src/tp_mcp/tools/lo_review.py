@@ -92,6 +92,8 @@ def planned_distance_m(description: str | None) -> float | None:
     if not description:
         return None
     body, _, _ = description.partition(_BODY_SPLIT)
+    # 「左右各25公尺」= 25 m each side = 50 m (unilateral drills, SWIM-xx house style)
+    body = re.sub(r"左右各\s*(\d+(?:\.\d+)?)\s*公尺", lambda m: f"{float(m.group(1)) * 2:g}公尺", body)
     total = 0.0
     for line in body.splitlines():
         line = line.strip().lstrip("-－ 　")
@@ -161,9 +163,45 @@ def _num(val: Any) -> float:
     return float(val) if isinstance(val, (int, float)) else 0.0
 
 
+def _merge_fragments(workouts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """FORK: fold a device-split recording into the planned session it belongs to.
+
+    A watch that stops mid-session uploads two files; TP pairs one with the
+    planned workout and leaves the other as an untitled, unplanned activity on
+    the same day and sport (09/23: swim class 24.8 min + 11.6 min). Reported
+    raw, that is one false "incomplete 41%" plus one false "unplanned". A
+    completed row with no plan and no title is added to the same-day, same-sport
+    completed row that has a plan; nothing else is touched."""
+    def has_plan(w: dict[str, Any]) -> bool:
+        return bool(w.get("duration_planned") or w.get("distance_planned_km") or w.get("tss_planned")
+                    or planned_distance_m(w.get("description")))
+
+    out = [dict(w) for w in workouts]
+    merged: list[dict[str, Any]] = []
+    drop: set[int] = set()
+    for i, frag in enumerate(out):
+        if frag.get("type") != "completed" or has_plan(frag) or (frag.get("title") or "").strip():
+            continue
+        host = next((h for j, h in enumerate(out) if j != i and j not in drop
+                     and h.get("type") == "completed" and has_plan(h)
+                     and str(h.get("date"))[:10] == str(frag.get("date"))[:10]
+                     and h.get("sport") == frag.get("sport")), None)
+        if host is None:
+            continue
+        for key in ("duration_actual", "distance_actual_km", "tss_actual"):
+            if isinstance(frag.get(key), (int, float)):
+                host[key] = (host.get(key) or 0) + frag[key]
+        host.setdefault("merged_fragments", []).append(frag.get("id"))
+        merged.append({"fragment_id": frag.get("id"), "into": host.get("id"), "date": str(frag.get("date"))[:10],
+                       "sport": frag.get("sport")})
+        drop.add(i)
+    return [w for i, w in enumerate(out) if i not in drop], merged
+
+
 def summarize_workouts(
     workouts: list[dict[str, Any]],
     incomplete_below: float = 90.0,
+    merge_fragments: bool = True,
 ) -> dict[str, Any]:
     """Strip descriptions, add per-sport completion, flag the gaps.
 
@@ -174,6 +212,9 @@ def summarize_workouts(
     unplanned: list[dict[str, Any]] = []
     per_sport: dict[str, dict[str, float]] = {}
     tss_planned_total = tss_actual_total = 0.0
+    merged: list[dict[str, Any]] = []
+    if merge_fragments:
+        workouts, merged = _merge_fragments(workouts)
 
     for w in workouts:
         basis = _basis_for(w)
@@ -197,6 +238,8 @@ def summarize_workouts(
         for key in ("tss_planned", "tss_actual"):
             if w.get(key) is not None:
                 row[key] = w[key]
+        if w.get("merged_fragments"):
+            row["merged_fragments"] = w["merged_fragments"]
         rows.append(row)
 
         tss_planned_total += _num(w.get("tss_planned"))
@@ -227,6 +270,8 @@ def summarize_workouts(
         out["incomplete"] = incomplete
     if unplanned:
         out["unplanned"] = unplanned
+    if merged:
+        out["merged_fragments"] = merged
     return out
 
 
@@ -235,6 +280,8 @@ async def lo_get_workouts_summary(
     end_date: str,
     workout_filter: str = "all",
     incomplete_below: float = 90.0,
+    save_to: str | None = None,
+    merge_fragments: bool = True,
 ) -> dict[str, Any]:
     """List workouts without their descriptions, with per-sport completion.
 
@@ -256,8 +303,18 @@ async def lo_get_workouts_summary(
     if res.get("isError"):
         return res
 
-    out = summarize_workouts(res.get("workouts") or [], incomplete_below=incomplete_below)
+    out = summarize_workouts(res.get("workouts") or [], incomplete_below=incomplete_below,
+                             merge_fragments=merge_fragments)
     out["date_range"] = res.get("date_range") or {"start": start_date, "end": end_date}
+    if save_to:
+        import json
+        from pathlib import Path
+        p = Path(save_to).expanduser()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+        return {"saved_to": str(p), "count": out["count"], "totals": out["totals"],
+                **{k: out[k] for k in ("incomplete", "unplanned", "merged_fragments") if k in out},
+                "date_range": out["date_range"]}
     return out
 
 
@@ -288,6 +345,12 @@ def register_lo_review(tools: list[Any], handlers: dict[str, Any]) -> None:
                     "default": "all",
                     "description": "Filter by status.",
                 },
+                "save_to": {"type": "string", "description": (
+                    "Absolute path ON THE MACHINE RUNNING THIS SERVER: write the full summary there and "
+                    "return only totals + incomplete/unplanned (keeps a multi-week review out of context).")},
+                "merge_fragments": {"type": "boolean", "default": True, "description": (
+                    "Fold an untitled, unplanned completed activity into the same-day, same-sport planned "
+                    "session (device-split recordings). Set false to see the raw rows.")},
                 "incomplete_below": {
                     "type": "number",
                     "default": 90,
@@ -306,6 +369,8 @@ def register_lo_review(tools: list[Any], handlers: dict[str, Any]) -> None:
             end_date=args["end_date"],
             workout_filter=args.get("type", "all"),
             incomplete_below=float(args.get("incomplete_below", 90)),
+            save_to=args.get("save_to"),
+            merge_fragments=bool(args.get("merge_fragments", True)),
         )
 
     handlers["lo_get_workouts_summary"] = _h_summary

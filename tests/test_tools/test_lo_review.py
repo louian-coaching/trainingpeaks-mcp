@@ -289,3 +289,19 @@ def test_bike_stays_on_time_even_with_distances_in_the_body():
         "distance_actual_km": 95.0, "description": "- 50公里@50-65%",
     }])
     assert rows["workouts"][0]["basis"] == "duration"
+
+
+def test_device_split_fragment_is_merged():
+    from tp_mcp.tools.lo_review import summarize_workouts
+    ws = [
+        {"id": "a", "date": "2026-09-23", "sport": "Swim", "title": "游泳課堂", "type": "completed",
+         "duration_planned": 1.0, "duration_actual": 24.8 / 60, "tss_planned": 45, "tss_actual": 45.7},
+        {"id": "b", "date": "2026-09-23", "sport": "Swim", "title": None, "type": "completed",
+         "duration_actual": 11.6 / 60, "tss_actual": 16.7},
+    ]
+    out = summarize_workouts(ws)
+    assert out["count"] == 1 and "unplanned" not in out
+    assert out["workouts"][0]["actual"] == 36.4
+    assert out["merged_fragments"][0]["into"] == "a"
+    raw = summarize_workouts(ws, merge_fragments=False)
+    assert raw["count"] == 2 and raw["unplanned"]

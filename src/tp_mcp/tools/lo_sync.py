@@ -212,6 +212,20 @@ async def lo_diff_week(start_date: str, end_date: str, save_snapshot_after: bool
                               "suggested_body": r["suggested_body"]})
         out["thresholds"] = th
         out["stale_bodies"] = stale
+    # swims have no graph: check the body's metres against TP's distance field
+    from tp_mcp.tools.lo_review import planned_distance_m
+    swim_mis = []
+    for w in rows:
+        if str(w.get("sport")) != "Swim":
+            continue
+        body_m = planned_distance_m(w.get("description"))
+        tp_km = w.get("distance_planned_km")
+        if body_m and isinstance(tp_km, (int, float)) and tp_km and abs(body_m - tp_km * 1000) >= 50:
+            swim_mis.append({"id": str(w.get("id")), "date": _day(w.get("date")), "title": w.get("title"),
+                             "body_m": body_m, "distance_planned_km": tp_km,
+                             "fix": {"workout_id": str(w.get("id")), "distance_km": round(body_m / 1000, 3)}})
+    if swim_mis:
+        out["swim_distance_mismatch"] = swim_mis
     if save_snapshot_after:
         out["snapshot"] = save_snapshot(rows, start_date, end_date)
     out["readback_json_path"] = str(Path(tmp).expanduser())

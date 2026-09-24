@@ -52,6 +52,7 @@ Choosing a default unit (e.g. kg) is the caller's concern, not the connector's.
 
 import json
 import logging
+import re
 import uuid
 from functools import lru_cache
 from typing import Any
@@ -171,6 +172,21 @@ async def tp_search_exercises(
     return {"count": len(out), "exercises": out}
 
 
+def tp_lookup_exercise_ids(ids: list[Any]) -> dict[str, Any]:
+    """FORK: reverse lookup — library title/parameters for each id (offline)."""
+    cat = _catalogue()
+    found, missing = {}, []
+    for i in ids or []:
+        k = str(i).strip()
+        ex = cat.get(k)
+        if not ex:
+            missing.append(k)
+            continue
+        found[k] = {"title": ex["title"], "video_url": ex.get("videoUrl"),
+                    "parameters": [p["parameter"] for p in ex.get("parameters", [])]}
+    return {"ids": found, "not_found": missing}
+
+
 # ── Payload construction ────────────────────────────────────────────────────
 
 
@@ -210,6 +226,50 @@ def _validate_blocks(blocks: list[dict[str, Any]]) -> str | None:
                 f"exercise (got {set_counts})."
             )
     return None
+
+
+# FORK: coaching lint for strength blocks (validate_strength S9/S10 moved to write time).
+_LOADED_RE = re.compile(
+    r"\b(db|kb|dumbbell|barbell|kettlebell|weighted|goblet|cable|machine|landmine|plate|"
+    r"trap bar|safety bar|smith)\b", re.I)
+_EQUIP_RE = re.compile(r"\b(band|banded|swiss ball|stability ball|trx|foam roller|bosu|box|bench|bar)\b", re.I)
+_WEIGHT_PARAMS = ("WeightKg", "WeightPerSideKg", "WeightLb", "WeightPerSideLb", "WeightPercentage")
+
+
+def _lint_blocks(blocks: list[dict[str, Any]], title: str = "", mobility: bool = False) -> dict[str, Any]:
+    """Coaching checks run before a strength write.
+
+    errors  → block the write unless force=True:
+      * first block is not a WarmUp (FMT-52) — skipped for mobility sessions
+      * a loaded exercise (title names KB/DB/barbell/…) has a set without any weight parameter (FMT-51)
+    warnings → returned, never block:
+      * exercises whose library title implies equipment (band, ball, TRX, roller, box, bench)
+    Also returns `resolved`: the library title for every id, so a wrong id is
+    visible at write time instead of after a read-back.
+    """
+    catalogue = _catalogue()
+    errors: list[str] = []
+    warnings: list[str] = []
+    resolved: list[dict[str, Any]] = []
+    is_mob = mobility or ("活動度" in (title or ""))
+    if blocks and not is_mob and (blocks[0].get("type") or "SingleExercise") != "WarmUp":
+        errors.append("blocks[0] is not a WarmUp block (FMT-52: every strength session opens with a warm-up; "
+                      "pass mobility=true for a mobility-only session)")
+    for bi, b in enumerate(blocks or []):
+        for ex in b.get("exercises") or []:
+            eid = str(ex.get("id", "")).strip()
+            meta = catalogue.get(eid) or {}
+            name = meta.get("title") or "?"
+            resolved.append({"block": bi, "id": eid, "title": name})
+            if _LOADED_RE.search(name):
+                missing = [si + 1 for si, st in enumerate(ex.get("sets") or [])
+                           if not any(str(st.get(k) or "").strip() for k in _WEIGHT_PARAMS)]
+                if missing:
+                    errors.append(f"block[{bi}] {name} (id {eid}): set(s) {missing} have no weight parameter "
+                                  f"(FMT-51: loaded exercises need WeightKg/WeightPerSideKg on every set)")
+            if _EQUIP_RE.search(name):
+                warnings.append(f"block[{bi}] {name} (id {eid}) implies equipment — confirm the athlete has it")
+    return {"errors": errors, "warnings": warnings, "resolved": resolved}
 
 
 def _u() -> str:
@@ -338,6 +398,9 @@ async def tp_create_strength_workout(
     title: str,
     blocks: list[dict[str, Any]],
     instructions: str | None = None,
+    mobility: bool = False,
+    force: bool = False,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Create a structured strength (gym) workout on the athlete's calendar.
 
@@ -368,6 +431,14 @@ async def tp_create_strength_workout(
     invalid = _validate_blocks(blocks)
     if invalid:
         return _err("VALIDATION_ERROR", invalid)
+    lint = _lint_blocks(blocks, title=title, mobility=mobility)
+    if lint["errors"] and not force:
+        out = _err("LINT_FAILED", "Strength workout failed coaching checks; nothing was created. "
+                   "Fix the blocks, or pass force=true for a deliberate exception.")
+        out.update(lint)
+        return out
+    if dry_run:
+        return {"dry_run": True, **lint}
 
     async with TPClient() as client:
         athlete_id, access, err = await _access(client)
@@ -406,6 +477,9 @@ async def tp_create_strength_workout(
             "title": title.strip(),
             "total_blocks": snap.get("totalBlocks"),
             "total_sets": snap.get("totalSets"),
+            "exercises": [f"{r['title']} ({r['id']})" for r in lint["resolved"]],
+            **({"warnings": lint["warnings"]} if lint["warnings"] else {}),
+            **({"forced_past": lint["errors"]} if lint["errors"] else {}),
         }
 
 

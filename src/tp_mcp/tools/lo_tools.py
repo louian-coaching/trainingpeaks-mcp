@@ -658,13 +658,30 @@ async def lo_get_week_for_validate(
         row = dict(w)
         row.setdefault("type", "planned")
         out_rows.append(row)
+    # FORK: Strength Builder sessions live on another API and never appear in
+    # tp_get_workouts — carry them alongside so validate_week sees them (R33/R54)
+    strength_rows: list[dict[str, Any]] = []
+    strength_error = None
+    try:
+        from tp_mcp.tools.strength import tp_get_strength_workouts
+
+        st = await tp_get_strength_workouts(start_date=start_date, end_date=end_date)
+        if isinstance(st, dict) and st.get("isError"):
+            strength_error = st.get("message")
+        else:
+            for w in (st or {}).get("workouts") or []:
+                strength_rows.append({k: w.get(k) for k in ("workout_id", "date", "title", "total_sets",
+                                                             "compliance_state", "exercises")})
+    except Exception as e:  # noqa: BLE001 — strength is best-effort, never blocks the week
+        strength_error = str(e)
     try:
         import os
         from pathlib import Path
 
         save_to = str(Path(os.path.expanduser(save_to)))
         Path(save_to).parent.mkdir(parents=True, exist_ok=True)
-        _write_json(save_to, {"workouts": out_rows, "date_range": {"start": start_date, "end": end_date}})
+        _write_json(save_to, {"workouts": out_rows, "strength_workouts": strength_rows,
+                              "date_range": {"start": start_date, "end": end_date}})
     except OSError as e:
         return _err("API_ERROR", f"save_to failed: {e}")
     snapshot_path = None
@@ -692,6 +709,9 @@ async def lo_get_week_for_validate(
             for r in out_rows
         ],
         "snapshot": snapshot_path,
+        "strength": [f"{r.get('date')} {r.get('title')} ({r.get('workout_id')}, {r.get('total_sets')} sets)"
+                     for r in strength_rows],
+        **({"strength_error": strength_error} if strength_error else {}),
         "next": f"python3 tp-ai-layer/tools/validate_week.py {save_to} <flags>",
     }
 

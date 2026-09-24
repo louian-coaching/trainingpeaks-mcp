@@ -166,7 +166,34 @@ async def tp_log_metrics(
         }
 
 
-async def tp_get_metrics(start_date: str, end_date: str) -> dict[str, Any]:
+_DAILY_KEYS = {"HRV": "hrv", "Sleep Hours": "sleep_h", "Pulse": "rhr", "Time in Deep Sleep": "deep_h",
+               "Time in REM Sleep": "rem_h", "Body Battery": "body_battery", "Stress Level": "stress",
+               "Weight": "weight", "Soreness": "soreness", "Fatigue": "fatigue", "Mood": "mood",
+               "Sleep Quality": "sleep_quality", "SPO2": "spo2"}
+
+
+def _daily_table(metrics: list[Any]) -> list[dict[str, Any]]:
+    """FORK: one row per day with the monitoring fields (method/0 §0.3 cluster)."""
+    rows = []
+    for m in metrics or []:
+        if not isinstance(m, dict):
+            continue
+        row: dict[str, Any] = {"date": str(m.get("timeStamp") or "")[:10]}
+        for d in m.get("details") or []:
+            key = _DAILY_KEYS.get(d.get("label"))
+            if not key:
+                continue
+            v = d.get("value")
+            if isinstance(v, list):  # [min, max, avg] (Body Battery, Stress)
+                v = [round(x, 1) if isinstance(x, float) else x for x in v]
+            elif isinstance(v, float):
+                v = round(v, 2)
+            row[key] = v
+        rows.append(row)
+    return rows
+
+
+async def tp_get_metrics(start_date: str, end_date: str, detail: str = "compact") -> dict[str, Any]:
     """Get health metrics for a date range.
 
     Args:
@@ -214,9 +241,14 @@ async def tp_get_metrics(start_date: str, end_date: str) -> dict[str, Any]:
                 "message": "No metrics data for this date range.",
             }
 
+        data = response.data if isinstance(response.data, list) else [response.data]
+        if str(detail or "compact").lower() != "full":
+            return {"daily": _daily_table(data), "count": len(data),
+                    "date_range": {"start": start_date, "end": end_date},
+                    "note": "compact; list fields are [min, max, avg]. detail='full' for raw metric records."}
         return {
-            "metrics": response.data if isinstance(response.data, list) else [response.data],
-            "count": len(response.data) if isinstance(response.data, list) else 1,
+            "metrics": data,
+            "count": len(data),
             "date_range": {"start": start_date, "end": end_date},
         }
 

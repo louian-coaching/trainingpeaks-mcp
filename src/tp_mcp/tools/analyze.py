@@ -160,7 +160,45 @@ def _stop_timestamp(start_iso: str | None, elapsed_seconds: Any) -> str | None:
     return (start_dt + timedelta(seconds=float(elapsed_seconds))).isoformat()
 
 
-async def tp_analyze_workout(workout_id: str, save_to: str | None = None) -> dict[str, Any]:
+_LAP_KEEP = (
+    ("Name", "name"), ("Intensity", "class"), ("TotalTimerTime", "sec"), ("TotalDistance", "km"),
+    ("AveragePace", "pace_s"), ("NormalizedGradedPace", "ngp_s"), ("AveragePower", "avg_w"),
+    ("NormalizedPower", "np_w"), ("AverageHeartRate", "avg_hr"), ("MaximumHeartRate", "max_hr"),
+    ("AverageCadence", "cad"), ("TotalAscent", "gain_m"), ("TSS", "tss"), ("rTSS", "rtss"),
+)
+_TOTAL_KEEP = ("Duration", "Moving time", "Distance", "TSS", "rTSS", "IF", "rIF", "NP", "NGP",
+               "Avg Power", "Average Power", "Avg Pace", "EF", "Pw:Hr", "Pa:Hr", "El. Gain", "VI")
+_CHANNEL_KEEP = ("HeartRate", "Power", "Pace", "Speed", "Cadence")
+
+
+def _compact(full: dict[str, Any]) -> dict[str, Any]:
+    """FORK: lap table + key totals only (the full dump is still written to data_file)."""
+    laps = []
+    for lap in full.get("lapData") or []:
+        row = {}
+        for src, dst in _LAP_KEEP:
+            v = lap.get(src)
+            if v is not None and v != "":
+                row[dst] = round(v, 2) if isinstance(v, float) else v
+        laps.append(row)
+    totals = {k: v.get("value") for k, v in (full.get("totals") or {}).items() if k in _TOTAL_KEEP}
+    chans = {c["identifier"]: [c.get("min"), c.get("max"), c.get("average")]
+             for c in full.get("dataChannels") or [] if c.get("identifier") in _CHANNEL_KEEP}
+    return {
+        "workoutId": full.get("workoutId"),
+        "startTimestamp": full.get("startTimestamp"),
+        "totals": totals,
+        "channels_min_max_avg": chans,
+        "laps": laps,
+        "lap_units": "sec=timer seconds, pace_s/ngp_s=seconds per km, km=distance",
+        "single_lap": full.get("single_lap"),
+        "time_series_points": full.get("time_series_points"),
+        "data_file": full.get("data_file"),
+        "detail": "compact (pass detail='full' for zones, all lap columns and channel metadata)",
+    }
+
+
+async def tp_analyze_workout(workout_id: str, save_to: str | None = None, detail: str = "compact") -> dict[str, Any]:
     """Get detailed workout analysis including metrics, zones, and lap data.
 
     Full time-series data is saved to a JSON file for further analysis.
@@ -325,7 +363,7 @@ async def tp_analyze_workout(workout_id: str, save_to: str | None = None) -> dic
         for ch in analysis.data_elements
     ]
 
-    return {
+    full = {
         "workoutId": analysis.workout_id,
         "startTimestamp": analysis.start_timestamp,
         "stopTimestamp": analysis.stop_timestamp,
@@ -339,3 +377,4 @@ async def tp_analyze_workout(workout_id: str, save_to: str | None = None) -> dic
         "time_series_points": len(analysis.data),
         "data_file": data_file,
     }
+    return full if str(detail or "compact").lower() == "full" else _compact(full)

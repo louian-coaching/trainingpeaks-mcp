@@ -171,7 +171,8 @@ def _part(step: dict[str, Any], *, sport: str, metric: str, th: dict[str, Any],
         if easy and role == "work" and kind == "s" and pct and pct[1] <= 80:
             return f"輕鬆慢跑{amount}，配速不限，以能夠只以鼻子呼吸為原則。"
         if role == "work" and kind == "s" and val <= 30 and pct and pct[0] >= 95:
-            return f"{amount}加速跑"
+            # keep the target: "30秒@3:59~3:49/km" / "30秒@301~316W"; bare "加速跑" only when no target
+            return f"{amount}{inten}" if inten and not easy else f"{amount}加速跑"
         if role == "warm" and kind == "s":
             return f"暖身跑{amount}+伸展"
         if role == "cool" and kind == "s":
@@ -227,10 +228,12 @@ def render_body_lines(sw: dict[str, Any], sport: str, th: dict[str, Any], title:
             continue
         parts = [
             _part(st, sport=sport, metric=metric, th=th,
-                  role=_role(st, first=False, last=False, in_rep=True), big_hours=False)
+                  role=_role(st, first=False, last=False, in_rep=True), big_hours=False, easy=easy)
             for st in steps
         ]
-        joiner = ", " if any(p.endswith("加速跑") for p in parts) else "+"
+        short_first = (sport == "Run" and _length(steps[0])[0] == "s" and _length(steps[0])[1] <= 30
+                       and _role(steps[0], first=False, last=False, in_rep=True) == "work")
+        joiner = ", " if short_first or any(p.endswith("加速跑") for p in parts) else "+"
         line = "- " + joiner.join(parts)
         if reps > 1:
             line += f", {reps}組"
@@ -284,7 +287,24 @@ def _tok_eq(a: str, b: str) -> bool:
         return False
 
 
+def _drop_short_intensity(sig: tuple[str, ...]) -> tuple[str, ...]:
+    """Strides / sprints (≤30 s) are written either with a target
+    ("30秒@301~316W") or without ("20秒衝刺跑"): the target is optional text,
+    so drop a pace/power token that directly follows a ≤30 s time token."""
+    out: list[str] = []
+    skip = False
+    for i, t in enumerate(sig):
+        if skip:
+            skip = False
+            continue
+        out.append(t)
+        if t[0] == "t" and t[1:].isdigit() and int(t[1:]) <= 30 and i + 1 < len(sig) and sig[i + 1][0] in "wp":
+            skip = True
+    return tuple(out)
+
+
 def sig_eq(a: tuple[str, ...], b: tuple[str, ...]) -> bool:
+    a, b = _drop_short_intensity(a), _drop_short_intensity(b)
     return len(a) == len(b) and all(_tok_eq(x, y) for x, y in zip(a, b, strict=True))
 
 

@@ -294,3 +294,15 @@ async def test_delete_batch_dry_run():
         out = await lo_delete_workouts_batch(["1"], dry_run=True)
     assert out["results"][0]["status"] == "would_delete"
     d.assert_not_called()
+
+
+def test_render_run_strides_keep_target_and_match_both_writings():
+    from tp_mcp.tools.lo_render import compare_body
+    sw = {"primaryIntensityMetric": "percentOfThresholdPace", "structure": [
+        rep(2, step(30, lo=112, hi=117), step(90, lo=50, hi=65, cls="rest")),
+    ]}
+    lines = render_body_lines(sw, "Run", {"run_pace_sec": 280}, "速度間歇")
+    assert lines[0] == "- 30秒@4:10~3:59/km, 慢跑恢復1分30秒, 2組"
+    # a body written with the pace, or as bare 衝刺跑, both count as in sync
+    assert compare_body("- 30秒@4:10~3:59/km, 慢跑恢復1分30秒, 2組\n- 伸展", lines)["in_sync"]
+    assert compare_body("- 30秒衝刺跑, 慢跑恢復1分30秒, 2組\n- 伸展", lines)["in_sync"]

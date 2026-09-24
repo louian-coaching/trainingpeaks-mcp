@@ -128,3 +128,11 @@ class TestGetNutrition:
             result = await tp_get_nutrition("2026-03-01", "2026-03-07")
 
         assert "No nutrition" in result.get("message", "")
+
+
+def test_daily_table_compact():
+    from tp_mcp.tools.metrics import _daily_table
+    rows = _daily_table([{"timeStamp": "2026-09-24T00:00:00", "details": [
+        {"label": "HRV", "value": 98}, {"label": "Sleep Hours", "value": 6.5333},
+        {"label": "Body Battery", "value": [5, 57, 34.5103]}, {"label": "Time Awake", "value": 0.1}]}])
+    assert rows == [{"date": "2026-09-24", "hrv": 98, "sleep_h": 6.53, "body_battery": [5, 57, 34.5]}]

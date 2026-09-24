@@ -193,7 +193,38 @@ async def tp_get_next_event() -> dict[str, Any]:
 
 
 async def tp_get_events(start_date: str, end_date: str) -> dict[str, Any]:
-    """List events in a date range.
+    """List events in a date range; FORK: ranges over 90 days are fetched in 90-day chunks."""
+    from datetime import date as _date
+    from datetime import timedelta as _td
+    try:
+        s_d, e_d = _date.fromisoformat(str(start_date)), _date.fromisoformat(str(end_date))
+    except ValueError:
+        s_d = e_d = None
+    if s_d and e_d and e_d >= s_d and (e_d - s_d).days > 89:
+        if (e_d - s_d).days > 730:
+            return {"isError": True, "error_code": "VALIDATION_ERROR",
+                    "message": "Date range too large even for chunked fetch (max 2 years)."}
+        events: list[Any] = []
+        seen: set[Any] = set()
+        cur = s_d
+        while cur <= e_d:
+            chunk_end = min(cur + _td(days=89), e_d)
+            r = await _tp_get_events_window(cur.isoformat(), chunk_end.isoformat())
+            if r.get("isError"):
+                return r
+            for evt in r.get("events") or []:
+                key = evt.get("id") if isinstance(evt, dict) else id(evt)
+                if key not in seen:
+                    seen.add(key)
+                    events.append(evt)
+            cur = chunk_end + _td(days=1)
+        return {"events": events, "count": len(events),
+                "date_range": {"start": s_d.isoformat(), "end": e_d.isoformat()}, "chunked": True}
+    return await _tp_get_events_window(start_date, end_date)
+
+
+async def _tp_get_events_window(start_date: str, end_date: str) -> dict[str, Any]:
+    """List events in a date range (≤90 days).
 
     Args:
         start_date: Start date (YYYY-MM-DD).

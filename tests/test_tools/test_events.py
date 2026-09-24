@@ -721,3 +721,20 @@ class TestUpdateEventAttachLegs:
             await tp_update_event(event_id="1", description="just a note")
 
         assert mock_instance.put.call_args.kwargs["json"]["workouts"] == [55]
+
+
+@pytest.mark.asyncio
+async def test_events_long_range_is_chunked():
+    from unittest.mock import patch as _p
+
+    from tp_mcp.tools import events as ev
+    calls = []
+
+    async def fake(s, e):
+        calls.append((s, e))
+        return {"events": [{"id": 1}] if len(calls) == 1 else [{"id": 1}, {"id": 2}], "count": 1}
+
+    with _p.object(ev, "_tp_get_events_window", side_effect=fake):
+        r = await ev.tp_get_events("2026-09-24", "2027-03-31")
+    assert r["chunked"] and len(calls) == 3 and [e["id"] for e in r["events"]] == [1, 2]
+    assert calls[0] == ("2026-09-24", "2026-12-22")

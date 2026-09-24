@@ -95,6 +95,8 @@ class TestPatch:
         weights = [pv["prescribedValue"] for s in row["sets"] for pv in s["parameterValues"]
                    if pv["parameter"] == "WeightKg"]
         assert weights == ["12"] * 3
+        # TECH-44: the patched prescription is sent with fresh ids (server drops reused ids)
+        assert row["id"] != "p-Dumbbell Row"
         # untouched exercise keeps its ids and values
         assert posted["blocks"][1]["prescriptions"][0]["id"] == "p-Dead Bug"
         assert r["total_sets"] == 6 and r["changed"] == ["patch Dumbbell Row"]

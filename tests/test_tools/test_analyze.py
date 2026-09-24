@@ -186,7 +186,7 @@ class TestTpAnalyzeWorkout:
 
         with patch("tp_mcp.tools.analyze.TPClient") as mock_tp:
             mock_tp.return_value.__aenter__.return_value = mock_client
-            result = await tp_analyze_workout("12345")
+            result = await tp_analyze_workout("12345", detail="full")
 
         assert result["isError"] is True
         assert result["error_code"] == "AUTH_INVALID"
@@ -205,7 +205,7 @@ class TestTpAnalyzeWorkout:
 
         with patch("tp_mcp.tools.analyze.TPClient") as mock_tp:
             mock_tp.return_value.__aenter__.return_value = mock_client
-            result = await tp_analyze_workout("12345")
+            result = await tp_analyze_workout("12345", detail="full")
 
         assert result["isError"] is True
         assert result["error_code"] == "AUTH_INVALID"
@@ -220,7 +220,7 @@ class TestTpAnalyzeWorkout:
                 mock_http_client = _mock_post_sequence()
                 mock_httpx.return_value.__aenter__.return_value = mock_http_client
 
-                result = await tp_analyze_workout("3553733903")
+                result = await tp_analyze_workout("3553733903", detail="full")
 
         assert "isError" not in result or not result.get("isError")
         assert result["workoutId"] == 3553733903
@@ -271,7 +271,7 @@ class TestTpAnalyzeWorkout:
                 mock_http_client = _mock_post_sequence(status_charts=404, status_laps=404)
                 mock_httpx.return_value.__aenter__.return_value = mock_http_client
 
-                result = await tp_analyze_workout("3553733903")
+                result = await tp_analyze_workout("3553733903", detail="full")
 
         assert "isError" not in result or not result.get("isError")
         assert result["totals"]["TSS"]["value"] == 75.2
@@ -289,7 +289,7 @@ class TestTpAnalyzeWorkout:
                 mock_http_client = _mock_post_sequence(status_summary=401)
                 mock_httpx.return_value.__aenter__.return_value = mock_http_client
 
-                result = await tp_analyze_workout("12345")
+                result = await tp_analyze_workout("12345", detail="full")
 
         assert result["isError"] is True
         assert result["error_code"] == "AUTH_EXPIRED"
@@ -308,7 +308,7 @@ class TestTpAnalyzeWorkout:
                 mock_http_client = _mock_post_sequence(status_charts=401)
                 mock_httpx.return_value.__aenter__.return_value = mock_http_client
 
-                result = await tp_analyze_workout("12345")
+                result = await tp_analyze_workout("12345", detail="full")
 
         assert result["isError"] is True
         assert result["error_code"] == "AUTH_EXPIRED"
@@ -341,7 +341,7 @@ class TestTpAnalyzeWorkout:
                 mock_http_client.post.side_effect = httpx.TimeoutException("timed out")
                 mock_httpx.return_value.__aenter__.return_value = mock_http_client
 
-                result = await tp_analyze_workout("12345")
+                result = await tp_analyze_workout("12345", detail="full")
 
         assert result["isError"] is True
         assert result["error_code"] == "NETWORK_ERROR"
@@ -357,7 +357,7 @@ class TestTpAnalyzeWorkout:
                 mock_http_client.post.side_effect = httpx.ConnectError("refused")
                 mock_httpx.return_value.__aenter__.return_value = mock_http_client
 
-                result = await tp_analyze_workout("12345")
+                result = await tp_analyze_workout("12345", detail="full")
 
         assert result["isError"] is True
         assert result["error_code"] == "NETWORK_ERROR"
@@ -382,3 +382,17 @@ class TestTpAnalyzeWorkout:
                 assert headers["Authorization"] == f"Bearer {TEST_ACCESS_TOKEN}"
                 assert "Cookie" not in headers
                 assert call_kwargs.kwargs["json"] == {"workoutId": 3553733903}
+
+
+def test_compact_shape():
+    from tp_mcp.tools.analyze import _compact
+    full = {"workoutId": 1, "totals": {"Distance": {"value": 9.5, "unit": "km"}, "Grade": {"value": 0}},
+            "dataChannels": [{"identifier": "Power", "min": 0, "max": 280, "average": 220, "zones": [1]},
+                             {"identifier": "Altitude", "min": 1}],
+            "lapData": [{"Name": "Lap 1", "TotalTimerTime": 300, "AveragePace": 317, "AveragePower": 187.4,
+                         "PowerPulseDecoupling": 3, "AverageStepLength": 1000}],
+            "single_lap": False, "data_file": "/x.json"}
+    c = _compact(full)
+    assert c["totals"] == {"Distance": 9.5}
+    assert c["channels_min_max_avg"] == {"Power": [0, 280, 220]}
+    assert c["laps"] == [{"name": "Lap 1", "sec": 300, "pace_s": 317, "avg_w": 187.4}]

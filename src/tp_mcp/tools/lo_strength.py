@@ -153,7 +153,25 @@ def _apply_patch(doc: dict[str, Any], patch: dict[str, Any]) -> str | None:
             new_sets.append({**base, "parameterValues": values})
         p["sets"] = new_sets
         _sync_columns(p)
+    _refresh_ids(p)
     return None
+
+
+def _refresh_ids(p: dict[str, Any]) -> None:
+    """Give a patched prescription and its sets / parameterValues fresh ids.
+
+    TECH-44 root cause (09/24): the Strength API drops a parameterValue whose
+    id already exists when its value changes — that is why an overwrite
+    "cleared" a set, why a second send worked, and why Reps+Weight landed one
+    at a time, alternating. Full ``blocks`` replaces always worked because
+    _build_prescription mints new ids. So a patched prescription now gets
+    new ids too and is, on the wire, the same thing a replace sends.
+    Untouched exercises keep their ids."""
+    p["id"] = _s._u()
+    for st in p.get("sets") or []:
+        st["id"] = _s._u()
+        for pv in st.get("parameterValues") or []:
+            pv["id"] = _s._u()
 
 
 def _sync_columns(p: dict[str, Any]) -> None:
@@ -173,6 +191,8 @@ async def lo_update_strength_verified(
     mode: str = "replace",
     patch_exercises: list[dict[str, Any]] | None = None,
     dry_run: bool = False,
+    force: bool = False,
+    mobility: bool = False,
 ) -> dict[str, Any]:
     """Update a strength workout and prove it landed.
 
@@ -191,10 +211,16 @@ async def lo_update_strength_verified(
         return _err("INVALID_ARGS", "nothing to update")
     if mode not in ("replace", "append"):
         return _err("INVALID_ARGS", "mode must be 'replace' or 'append'")
+    lint: dict[str, Any] = {"errors": [], "warnings": [], "resolved": []}
     if blocks is not None:
         invalid = _s._validate_blocks(blocks)
         if invalid:
             return _err("VALIDATION_ERROR", invalid)
+        if mode == "replace":
+            lint = _s._lint_blocks(blocks, title=title or "", mobility=mobility)
+            if lint["errors"] and not force:
+                return _err("LINT_FAILED", "blocks failed coaching checks; nothing written "
+                            "(pass force=true for a deliberate exception)", **lint)
 
     async with TPClient() as client:
         _, access, err = await _s._access(client)
@@ -283,6 +309,10 @@ async def lo_update_strength_verified(
         result["landed"] = landed_fp
     else:
         result["message"] = f"{len(changed)} change(s) written and verified on read-back."
+    if lint["resolved"]:
+        result["exercises"] = [f"{r['title']} ({r['id']})" for r in lint["resolved"]]
+    if lint["warnings"]:
+        result["lint_warnings"] = lint["warnings"]
     return result
 
 
@@ -319,6 +349,11 @@ def register_lo_strength(tools: list[Any], handlers: dict[str, Any]) -> None:
                     ),
                 },
                 "dry_run": {"type": "boolean", "default": False},
+                "force": {"type": "boolean", "default": False,
+                          "description": ("Write a blocks replace even if coaching checks "
+                                          "(WarmUp first, weights on loaded moves) fail.")},
+                "mobility": {"type": "boolean", "default": False,
+                             "description": "Mobility-only session: skip the WarmUp-first check."},
             },
             "required": ["workout_id"],
         },
@@ -329,6 +364,7 @@ def register_lo_strength(tools: list[Any], handlers: dict[str, Any]) -> None:
             workout_id=args["workout_id"], title=args.get("title"), instructions=args.get("instructions"),
             blocks=args.get("blocks"), mode=args.get("mode", "replace"),
             patch_exercises=args.get("patch_exercises"), dry_run=bool(args.get("dry_run", False)),
+            force=bool(args.get("force", False)), mobility=bool(args.get("mobility", False)),
         )
 
     handlers["lo_update_strength_verified"] = _h

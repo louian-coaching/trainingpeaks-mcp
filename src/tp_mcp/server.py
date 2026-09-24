@@ -651,6 +651,12 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "workout_id": {"type": "string"},
+                "detail": {
+                    "type": "string", "enum": ["compact", "full"], "default": "compact",
+                    "description": ("FORK: compact (default) = key totals + one row per lap "
+                                    "(time, distance, pace, power, HR, cadence); full = everything incl. "
+                                    "zones and every lap column."),
+                },
                 "save_to": {
                     "type": "string",
                     "description": (
@@ -877,12 +883,14 @@ TOOLS = [
     ),
     Tool(
         name="tp_get_metrics",
-        description="Get health metrics for a date range.",
+        description="Get health metrics for a date range. Default compact = one row per day (HRV, sleep, RHR, …).",
         input_schema={
             "type": "object",
             "properties": {
                 "start_date": {"type": "string", "description": "YYYY-MM-DD"},
                 "end_date": {"type": "string", "description": "YYYY-MM-DD"},
+                "detail": {"type": "string", "enum": ["compact", "full"], "default": "compact",
+                           "description": "FORK: compact daily table (default) or the raw metric records."},
             },
             "required": ["start_date", "end_date"],
         },
@@ -1371,6 +1379,11 @@ TOOLS = [
                         "Use instead of query when looking up a whole session's exercises."
                     ),
                 },
+                "ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "FORK: reverse lookup — library title/parameters for these exercise ids.",
+                },
                 "limit": {"type": "integer", "description": "Max results, 1-100 (default 20)."},
                 "muscle_group": {
                     "type": "string",
@@ -1407,6 +1420,12 @@ TOOLS = [
                         "require the same number of sets for every exercise."
                     ),
                 },
+                "mobility": {"type": "boolean",
+                             "description": "FORK: mobility-only session — skip the WarmUp-first check."},
+                "force": {"type": "boolean",
+                          "description": "FORK: write even if coaching checks fail (echoed as forced_past)."},
+                "dry_run": {"type": "boolean",
+                            "description": "FORK: run checks and resolve exercise names; create nothing."},
             },
             "required": ["date", "title", "blocks"],
         },
@@ -1999,11 +2018,16 @@ async def _h_get_peaks(args):
 
 @_handler("tp_analyze_workout")
 async def _h_analyze(args):
-    return await tp_analyze_workout(workout_id=args["workout_id"], save_to=args.get("save_to"))
+    return await tp_analyze_workout(workout_id=args["workout_id"], save_to=args.get("save_to"),
+                                    detail=args.get("detail", "compact"))
 
 # --- Structured strength / gym ---
 @_handler("tp_search_exercises")
 async def _h_search_exercises(args):
+    # FORK: reverse lookup by id
+    if args.get("ids"):
+        from tp_mcp.tools.strength import tp_lookup_exercise_ids
+        return tp_lookup_exercise_ids(args["ids"])
     # FORK: batch mode
     if args.get("queries"):
         results = {}
@@ -2023,7 +2047,9 @@ async def _h_search_exercises(args):
 async def _h_create_strength(args):
     return await tp_create_strength_workout(
         date=args["date"], title=args["title"],
-        blocks=args.get("blocks") or [], instructions=args.get("instructions"))
+        blocks=args.get("blocks") or [], instructions=args.get("instructions"),
+        mobility=bool(args.get("mobility")), force=bool(args.get("force")),
+        dry_run=bool(args.get("dry_run")))
 
 @_handler("tp_get_strength_summary")
 async def _h_get_strength_summary(args):
@@ -2127,7 +2153,8 @@ async def _h_log_metrics(args):
 
 @_handler("tp_get_metrics")
 async def _h_get_metrics(args):
-    return await tp_get_metrics(start_date=args["start_date"], end_date=args["end_date"])
+    return await tp_get_metrics(start_date=args["start_date"], end_date=args["end_date"],
+                                detail=args.get("detail", "compact"))
 
 @_handler("tp_get_nutrition")
 async def _h_get_nutrition(args):
