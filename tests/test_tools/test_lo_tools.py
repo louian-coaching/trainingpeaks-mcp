@@ -689,3 +689,9 @@ class TestWeekLoad:
                 readback_week_start="2026-09-21", readback_week_end="2026-09-27", target_tss="70-90",
             )
         assert r["week_load"]["tri_tss"] == 78 and r["week_load"]["in_range"] is True
+
+
+def test_text_compare_ignores_trailing_whitespace():
+    from tp_mcp.tools.lo_tools import _compare
+    assert _compare("description", "a\n－－\nb\n", "a\n－－\nb")
+    assert not _compare("description", "a b", "a  b")

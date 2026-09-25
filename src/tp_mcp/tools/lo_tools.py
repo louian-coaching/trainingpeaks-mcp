@@ -228,6 +228,9 @@ def _compare(field: str, sent: Any, landed: Any) -> bool:
         return total is None or landed.get("end") == total
     if field in ("feeling", "rpe"):
         return _num_close(sent, landed, 0)
+    if field in ("description", "title") and isinstance(sent, str) and isinstance(landed, str):
+        # TP trims trailing whitespace/newlines on save (09/25: 814 sent, 813 landed, empty diff)
+        return sent.rstrip() == landed.rstrip()
     return sent == landed
 
 
