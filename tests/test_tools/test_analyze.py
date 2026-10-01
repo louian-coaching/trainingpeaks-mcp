@@ -396,3 +396,43 @@ def test_compact_shape():
     assert c["totals"] == {"Distance": 9.5}
     assert c["channels_min_max_avg"] == {"Power": [0, 280, 220]}
     assert c["laps"] == [{"name": "Lap 1", "sec": 300, "pace_s": 317, "avg_w": 187.4}]
+
+
+# --- FORK (TECH-47): Stryd developer-field power -------------------------------
+
+
+def test_alias_developer_power_copies_channel_and_relabels():
+    from tp_mcp.tools.analyze import _alias_developer_power
+    elems = [{"identifier": "HeartRate", "name": "Heart Rate"},
+             {"identifier": "6835fb106ff4c1e3", "name": "Power", "unit": "Watts", "average": 248}]
+    series = [{"time": 0, "6835fb106ff4c1e3": 233, "HeartRate": 140}, {"time": 1, "HeartRate": 141}]
+    assert _alias_developer_power(elems, series) == "6835fb106ff4c1e3"
+    assert elems[1]["identifier"] == "Power"
+    assert elems[1]["source_identifier"] == "6835fb106ff4c1e3"
+    assert series[0]["Power"] == 233
+    assert "Power" not in series[1]
+
+
+def test_alias_developer_power_leaves_standard_power_alone():
+    from tp_mcp.tools.analyze import _alias_developer_power
+    elems = [{"identifier": "Power", "name": "Power"}, {"identifier": "abc", "name": "Power"}]
+    series = [{"Power": 200, "abc": 999}]
+    assert _alias_developer_power(elems, series) is None
+    assert series[0]["Power"] == 200
+
+
+def test_alias_developer_power_ambiguous_does_nothing():
+    from tp_mcp.tools.analyze import _alias_developer_power
+    elems = [{"identifier": "a", "name": "Power"}, {"identifier": "b", "name": "power"}]
+    series = [{"a": 1, "b": 2}]
+    assert _alias_developer_power(elems, series) is None
+    assert "Power" not in series[0]
+
+
+def test_compact_keeps_stryd_lap_power():
+    from tp_mcp.tools.analyze import _compact
+    full = {"dataChannels": [{"identifier": "Power", "min": 0, "max": 380, "average": 248}],
+            "lapData": [{"Name": "Lap 11", "TotalTimerTime": 222, "Lap Power": 299}]}
+    c = _compact(full)
+    assert c["channels_min_max_avg"] == {"Power": [0, 380, 248]}
+    assert c["laps"] == [{"name": "Lap 11", "sec": 222, "lap_w": 299}]

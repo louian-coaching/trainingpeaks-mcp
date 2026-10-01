@@ -448,8 +448,13 @@ async def lo_verify_intervals(
                 f"Re-run with align='scale' if the athlete simply went long/short "
                 f"uniformly; treat late segments as approximate otherwise."
             )
-    lap_count = len(analysis.get("lapData") or [])
-    if lap_count <= 1:
+    # The compact analysis (the default since 3c2d641) has no ``lapData`` —
+    # counting it reported "single lap" for every workout. Use the flag the
+    # analysis itself computes, falling back to counting either lap key.
+    single = analysis.get("single_lap")
+    if single is None:
+        single = len(analysis.get("lapData") or analysis.get("laps") or []) <= 1
+    if single:
         out["note"] = (
             "Device recorded a single lap — these segments come from the prescription, "
             "not from lap buttons."

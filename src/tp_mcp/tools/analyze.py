@@ -160,11 +160,45 @@ def _stop_timestamp(start_iso: str | None, elapsed_seconds: Any) -> str | None:
     return (start_dt + timedelta(seconds=float(elapsed_seconds))).isoformat()
 
 
+def _alias_developer_power(data_elements: list[dict[str, Any]],
+                           time_series: list[dict[str, Any]]) -> str | None:
+    """FORK (TECH-47): expose a developer-field power channel as ``Power``.
+
+    Stryd and other Connect IQ sensors write running power as a developer
+    field: the channel's identifier is a hash (e.g. ``6835fb106ff4c1e3``) and
+    only its ``friendlyName`` says "Power". Everything downstream — the compact
+    channel list, ``lo_verify_intervals`` — keys on the standard ``Power``
+    identifier, so these workouts read as "no power recorded". On 2026/10/01
+    that sent the coach a wrong "check your Stryd upload" for two athletes
+    whose files were complete.
+
+    When there is no standard ``Power`` channel and exactly one channel named
+    "Power", copy its samples to ``Power`` on every point and relabel the
+    element (keeping the original id in ``source_identifier``). Returns the
+    aliased identifier, or None when nothing changed. Mutates in place.
+    """
+    if any(e.get("identifier") == "Power" for e in data_elements):
+        return None
+    cands = [e for e in data_elements
+             if (e.get("name") or "").strip().lower() == "power" and e.get("identifier")]
+    if len(cands) != 1:
+        return None
+    elem = cands[0]
+    src = elem["identifier"]
+    for p in time_series:
+        if isinstance(p, dict) and src in p and "Power" not in p:
+            p["Power"] = p[src]
+    elem["source_identifier"] = src
+    elem["identifier"] = "Power"
+    return src
+
+
 _LAP_KEEP = (
     ("Name", "name"), ("Intensity", "class"), ("TotalTimerTime", "sec"), ("TotalDistance", "km"),
     ("AveragePace", "pace_s"), ("NormalizedGradedPace", "ngp_s"), ("AveragePower", "avg_w"),
     ("NormalizedPower", "np_w"), ("AverageHeartRate", "avg_hr"), ("MaximumHeartRate", "max_hr"),
     ("AverageCadence", "cad"), ("TotalAscent", "gain_m"), ("TSS", "tss"), ("rTSS", "rtss"),
+    ("Lap Power", "lap_w"),  # FORK (TECH-47): Stryd developer-field lap power
 )
 _TOTAL_KEEP = ("Duration", "Moving time", "Distance", "TSS", "rTSS", "IF", "rIF", "NP", "NGP",
                "Avg Power", "Average Power", "Avg Pace", "EF", "Pw:Hr", "Pa:Hr", "El. Gain", "VI")
@@ -310,6 +344,7 @@ async def tp_analyze_workout(workout_id: str, save_to: str | None = None, detail
         if isinstance(meta, dict)
     ]
     time_series = (charts or {}).get("data") or []
+    _alias_developer_power(data_elements, time_series)
 
     lap_column_meta = (laps or {}).get("columnMetadata") or {}
     lap_columns = [

@@ -421,3 +421,35 @@ async def test_in_range_pct_survives_when_the_sampling_is_honest(tmp_path):
         res = await lo_verify_intervals("1", ftp=270)
     assert res["segments"][0]["in_range_pct"] == 100.0
     assert res["segments"][0]["power_basis"] == "accumulated"
+
+
+# --- compact analysis has no lapData: the single-lap note must follow single_lap ---
+
+
+def _patched_compact(single_lap, laps, tmp_path):
+    data_file = tmp_path / "analysis.json"
+    data_file.write_text(json.dumps({"data": _flat_ride()}))
+    analysis = {"workoutId": 1, "data_file": str(data_file), "laps": laps}
+    if single_lap is not None:
+        analysis["single_lap"] = single_lap
+    detail = {"id": "1", "structured_workout": _sw()}
+    return (
+        patch("tp_mcp.tools.analyze.tp_analyze_workout", AsyncMock(return_value=analysis)),
+        patch("tp_mcp.tools.workouts.tp_get_workout", AsyncMock(return_value=detail)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_single_lap_note_when_compact_says_multi_lap(tmp_path):
+    a, w = _patched_compact(False, [{"name": "Lap 1"}, {"name": "Lap 2"}], tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1")
+    assert "note" not in res
+
+
+@pytest.mark.asyncio
+async def test_single_lap_falls_back_to_counting_compact_laps(tmp_path):
+    a, w = _patched_compact(None, [{"name": "Lap 1"}, {"name": "Lap 2"}], tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1")
+    assert "note" not in res
