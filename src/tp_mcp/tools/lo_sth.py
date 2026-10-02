@@ -114,8 +114,16 @@ def unwrap(res: dict[str, Any]) -> dict[str, Any]:
     """MCP tools/call result → 平台原本的 JSON 物件。"""
     if isinstance(res.get("structuredContent"), dict):
         out = res["structuredContent"]
-        if set(out) == {"result"} and isinstance(out["result"], dict):
-            out = out["result"]
+        if set(out) == {"result"}:
+            inner = out["result"]
+            # 2026/10/02：STH 開始把 result 包成 JSON 字串（{"result": "{...}"}），要再解一層
+            if isinstance(inner, str):
+                try:
+                    inner = json.loads(inner)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if isinstance(inner, dict):
+                out = inner
         return out
     texts = [c.get("text", "") for c in res.get("content", []) if c.get("type") == "text"]
     raw = "\n".join(texts)

@@ -168,3 +168,11 @@ def test_tools_registered_and_athlete_exempt():
     for n in lo_sth.LO_STH_TOOLS:
         assert n in names
         assert "athlete" not in names[n].input_schema["properties"]
+
+
+def test_unwrap_result_json_string():
+    """2026/10/02：STH 把 structuredContent.result 包成 JSON 字串，要再解一層。"""
+    from tp_mcp.tools.lo_sth import unwrap
+    res = {"structuredContent": {"result": '{"ok": true, "identityType": "C"}'}}
+    assert unwrap(res) == {"ok": True, "identityType": "C"}
+    assert unwrap({"structuredContent": {"result": "not json"}}) == {"result": "not json"}
