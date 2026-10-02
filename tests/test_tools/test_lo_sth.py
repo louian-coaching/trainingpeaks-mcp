@@ -115,10 +115,10 @@ def test_create_week_switches_identity_and_writes(tmp_path):
     out = run(lo_sth.lo_sth_create_week(f, write=True, readback_save_to=str(tmp_path / "rb.json"),
                                         client_factory=lambda: fc))
     assert out["identity"]["switched"] is True
-    assert out["summary"] == "3/3 堂寫入" and "isError" not in out
+    assert out["summary"].startswith("3/3") and "isError" not in out
     assert all(a["tri_user_id"] == "abc123" and a["identity_type"] == "C"
                for t, a in fc.calls if t == "create_workout")
-    assert "lo_sth_reorder_week" in out["next"]
+    assert "lo_sth_finish_week" in out["next"]
     p = json.loads(open(f, encoding="utf-8").read())
     assert [w.get("_classScheduleId") for w in p["workouts"]] == [98001, 98002, 98003]
 

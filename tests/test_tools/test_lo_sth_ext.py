@@ -31,6 +31,8 @@ class Fake:
         self.store = {}   # cid -> {"date","cj","ver","ref"}
         self.next = 99000
         self.sleeps = []
+        self.frozen_duration = False
+        self.reorder_409 = False
 
     async def __aenter__(self):
         return self
@@ -53,7 +55,8 @@ class Fake:
                 if a["date_from"] <= r["date"] <= a["date_to"]:
                     days.setdefault(r["date"], []).append({
                         "classScheduleId": cid, "title": r["cj"]["title"], "sportType": r["cj"]["sportType"],
-                        "durationMin": 25.0, "plannedSTL": r["cj"].get("stl", 0), "scheduleVersion": f"v{r['ver']}",
+                        "durationMin": (25.0 if self.frozen_duration else round(r["cj"].get("durationSeconds", 1500) / 60, 1)),
+                        "plannedSTL": r["cj"].get("stl", 0), "scheduleVersion": f"v{r['ver']}",
                         "scheduleRef": r["ref"], "athleteRef": "aref", "displayOrder": len(days.get(r["date"], []))})
             return {"triUserId": a.get("tri_user_id"), "days": [{"date": d, "workouts": ws} for d, ws in sorted(days.items())]}
         if tool == "preview_assigned_workout_update":
@@ -99,6 +102,8 @@ class Fake:
             return {"beginDay": a["date"], "endDay": a["date"], "scheduleCount": len(self.store), "statsConsistent": True,
                     "issues": [{"severity": "info", "code": "FUTURE_SCHEDULE"}]}
         if tool == "reorder_day":
+            if self.reorder_409:
+                return {"ok": False, "error": "409001 课表正在同步设备"}
             return {"ok": True, "orderApplied": True}
         if tool == "create_workout":
             if a.get("dry_run") is False:
@@ -250,9 +255,166 @@ def test_create_week_finish_reorders_validates_and_snapshots(tmp_path):
         f.sleeps.append(s)
     out = run(lo_sth.lo_sth_create_week(pf, write=True, finish=True, client_factory=lambda: f, sleep=nosleep,
                                         band=[100, 400], band_sports=["RUN", "RIDE", "SWIM"]))
-    assert out["summary"] == "3/3 堂寫入" and out["validate"]["ok"] and f.sleeps == [45]
-    days = {r["date"]: r["order"] for r in out["reorder"]}
+    fin = out["finish"]
+    assert out["summary"].startswith("3/3") and fin["validate"]["ok"] and f.sleeps == []
+    days = {r["date"]: r["order"] for r in fin["reorder"]}
     assert days["2026-10-08"][0] == coach_swim and len(days["2026-10-07"]) == 2
-    assert out["band"]["status"] in ("in", "under", "over")
+    assert fin["band"]["status"] in ("in", "under", "over") and fin["status"] == "done"
     ids = [r["classScheduleId"] for r in out["rows"]]
     assert all(ext.load_snapshot("T1", i) for i in ids)
+
+
+# ---------- 10/02 優化 1：時長欄位回填＋週課表驗收 ----------
+def test_update_replace_syncs_duration_seconds_and_checks_week_view(tmp_path):
+    f = Fake()
+    cid = f.add("2026-10-07", bike_cj())
+    new = bike_cj(secs=900)
+    new["durationSeconds"] = 999          # 教練介面改完常見：欄位沒跟著變
+    new["duration"] = "00:16:39"
+    p = tmp_path / "cj.json"
+    p.write_text(json.dumps(new, ensure_ascii=False), encoding="utf-8")
+    out = run(ext.lo_sth_update_verified("T1", cid, classes_json_file=str(p), client_factory=lambda: f))
+    assert out["ok"] and out["week_view"]["ok"] and out["duration_min"] == 25
+    assert f.store[cid]["cj"]["durationSeconds"] == 1500 and f.store[cid]["cj"]["duration"] == "00:25:00"
+    assert any(w["code"] == "DURATIONS_SYNCED" for w in out["warnings"])
+
+
+def test_update_replace_fails_when_week_view_still_shows_old_duration(tmp_path):
+    f = Fake()
+    f.frozen_duration = True                # 週課表一直顯示 25 分
+    cid = f.add("2026-10-07", bike_cj())
+    p = tmp_path / "cj.json"
+    p.write_text(json.dumps(bike_cj(secs=1800), ensure_ascii=False), encoding="utf-8")
+    out = run(ext.lo_sth_update_verified("T1", cid, classes_json_file=str(p), client_factory=lambda: f))
+    assert out["ok"] is False and out["week_view"]["ok"] is False
+
+
+# ---------- 優化 3：官方負荷合理性 ----------
+def test_load_unchanged_after_structure_change_warns_and_can_scale(tmp_path):
+    f = Fake()
+    old = bike_cj()
+    old["stl"], old["sth"] = 84, 13800     # 官方 calculate 在 Fake 裡永遠回 84
+    cid = f.add("2026-10-07", old)
+    p = tmp_path / "cj.json"
+    p.write_text(json.dumps(bike_cj(secs=1800), ensure_ascii=False), encoding="utf-8")
+    out = run(ext.lo_sth_update_verified("T1", cid, classes_json_file=str(p), recalc_load=True, client_factory=lambda: f))
+    w = next(x for x in out["warnings"] if x["code"] == "LOAD_UNCHANGED_AFTER_STRUCTURE_CHANGE")
+    assert w["suggested_stl"] > 84 and out["stl"] == 84
+    f.store[cid]["cj"] = old
+    out2 = run(ext.lo_sth_update_verified("T1", cid, classes_json_file=str(p), recalc_load=True,
+                                          load_fallback="scale", client_factory=lambda: f))
+    assert out2["stl"] == w["suggested_stl"] and f.store[cid]["cj"]["stl"] == w["suggested_stl"]
+
+
+# ---------- 優化 4：完整性 ----------
+def _run_cj(secs_4k=600):
+    return {"title": "節奏跑", "sportType": "RUN", "stl": 65, "durationSeconds": 2559, "duration": "00:52:39",
+            "summary": "- 4公里@5:12~4:42/km", "trainingAdvice": "",
+            "stages": [{"times": 1, "sections": [{"stageMode": "warmup", "capacity": "distance", "targetDistance": 4,
+                                                   "targetSeconds": secs_4k, "thresholdSpeedRange": [77, 85],
+                                                   "thresholdSpeedRangeNum": [312, 282]}]},
+                       {"times": 1, "sections": [{"stageMode": "cooling", "capacity": "time", "targetSeconds": 300,
+                                                   "thresholdSpeedRange": [65, 75], "thresholdSpeedRangeNum": [369, 320]}]}],
+            "timeline": [{"duration": 600, "times": 1, "stageTimeline": [{"duration": 600}]},
+                         {"duration": 300, "times": 1, "stageTimeline": [{"duration": 300}]}]}
+
+
+def test_integrity_flags_implausible_distance_seconds_and_stale_fields():
+    codes = {i["code"] for i in ext.integrity(_run_cj(), week_duration_min=42.6)}
+    assert {"IMPLAUSIBLE_TARGET_SECONDS", "DURATION_SECONDS_STALE", "DURATION_STR_STALE"} <= codes
+    fixed = ext.apply_integrity_fix(_run_cj())
+    assert fixed["stages"][0]["sections"][0]["targetSeconds"] == 1188
+    assert fixed["durationSeconds"] == 1488 and fixed["timeline"][0]["duration"] == 1188
+    assert ext.integrity(fixed) == []
+
+
+# ---------- 優化 4／5／6：diff_week ----------
+def test_diff_week_text_diff_compact_structure_new_course_week_stl_and_fix_file(tmp_path):
+    f = Fake()
+    cid = f.add("2026-10-08", _run_cj(secs_4k=1188) | {"durationSeconds": 1488, "duration": "00:24:48"})
+    ext.save_snapshot("T1", cid, copy.deepcopy(f.store[cid]["cj"]), "2026-10-08", "v1", "節奏跑")
+    cj = f.store[cid]["cj"]
+    cj["stages"][0]["sections"][0]["targetSeconds"] = 600      # 教練介面改壞
+    cj["summary"] = "- 4公里@5:12~4:42/km\n- 伸展"
+    f.store[cid]["ver"] = 2
+    newc = f.add("2026-10-06", {"title": "輕鬆跑", "sportType": "RUN", "stl": 33, "summary": "- 輕鬆慢跑40分鐘",
+                                "trainingAdvice": "鼻子呼吸"})
+    out = run(ext.lo_sth_diff_week("T1", "2026-10-05", "2026-10-11", save_to=str(tmp_path / "d.json"),
+                                   band=[90, 100], band_sports=["RUN"], client_factory=lambda: f))
+    ch = out["changed"][0]
+    assert ch["changes"]["summary"] == ["+- 伸展"]
+    assert "structure" not in ch["changes"]   # 距離段只改秒數，結構指紋看不出來——所以才要 integrity
+    assert any(i["code"] == "IMPLAUSIBLE_TARGET_SECONDS" for i in ch["integrity"])
+    fixed = json.loads(open(ch["fix_file"], encoding="utf-8").read())
+    assert fixed["stages"][0]["sections"][0]["targetSeconds"] == 1188
+    assert out["new"][0]["id"] == newc and "輕鬆慢跑" in out["new"][0]["summary"]
+    assert out["week_stl"]["RUN"] == 98 and out["band"]["status"] == "in"
+
+
+# ---------- 優化 2：防重複＋收尾 ----------
+def test_create_week_skips_existing_same_course_and_rerun_creates_nothing(tmp_path):
+    f = Fake()
+    dup = f.add("2026-10-07", bike_cj())                     # 平台上已經有同日同項目同標題「節奏騎」
+    pf = _payload(tmp_path)
+    out = run(lo_sth.lo_sth_create_week(pf, write=True, client_factory=lambda: f))
+    st = {r["title"]: r["status"] for r in out["rows"]}
+    assert st["節奏騎"] == "skipped_existing" and st["換項跑"] == "created"
+    assert out["summary"].startswith("3/3")
+    n_creates = sum(1 for t, a in f.calls if t == "create_workout" and a.get("dry_run") is False)
+    again = run(lo_sth.lo_sth_create_week(pf, write=True, client_factory=lambda: f))
+    assert all(r["status"] in ("already_created", "skipped_existing") for r in again["rows"])
+    assert sum(1 for t, a in f.calls if t == "create_workout" and a.get("dry_run") is False) == n_creates
+    p = json.loads(open(pf, encoding="utf-8").read())
+    assert p["workouts"][0]["_classScheduleId"] == dup
+
+
+def test_finish_week_returns_pending_when_device_keeps_syncing(tmp_path):
+    f = Fake()
+    pf = _payload(tmp_path)
+    run(lo_sth.lo_sth_create_week(pf, write=True, client_factory=lambda: f))
+    f.add("2026-10-07", {"title": "長訓", "sportType": "SWIM", "stl": 0})   # 教練事後加的課，應排最前
+    f.reorder_409 = True
+
+    async def nosleep(x):
+        f.sleeps.append(x)
+    out = run(lo_sth.lo_sth_finish_week(pf, client_factory=lambda: f, sleep=nosleep, time_budget_s=30, retry_wait_s=15))
+    assert out["status"] == "pending_device_sync" and sum(f.sleeps) <= 30
+    f.reorder_409 = False
+    out2 = run(lo_sth.lo_sth_finish_week(pf, client_factory=lambda: f, sleep=nosleep))
+    assert out2["status"] == "done" and out2["validate"]["ok"]
+
+
+# ---------- 優化 7：逐段驗收＋紅旗 ----------
+def test_intervals_reconstruct_two_threshold_blocks():
+    from tp_mcp.tools import lo_sth_intervals as ivl
+    cj = {"sportType": "CYCLE", "stages": [
+        {"times": 1, "sections": [{"stageMode": "warmup", "capacity": "time", "targetSeconds": 600,
+                                   "thresholdFtpRange": [50, 65], "thresholdFtpRangeNum": [105, 137]}]},
+        {"times": 3, "sections": [{"stageMode": "bike", "capacity": "time", "targetSeconds": 30,
+                                   "thresholdFtpRange": [118, 125], "thresholdFtpRangeNum": [248, 263]},
+                                  {"stageMode": "bike", "capacity": "time", "targetSeconds": 90,
+                                   "thresholdFtpRange": [50, 60], "thresholdFtpRangeNum": [105, 126]}]},
+        {"times": 2, "sections": [{"stageMode": "bike", "capacity": "time", "targetSeconds": 900,
+                                   "thresholdFtpRange": [95, 105], "thresholdFtpRangeNum": [200, 221]},
+                                  {"stageMode": "recover", "capacity": "time", "targetSeconds": 300,
+                                   "thresholdFtpRange": [50, 60], "thresholdFtpRangeNum": [105, 126]}]}]}
+    pw = [120] * 960 + [205] * 900 + [115] * 300 + [212] * 900 + [110] * 300
+    ts = [{"power": p, "speed": 30, "heartRate": 150} for p in pw]
+    r = ivl.analyze(ts, cj)
+    assert r["planned_blocks"] == 2 and r["match"] and [b["avg_w"] for b in r["blocks"]] == [205, 212]
+
+
+def test_prep_week_red_flags_for_unplanned_long_ride(tmp_path):
+    f = Fake()
+    f.store[501] = {"date": "2026-09-29", "cj": bike_cj(), "ver": 3, "ref": "r501"}
+    out = run(ext.lo_sth_prep_week("T1", "2026-10-05", str(tmp_path / "prep"), client_factory=lambda: f))
+    assert any("公路骑行" in x for x in out["summary"]["red_flags"])
+
+
+def test_calc_loads_writes_sidecar_with_signature(tmp_path):
+    f = Fake()
+    pf = _payload(tmp_path)
+    out = run(lo_sth.lo_sth_calc_loads(pf, client_factory=lambda: f))
+    side = json.loads(open(out["loads_sidecar"], encoding="utf-8").read())
+    ent = side["2026-10-07|RIDE|節奏騎"]
+    assert ent["stl"] == 84 and ent["sig"] == lo_sth.stages_sig(bike_cj())
