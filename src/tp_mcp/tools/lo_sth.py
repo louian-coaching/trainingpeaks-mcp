@@ -259,8 +259,30 @@ async def lo_sth_call(tool: str, arguments: dict[str, Any] | None = None, argume
     return res
 
 
+def week_totals(p: dict[str, Any]) -> dict[str, Any]:
+    """payload 內每項目的 STL 合計（騎跑官方值；游泳／肌力用 payload 裡已估的值）。"""
+    by: dict[str, int] = {}
+    for w in p["workouts"]:
+        cj = _cj(w) or {}
+        sp = "RIDE" if str(w["sport_type"]).upper() in ("RIDE", "CYCLE") else str(w["sport_type"]).upper()
+        by[sp] = by.get(sp, 0) + int(cj.get("stl") or 0)
+    return by
+
+
+def band_check(by: dict[str, int], band: list[int] | None, sports: list[str] | None) -> dict[str, Any] | None:
+    if not band:
+        return None
+    use = [s.upper().replace("CYCLE", "RIDE") for s in (sports or ["RUN", "RIDE", "SWIM"])]
+    tot = sum(v for k, v in by.items() if k in use)
+    lo, hi = int(band[0]), int(band[1])
+    return {"sports": use, "total": tot, "band": [lo, hi],
+            "status": "in" if lo <= tot <= hi else ("under" if tot < lo else "over"),
+            "delta_to_band": 0 if lo <= tot <= hi else (lo - tot if tot < lo else hi - tot)}
+
+
 async def lo_sth_calc_loads(payload_file: str, overwrite: bool = False,
-                            client_factory=_default_factory) -> dict[str, Any]:
+                            client_factory=_default_factory, band: list[int] | None = None,
+                            band_sports: list[str] | None = None) -> dict[str, Any]:
     p = load_payload(payload_file)
     rows = []
     async with client_factory() as cli:
@@ -287,7 +309,13 @@ async def lo_sth_calc_loads(payload_file: str, overwrite: bool = False,
                              "detail": {k: res.get(k) for k in list(res)[:6]}})
     Path(os.path.expanduser(payload_file)).write_text(json.dumps(p, ensure_ascii=False, indent=1), encoding="utf-8")
     ratios = [r["sth"] / r["stl"] for r in rows if r.get("stl")]
-    return {"payload_file": payload_file, "rows": rows,
+    by = week_totals(p)
+    for r in rows:  # 每分鐘 STL：調量時直接換算要砍／加幾分鐘
+        w = p["workouts"][r["i"]]
+        if r.get("stl") and w.get("duration_min"):
+            r["stl_per_min"] = round(r["stl"] / int(w["duration_min"]), 2)
+    return {"payload_file": payload_file, "rows": rows, "totals_by_sport": by,
+            **({"band": band_check(by, band, band_sports)} if band else {}),
             "sth_to_stl_measured": round(sum(ratios) / len(ratios), 1) if ratios else None,
             "note": "sth_to_stl_measured＝同批騎跑官方實測比值，游泳／肌力估算 STH 用它（PLAT-15）"}
 
@@ -304,7 +332,9 @@ def _create_args(p: dict[str, Any], w: dict[str, Any]) -> dict[str, Any]:
 
 
 async def lo_sth_create_week(payload_file: str, write: bool = False, readback_save_to: str | None = None,
-                             client_factory=_default_factory) -> dict[str, Any]:
+                             client_factory=_default_factory, finish: bool = False, sleep=asyncio.sleep,
+                             settle_s: int = 45, band: list[int] | None = None,
+                             band_sports: list[str] | None = None) -> dict[str, Any]:
     p = load_payload(payload_file)
     out: dict[str, Any] = {"tri_user_id": p["tri_user_id"], "mode": "write" if write else "dry_run", "rows": []}
     async with client_factory() as cli:
@@ -350,10 +380,15 @@ async def lo_sth_create_week(payload_file: str, write: bool = False, readback_sa
                                                   "tri_user_id": p["tri_user_id"]})
         if readback_save_to:
             out["readback_saved_to"] = _dump(readback_save_to, wk)
-        # 把新 id 回寫 payload，給 reorder 用
+        # 把新 id 回寫 payload，給 reorder 用；同時存快照（lo_sth_diff_week 的基準，10/02 提速 D）
+        from tp_mcp.tools.lo_sth_ext import iter_week, save_snapshot
+        vers = {w.get("classScheduleId"): w.get("scheduleVersion") for _, w in iter_week(wk)}
         for r in out["rows"]:
             if r.get("classScheduleId"):
-                p["workouts"][r["i"]]["_classScheduleId"] = r["classScheduleId"]
+                w = p["workouts"][r["i"]]
+                w["_classScheduleId"] = r["classScheduleId"]
+                save_snapshot(p["tri_user_id"], r["classScheduleId"], _cj(w), w["classes_date"],
+                              vers.get(r["classScheduleId"]), w["title"], "create_week")
         Path(os.path.expanduser(payload_file)).write_text(json.dumps(p, ensure_ascii=False, indent=1), encoding="utf-8")
     n_ok = sum(r.get("status") == "created" for r in out["rows"])
     out["summary"] = f"{n_ok}/{len(p['workouts'])} 堂寫入"
@@ -361,8 +396,37 @@ async def lo_sth_create_week(payload_file: str, write: bool = False, readback_sa
         out.update({"isError": True, "error_code": "WRITE_INCOMPLETE"})
     multi = sorted({w["classes_date"] for w in p["workouts"]
                     if sum(x["classes_date"] == w["classes_date"] for x in p["workouts"]) > 1})
-    if multi:
-        out["next"] = f"同日多堂 {multi}：等 ~45 秒後呼叫 lo_sth_reorder_week(payload_file)（PLAT-30）"
+    if not finish:
+        if multi:
+            out["next"] = f"同日多堂 {multi}：等 ~45 秒後呼叫 lo_sth_reorder_week(payload_file)（PLAT-30）"
+        return out
+    if out.get("isError"):
+        return out
+    # ④ finish（10/02 提速 C）：等裝置同步→排序（含當天教練既有課）→ validate_schedule_week → 量級
+    from tp_mcp.tools.lo_sth_ext import iter_week as _iw
+    others = {}
+    for d, w in _iw(wk):
+        others.setdefault(d, []).append(w.get("classScheduleId"))
+    need = sorted({w["classes_date"] for w in p["workouts"] if len(others.get(w["classes_date"], [])) > 1})
+    if need:
+        await sleep(settle_s)  # PLAT-30
+        out["reorder"] = (await lo_sth_reorder_week(payload_file, client_factory=client_factory, sleep=sleep,
+                                                    include_existing=True))["rows"]
+    async with client_factory() as cli:
+        v = await cli.call("validate_schedule_week", {"tri_user_id": p["tri_user_id"], "date": dates[0]})
+        wk2 = await cli.call("get_week_schedule", {"date_from": dates[0], "date_to": dates[-1],
+                                                   "tri_user_id": p["tri_user_id"]})
+    issues = [i for i in (v.get("issues") or []) if i.get("severity") not in ("info",)]
+    by: dict[str, int] = {}
+    for _, w in _iw(wk2):
+        sp = "RIDE" if w.get("sportType") in ("CYCLE", "RIDE") else str(w.get("sportType"))
+        by[sp] = by.get(sp, 0) + int(w.get("plannedSTL") or 0)
+    out["validate"] = {"range": [v.get("beginDay"), v.get("endDay")], "scheduleCount": v.get("scheduleCount"),
+                       "error_warning": issues[:10], "ok": not issues and v.get("statsConsistent", True)}
+    out["week_stl_by_sport"] = by
+    if band:
+        out["band"] = band_check(by, band, band_sports)
+    out.pop("next", None)
     return out
 
 
@@ -390,13 +454,14 @@ def _day_ids(week: Any, date: str) -> list[Any]:
 
 
 async def lo_sth_reorder_week(payload_file: str, retry_wait_s: int = 20, retries: int = 2,
-                              client_factory=_default_factory, sleep=asyncio.sleep) -> dict[str, Any]:
+                              client_factory=_default_factory, sleep=asyncio.sleep,
+                              include_existing: bool = False) -> dict[str, Any]:
     p = load_payload(payload_file)
     by_day: dict[str, list[Any]] = {}
     for w in p["workouts"]:
         if w.get("_classScheduleId"):
             by_day.setdefault(w["classes_date"], []).append(w["_classScheduleId"])
-    days = {d: ids for d, ids in by_day.items() if len(ids) > 1}
+    days = dict(by_day) if include_existing else {d: ids for d, ids in by_day.items() if len(ids) > 1}
     rows = []
     if not days:
         return {"rows": [], "note": "沒有同日多堂（或 payload 沒有 _classScheduleId，先跑 lo_sth_create_week write=true）"}
@@ -404,6 +469,8 @@ async def lo_sth_reorder_week(payload_file: str, retry_wait_s: int = 20, retries
         for d, ours in sorted(days.items()):
             wk = await cli.call("get_week_schedule", {"date_from": d, "date_to": d, "tri_user_id": p["tri_user_id"]})
             existing = [i for i in _day_ids(wk, d) if i not in ours]
+            if include_existing and not existing and len(ours) < 2:
+                continue  # 單堂、當天沒別的課：不用排
             order = existing + ours  # 教練既有課在前、新課照 payload 順序
             args = {"classes_date": d, "ordered_schedule_ids": json.dumps(order), "tri_user_id": p["tri_user_id"]}
             status, last = "failed", {}
@@ -451,14 +518,21 @@ def register_lo_sth(tools: list[Any], handlers: dict[str, Any]) -> None:
         "距離制跑課自動暫改 capacity=time 試算（PLAT-10）、騎車自動用 CYCLE（PLAT-17）；已有 sth 的課略過（overwrite=true 才重算）。"
         "回傳逐堂 sth/stl 與同批實測 sth_to_stl（游泳／肌力估算用，PLAT-15）。"),
         input_schema={"type": "object", "properties": {
-            "payload_file": _PF, "overwrite": {"type": "boolean", "default": False}}, "required": ["payload_file"]}))
+            "payload_file": _PF, "overwrite": {"type": "boolean", "default": False},
+            "band": {"type": "array", "items": {"type": "integer"}, "description": "量級帶 [下限, 上限]，回 status in/under/over 與差多少"},
+            "band_sports": {"type": "array", "items": {"type": "string"}, "description": "量級帶算哪幾項，預設 RUN／RIDE／SWIM（騎跑選手給 [\"RUN\",\"RIDE\"]）"}},
+            "required": ["payload_file"]}))
     tools.append(Tool(name="lo_sth_create_week", description=(
         "StrongTri 整週建課：先確認教練身分（R 自動切 C，PLAT-36）→ 全部 dry-run（任一堂有 blocking 整批不寫）→ "
         "write=true 時逐堂三件套真寫（CONFIRM_SCHEDULE_CREATE）→ 讀回整週（readback_save_to 落檔）→ 新 classScheduleId 回寫 payload。"
-        "預設 write=false＝只 dry-run。同日多堂的排序另呼叫 lo_sth_reorder_week。"),
+        "預設 write=false＝只 dry-run。`finish=true`（10/02 提速 C）：寫完自動等 45 秒→排序（含當天教練既有課，既有在前）→"
+        "validate_schedule_week→整週各項 STL（帶 band 就順便比帶），不用再分開呼叫 reorder／validate。成功建立的課自動存快照（給 lo_sth_diff_week）。"),
         input_schema={"type": "object", "properties": {
             "payload_file": _PF, "write": {"type": "boolean", "default": False},
-            "readback_save_to": {"type": "string", "description": "Mac 上的整週讀回輸出路徑"}},
+            "readback_save_to": {"type": "string", "description": "Mac 上的整週讀回輸出路徑"},
+            "finish": {"type": "boolean", "default": False},
+            "band": {"type": "array", "items": {"type": "integer"}},
+            "band_sports": {"type": "array", "items": {"type": "string"}}},
             "required": ["payload_file"]}))
     tools.append(Tool(name="lo_sth_reorder_week", description=(
         "照 payload 順序排同日多堂（reorder_day 真寫）；教練既有課排前、新課照 payload 順序。撞 409001（裝置同步中）自動等 "
@@ -468,8 +542,11 @@ def register_lo_sth(tools: list[Any], handlers: dict[str, Any]) -> None:
             "retries": {"type": "integer", "default": 2}}, "required": ["payload_file"]}))
 
     async def _h_call(a): return await lo_sth_call(a["tool"], a.get("arguments"), a.get("arguments_file"), a.get("save_to"))
-    async def _h_calc(a): return await lo_sth_calc_loads(a["payload_file"], bool(a.get("overwrite", False)))
-    async def _h_create(a): return await lo_sth_create_week(a["payload_file"], bool(a.get("write", False)), a.get("readback_save_to"))
+    async def _h_calc(a): return await lo_sth_calc_loads(a["payload_file"], bool(a.get("overwrite", False)),
+                                                         band=a.get("band"), band_sports=a.get("band_sports"))
+    async def _h_create(a): return await lo_sth_create_week(a["payload_file"], bool(a.get("write", False)), a.get("readback_save_to"),
+                                                            finish=bool(a.get("finish", False)), band=a.get("band"),
+                                                            band_sports=a.get("band_sports"))
     async def _h_reorder(a): return await lo_sth_reorder_week(a["payload_file"], int(a.get("retry_wait_s", 20)), int(a.get("retries", 2)))
 
     handlers.update({"lo_sth_call": _h_call, "lo_sth_calc_loads": _h_calc,
