@@ -1643,14 +1643,17 @@ _ATHLETE_PARAM = {
 # Registered here, before the athlete-param injection and the metadata loop,
 # so both treat them like every other tool; handlers are merged into
 # _TOOL_HANDLERS right after it is created.
-from tp_mcp.tools.lo_strength import register_lo_strength  # noqa: E402
-from tp_mcp.tools.lo_tools import normalize_aliases, peek_payload_athlete, register_lo_tools  # noqa: E402
+from tp_mcp.tools.lo_capability import register_lo_capability  # noqa: E402
 from tp_mcp.tools.lo_review import register_lo_review  # noqa: E402
-from tp_mcp.tools.lo_weekly import register_lo_weekly  # noqa: E402
-from tp_mcp.tools.lo_verify import register_lo_verify  # noqa: E402
-from tp_mcp.tools.lo_sync import register_lo_sync  # noqa: E402
 from tp_mcp.tools.lo_sth import LO_STH_TOOLS, register_lo_sth  # noqa: E402
 from tp_mcp.tools.lo_sth_ext import LO_STH_EXT_TOOLS, register_lo_sth_ext  # noqa: E402
+from tp_mcp.tools.lo_strength import register_lo_strength  # noqa: E402
+from tp_mcp.tools.lo_sync import register_lo_sync  # noqa: E402
+from tp_mcp.tools.lo_threshold import register_lo_threshold  # noqa: E402
+from tp_mcp.tools.lo_tools import normalize_aliases, peek_payload_athlete, register_lo_tools  # noqa: E402
+from tp_mcp.tools.lo_verify import register_lo_verify  # noqa: E402
+from tp_mcp.tools.lo_version import register_lo_version, stale_notice  # noqa: E402
+from tp_mcp.tools.lo_weekly import register_lo_weekly  # noqa: E402
 
 _LO_HANDLERS: dict[str, Any] = {}
 register_lo_tools(TOOLS, _LO_HANDLERS)
@@ -1661,8 +1664,13 @@ register_lo_verify(TOOLS, _LO_HANDLERS)
 register_lo_sync(TOOLS, _LO_HANDLERS)
 register_lo_sth(TOOLS, _LO_HANDLERS)  # FORK 2026-09-27: StrongTri proxy
 register_lo_sth_ext(TOOLS, _LO_HANDLERS)  # FORK 2026-10-02: STH 提速 A/B/D
+register_lo_version(TOOLS, _LO_HANDLERS)  # FORK 2026-10-03: 重啟偵測
+register_lo_threshold(TOOLS, _LO_HANDLERS)  # FORK 2026-10-03: 閾值驗證寫入（TECH-22/24）
+register_lo_capability(TOOLS, _LO_HANDLERS)  # FORK 2026-10-03: 能力層 PROC-84/85
 _ATHLETE_EXEMPT_TOOLS |= set(LO_STH_TOOLS) | set(LO_STH_EXT_TOOLS)  # STH 用 tri_user_id，不吃 TP athlete
 _ATHLETE_EXEMPT_TOOLS.add("lo_weekly_check")  # takes its own `athletes` list
+_ATHLETE_EXEMPT_TOOLS.add("lo_version")  # local, not athlete-scoped
+_ATHLETE_EXEMPT_TOOLS.add("lo_capability_scan")  # takes its own `athletes` list
 
 for _tool in TOOLS:
     if _tool.name not in _ATHLETE_EXEMPT_TOOLS:
@@ -1764,7 +1772,10 @@ def _dump_and_summarize(name: str, result: Any, save_to: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _READ_ONLY_PREFIXES = ("tp_get_", "tp_list_", "tp_download_", "tp_search_", "tp_validate_", "tp_analyze_")
-_READ_ONLY_EXTRA = {"tp_auth_status", "lo_get_week_for_validate", "lo_diff_week", "lo_weekly_check"}  # FORK: lo_ read tool
+_READ_ONLY_EXTRA = {  # FORK: lo_ read tools
+    "tp_auth_status", "lo_get_week_for_validate", "lo_diff_week", "lo_weekly_check",
+    "lo_version", "lo_capability_scan",
+}
 
 # Irrecoverable data removal. Everything else that writes is recoverable by a
 # follow-up call (update/re-add), so destructiveHint stays False there.
@@ -1832,9 +1843,51 @@ for _tool in TOOLS:
     )
 
 
+# ---------------------------------------------------------------------------
+# FORK 2026-10-03: toolsets. 107 tools ≈ 108k characters of schema; about a third
+# belong to features this coaching practice never uses (equipment, groups, plan
+# store, library authoring, nutrition, file upload/pairing), and tp_update_workout
+# is the unverified path TECH-40 forbids. The default "coach" toolset hides them
+# from tools/list and refuses them at dispatch with a pointer; TP_MCP_TOOLSET=full
+# restores the upstream surface.
+# ---------------------------------------------------------------------------
+_HIDE_EQUIPMENT = ("tp_get_equipment", "tp_create_equipment", "tp_update_equipment", "tp_delete_equipment")
+_HIDE_GROUPS = ("tp_list_groups", "tp_list_athletes_in_group", "tp_create_group", "tp_rename_group",
+                "tp_delete_group", "tp_add_athletes_to_group", "tp_remove_athletes_from_group")
+_HIDE_LIBRARY = ("tp_get_libraries", "tp_get_library_items", "tp_get_library_item", "tp_create_library",
+                 "tp_delete_library", "tp_create_library_item", "tp_update_library_item",
+                 "tp_schedule_library_workout")
+_HIDE_PLANS = ("tp_list_training_plans", "tp_get_training_plan", "tp_get_training_plan_workouts",
+               "tp_apply_training_plan")
+_HIDE_FILES = ("tp_upload_workout_file", "tp_download_workout_file", "tp_delete_workout_file",
+               "tp_pair_workout", "tp_unpair_workout")
+_COACH_HIDDEN: dict[str, str] = {
+    **dict.fromkeys(_HIDE_EQUIPMENT, "equipment is not used in this practice"),
+    **dict.fromkeys(_HIDE_GROUPS, "athlete groups are managed in the TP web UI"),
+    **dict.fromkeys(_HIDE_LIBRARY, "the TP library (3818233) is for the coach's manual scheduling; "
+                                   "the model builds with tp_create_workouts_batch (sop-weekly Step 4)"),
+    **dict.fromkeys(_HIDE_PLANS, "training-plan store tools are not used (apply has a destructive history)"),
+    **dict.fromkeys(("tp_get_nutrition", "tp_update_nutrition"), "nutrition is not tracked here"),
+    **dict.fromkeys(_HIDE_FILES, "file upload/pairing is done by the athlete's devices"),
+    "tp_create_zones": "zone changes go through lo_update_threshold_verified / sop-threshold-update",
+    "tp_update_workout": "use lo_update_workout_verified (TECH-40: tp_update_workout can return "
+                         "success without landing)",
+}
+
+
+def _toolset() -> str:
+    return os.environ.get("TP_MCP_TOOLSET", "coach").strip().lower() or "coach"
+
+
+def _hidden(name: str) -> str | None:
+    return _COACH_HIDDEN.get(name) if _toolset() != "full" else None
+
+
 async def list_tools() -> list[Tool]:
     """List available tools (plain function - tests call it directly)."""
-    return TOOLS
+    if _toolset() == "full":
+        return TOOLS
+    return [t for t in TOOLS if t.name not in _COACH_HIDDEN]
 
 
 # ---------------------------------------------------------------------------
@@ -2379,7 +2432,15 @@ async def call_tool(name: str, arguments: dict[str, Any] | None = None) -> list[
     try:
         handler = _TOOL_HANDLERS.get(name)
         tool = _TOOLS_BY_NAME.get(name)
-        if not handler or tool is None:
+        _why_hidden = _hidden(name)
+        if _why_hidden:
+            result = {
+                "isError": True,
+                "error_code": "HIDDEN_TOOL",
+                "message": (f"{name} is hidden in the coach toolset: {_why_hidden}. "
+                            "Set TP_MCP_TOOLSET=full in the MCP server env to restore it."),
+            }
+        elif not handler or tool is None:
             result = {
                 "isError": True,
                 "error_code": "UNKNOWN_TOOL",
@@ -2415,6 +2476,10 @@ async def call_tool(name: str, arguments: dict[str, Any] | None = None) -> list[
                 # LOCAL PATCH: save_to — write full payload to file, return summary
                 if save_to and not (isinstance(result, dict) and result.get("isError")):
                     result = _dump_and_summarize(name, result, save_to)
+                # FORK 2026-10-03: say so on every result while the process runs old code.
+                _stale = stale_notice() if name != "lo_version" else None
+                if _stale and isinstance(result, dict):
+                    result["_server_stale"] = _stale
 
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 

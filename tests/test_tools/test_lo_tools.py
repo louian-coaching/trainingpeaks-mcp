@@ -435,6 +435,7 @@ class TestUpdateBatch:
                 [{"workout_id": "1", "title": "A", "tss_planned": 50},
                  {"workout_id": "2", "description": "d", "structured_workout": _SW}],
                 readback_save_to=str(rb),
+                settle_delay_s=0,
             )
         assert r["success"] is True
         assert r["summary"] == {"total": 2, "verified": 2, "failed": 0, "not_attempted": 0}
@@ -731,3 +732,101 @@ def test_get_workout_save_summary_names_the_structure(tmp_path):
     out = _dump_and_summarize("tp_get_workout", detail, str(tmp_path / "w.json"))
     assert out["has_structured_workout"] is True and out["structure_blocks"] == 2
     assert "structured_workout" in out["top_level_keys"] and "metrics" in out["top_level_keys"]
+
+
+# ---------------------------------------------------------------------------
+# TECH-44 settle pass: structure drops its last block AFTER the verify read
+# ---------------------------------------------------------------------------
+
+_SW3 = {
+    "primaryLengthMetric": "duration",
+    "primaryIntensityMetric": "percentOfFtp",
+    "structure": [
+        {"begin": 0, "end": 600, "steps": [{"name": "WU", "intensityClass": "warmUp"}]},
+        {"begin": 600, "end": 1800, "steps": [{"name": "Main", "intensityClass": "active"}]},
+        {"begin": 1800, "end": 2100, "steps": [{"name": "CD", "intensityClass": "coolDown"}]},
+    ],
+    "polyline": [[0, 50], [600, 50], [600, 90], [1800, 90], [1800, 50], [2100, 50]],
+}
+
+
+class DropLaterTP(FakeTP):
+    """The verify read sees the full structure; the next read has lost the last block."""
+
+    def __init__(self, detail, drops: int = 1):
+        super().__init__(detail)
+        self.drops = drops
+        self.armed = False
+        self.reads = 0
+
+    async def update(self, workout_id, **kw):
+        res = await super().update(workout_id, **kw)
+        if "structured_workout" in kw and self.drops > 0:
+            self.armed, self.reads = True, 0
+        return res
+
+    async def get(self, workout_id):
+        if self.armed:
+            self.reads += 1
+            if self.reads >= 2:
+                sw = self.state["structured_workout"]
+                sw["structure"] = sw["structure"][:-1]
+                self.state["metrics"]["duration_planned"] = sw["structure"][-1]["end"] / 3600
+                self.armed = False
+                self.drops -= 1
+        return await super().get(workout_id)
+
+
+class TestSettleCheck:
+    @pytest.mark.asyncio
+    async def test_late_drop_is_resent_and_holds(self):
+        from tp_mcp.tools.lo_tools import lo_update_workouts_batch
+
+        fake = DropLaterTP(_detail(id="7", sport="Run"), drops=1)
+        with _wire_multi(MultiFake({"7": fake})):
+            r = await lo_update_workouts_batch(
+                [{"workout_id": "7", "structured_workout": _SW3, "duration_minutes": 35, "tss_planned": 40}],
+                settle_delay_s=0,
+            )
+        assert r["success"] is True
+        assert r["settle_check"]["checked"] == 1
+        drop = r["settle_check"]["late_drops"][0]
+        assert drop["drifted"] == ["structured_workout", "duration_minutes"]
+        assert drop["resend_success"] is True and drop["final_ok"] is True
+        assert r["results"][0]["late_drop"]["final_ok"] is True
+        assert len(fake.state["structured_workout"]["structure"]) == 3
+
+    @pytest.mark.asyncio
+    async def test_late_drop_that_does_not_hold_fails_the_batch(self):
+        from tp_mcp.tools.lo_tools import lo_update_workouts_batch
+
+        fake = DropLaterTP(_detail(id="7", sport="Run"), drops=5)
+        with _wire_multi(MultiFake({"7": fake})):
+            r = await lo_update_workouts_batch(
+                [{"workout_id": "7", "structured_workout": _SW3, "duration_minutes": 35, "tss_planned": 40}],
+                settle_delay_s=0,
+            )
+        assert r["success"] is False and r["error_code"] == "WRITE_NOT_LANDED"
+        assert r["summary"]["failed"] == 1 and r["summary"]["verified"] == 0
+        assert r["results"][0]["error_code"] == "LATE_DROP"
+
+    @pytest.mark.asyncio
+    async def test_text_only_rows_are_not_rechecked(self):
+        from tp_mcp.tools.lo_tools import lo_update_workouts_batch
+
+        fake = FakeTP(_detail(id="1"))
+        with _wire_multi(MultiFake({"1": fake})):
+            r = await lo_update_workouts_batch([{"workout_id": "1", "title": "A"}], settle_delay_s=0)
+        assert r["settle_check"] == {"checked": 0, "late_drops": []}
+
+    @pytest.mark.asyncio
+    async def test_settle_check_can_be_disabled(self):
+        from tp_mcp.tools.lo_tools import lo_update_workouts_batch
+
+        fake = DropLaterTP(_detail(id="7", sport="Run"), drops=1)
+        with _wire_multi(MultiFake({"7": fake})):
+            r = await lo_update_workouts_batch(
+                [{"workout_id": "7", "structured_workout": _SW3, "duration_minutes": 35, "tss_planned": 40}],
+                settle_check=False,
+            )
+        assert "settle_check" not in r and r["success"] is True

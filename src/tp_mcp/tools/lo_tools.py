@@ -542,6 +542,81 @@ def _write_json(path: str, data: Any) -> None:
         json.dump(data, fh, ensure_ascii=False, indent=1)
 
 
+# TECH-44 (2026/09/17 Bullet 9/25): a batch reported "verified" and the whole-week
+# read-back taken a little later had lost the structure's last block (72 → 66.7 min).
+# The verify read and the final state are separated by an eventual-consistency
+# window, so the per-row verify cannot see it. The settle pass waits once, re-reads
+# every row whose structure/duration was written, and resends that row's structural
+# fields once (single row, same path as lo_update_workout_verified) if they drifted.
+_STRUCTURAL_FIELDS = ("structured_workout", "structure", "duration_minutes", "tss_planned")
+
+
+def _late_mismatch(sent: dict[str, Any], detail: dict[str, Any]) -> list[str]:
+    bad = []
+    for f in ("structured_workout", "structure", "duration_minutes"):
+        if f in sent and not _compare(f, sent[f], _landed_value(f, detail)):
+            bad.append(f)
+    return bad
+
+
+async def _settle_recheck(
+    updates: list[dict[str, Any]], rows: list[dict[str, Any]], *, delay_s: float = 3.0,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    import asyncio
+
+    targets = []
+    for u, row in zip(updates, rows, strict=False):
+        if row.get("status") == "not_attempted" or not row.get("success"):
+            continue
+        sent = {k: u[k] for k in _STRUCTURAL_FIELDS if k in u}
+        if any(k in sent for k in ("structured_workout", "structure", "duration_minutes")):
+            targets.append((u, row, sent))
+    report: dict[str, Any] = {"checked": len(targets), "late_drops": [], "late_failed": 0}
+    if not targets:
+        return report
+    if delay_s > 0:
+        await asyncio.sleep(delay_s)
+    resent = []
+    for u, row, sent in targets:
+        try:
+            bad = _late_mismatch(sent, await _read(str(u["workout_id"])))
+        except Exception as e:  # noqa: BLE001
+            row.setdefault("warnings", []).append(f"settle re-read failed: {e}")
+            continue
+        if not bad:
+            continue
+        entry: dict[str, Any] = {"workout_id": str(u["workout_id"]), "date": row.get("date"),
+                                 "title": row.get("title"), "drifted": bad}
+        try:
+            res = await _update_verified(str(u["workout_id"]), verbose=verbose, **sent)
+            res.pop("_after", None)
+            entry["resend_success"] = bool(res.get("success"))
+        except Exception as e:  # noqa: BLE001
+            entry["resend_success"] = False
+            entry["resend_error"] = str(e)
+        resent.append((u, row, sent, entry))
+        report["late_drops"].append(entry)
+    if resent and delay_s > 0:
+        await asyncio.sleep(delay_s)
+    for u, row, sent, entry in resent:
+        final_bad = ["(resend failed)"] if not entry.get("resend_success") else []
+        if not final_bad:
+            try:
+                final_bad = _late_mismatch(sent, await _read(str(u["workout_id"])))
+            except Exception as e:  # noqa: BLE001
+                final_bad = [f"(re-read failed: {e})"]
+        entry["final_ok"] = not final_bad
+        row["late_drop"] = {"drifted": entry["drifted"], "resent": True, "final_ok": entry["final_ok"]}
+        if final_bad:
+            row["success"] = False
+            row["error_code"] = "LATE_DROP"
+            row["message"] = (f"{'/'.join(entry['drifted'])} changed after verify and the single resend "
+                              f"did not hold ({', '.join(final_bad)}); fix by hand and re-read (TECH-44).")
+            report["late_failed"] += 1
+    return report
+
+
 async def lo_update_workouts_batch(
     updates: list[dict[str, Any]],
     on_error: str = "stop",
@@ -550,6 +625,8 @@ async def lo_update_workouts_batch(
     readback_week_start: str | None = None,
     readback_week_end: str | None = None,
     target_tss: str | None = None,
+    settle_check: bool = True,
+    settle_delay_s: float = 3.0,
 ) -> dict[str, Any]:
     """Run lo_update_workout_verified over a list; one round-trip instead of N.
 
@@ -594,11 +671,20 @@ async def lo_update_workouts_batch(
             if on_error == "stop":
                 halted = True
 
+    late: dict[str, Any] | None = None
+    if settle_check:
+        late = await _settle_recheck(updates, rows, delay_s=settle_delay_s, verbose=verbose)
+        if late["late_failed"]:
+            summary["verified"] -= late["late_failed"]
+            summary["failed"] += late["late_failed"]
+
     out: dict[str, Any] = {
         "success": summary["failed"] == 0 and summary["not_attempted"] == 0,
         "summary": summary,
         "results": rows,
     }
+    if late is not None:
+        out["settle_check"] = {k: v for k, v in late.items() if k != "late_failed"}
     if readback_save_to:
         if readback_week_start and readback_week_end:
             # Whole-week read-back (feedback #2): week-level rules (R6/R14/R45...) see
@@ -814,8 +900,9 @@ def register_lo_tools(tools: list[Any], handlers: dict[str, Any]) -> None:
             "Update MANY workouts in one call, each verified by read-back exactly "
             "like lo_update_workout_verified (split writes, sport-drift check, "
             "per-field sent/landed). Pass `updates` inline or a `payload_file` "
-            "produced by `tp_build.py --week --update`. Sequential, never retries; "
-            "on_error=stop halts at the first row that did not land. With "
+            "produced by `tp_build.py --week --update`. Sequential; the only retry is "
+            "the TECH-44 settle pass (one resend of a row whose structure changed after "
+            "verify). on_error=stop halts at the first row that did not land. With "
             "readback_save_to the post-update details are written in "
             "validate_week.py shape (structure included) so Step 5 needs no extra read."
         ),
@@ -857,6 +944,15 @@ def register_lo_tools(tools: list[Any], handlers: dict[str, Any]) -> None:
                         "e.g. '740-760': with whole-week readback, returns week_load {tri_tss, in_range, gap}."
                     ),
                 },
+                "settle_check": {
+                    "type": "boolean", "default": True,
+                    "description": (
+                        "TECH-44: after the batch, wait settle_delay_s, re-read every row whose "
+                        "structure/duration was written and resend that row once if it drifted "
+                        "(rows get late_drop; a drop that does not hold fails with LATE_DROP)."
+                    ),
+                },
+                "settle_delay_s": {"type": "number", "default": 3},
             },
             "required": [],
         },
@@ -906,6 +1002,8 @@ def register_lo_tools(tools: list[Any], handlers: dict[str, Any]) -> None:
             readback_week_start=a.get("readback_week_start"),
             readback_week_end=a.get("readback_week_end"),
             target_tss=a.get("target_tss"),
+            settle_check=bool(a.get("settle_check", True)),
+            settle_delay_s=float(a.get("settle_delay_s", 3.0)),
         )
 
     async def _h_get_week(args: dict[str, Any]) -> dict[str, Any]:

@@ -5,6 +5,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# FORK 2026-10-03: the suite tests the full upstream surface; the coach toolset
+# has its own test (test_fork_toolset.py).
+os.environ.setdefault("TP_MCP_TOOLSET", "full")
+
 # Test cookie (fake, for testing only)
 TEST_COOKIE = "test_cookie_value_12345"
 TEST_ATHLETE_ID = 123456

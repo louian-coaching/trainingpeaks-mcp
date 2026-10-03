@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -57,6 +58,32 @@ class ErrorCode(Enum):
     NETWORK_ERROR = "NETWORK_ERROR"
     FORBIDDEN_ENDPOINT = "FORBIDDEN_ENDPOINT"
     UNPARSEABLE_RESPONSE = "UNPARSEABLE_RESPONSE"  # FORK: 2xx with non-JSON body
+    WRITE_OUTCOME_UNKNOWN = "WRITE_OUTCOME_UNKNOWN"  # FORK: write sent, no answer — may have landed
+
+
+def _retries() -> int:
+    """FORK: extra attempts for transient failures (env TP_MCP_RETRIES, default 2)."""
+    try:
+        return int(os.environ.get("TP_MCP_RETRIES", "2"))
+    except ValueError:
+        return 2
+
+
+def _retry_after_seconds(response: Any) -> float | None:
+    try:
+        v = response.headers.get("Retry-After")
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _backoff(attempt: int, last: Any) -> float:
+    """1s, 3s, … ; honours Retry-After (capped at 15s) on 429."""
+    ra = getattr(last, "retry_after", None) if last is not None else None
+    if isinstance(ra, (int, float)) and ra > 0:
+        return min(float(ra), 15.0)
+    base = float(os.environ.get("TP_MCP_RETRY_BASE_S", "1.0"))
+    return base * (3 ** (attempt - 1))
 
 
 # Hard-blocked endpoints — destructive operations the connector must NEVER issue,
@@ -84,6 +111,7 @@ class APIResponse:
     data: dict[str, Any] | list[Any] | None = None
     error_code: ErrorCode | None = None
     message: str = ""
+    retry_after: float | None = None  # FORK: Retry-After seconds on 429
 
     @property
     def is_error(self) -> bool:
@@ -352,14 +380,58 @@ class TPClient:
         url = f"{self.base_url}{endpoint}"
         headers = self._get_headers()
 
-        try:
-            response = await self._client.request(
-                method=method,
-                url=url,
-                headers=headers,
-                json=json,
-                params=params,
-            )
+        # FORK 2026-10-03: transient-failure retry. Reads (GET) are idempotent and retry
+        # on timeouts, connection errors, 429 and 502/503/504. Writes retry ONLY when the
+        # request provably never reached TP (connect error / connect timeout) or TP
+        # refused it (429). A write that timed out after being sent returns
+        # WRITE_OUTCOME_UNKNOWN: it may have landed, so the caller must read back before
+        # resending (STH 10/02: "timeout → nearly created the week twice").
+        is_read = method.upper() == "GET"
+        attempts = 1 + max(0, _retries())
+        last: APIResponse | None = None
+        timeouts = 0
+        for attempt in range(attempts):
+            if attempt:
+                await asyncio.sleep(_backoff(attempt, last))
+                await self._throttle()
+            try:
+                response = await self._client.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    json=json,
+                    params=params,
+                )
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                last = APIResponse(success=False, error_code=ErrorCode.NETWORK_ERROR,
+                                   message=f"Could not connect to TrainingPeaks: {e or type(e).__name__}")
+                continue  # never reached the server — safe to retry for any method
+            except httpx.TimeoutException:
+                if not is_read:
+                    return APIResponse(
+                        success=False,
+                        error_code=ErrorCode.WRITE_OUTCOME_UNKNOWN,
+                        message=(f"{method} {endpoint} timed out after it was sent — it MAY have "
+                                 "landed. Read back (tp_get_workout / tp_get_workouts) before "
+                                 "resending; do not blindly retry."),
+                    )
+                last = APIResponse(success=False, error_code=ErrorCode.NETWORK_ERROR,
+                                   message="Request timed out. Check your network connection.")
+                timeouts += 1
+                if timeouts >= 2:  # two full timeouts ≈ 60s: stop, the client side may give up first
+                    break
+                continue
+            except httpx.RequestError as e:
+                if not is_read:
+                    return APIResponse(
+                        success=False,
+                        error_code=ErrorCode.WRITE_OUTCOME_UNKNOWN,
+                        message=(f"Network error during {method} {endpoint} ({e}) — it MAY have "
+                                 "landed. Read back before resending."),
+                    )
+                last = APIResponse(success=False, error_code=ErrorCode.NETWORK_ERROR,
+                                   message=f"Network error: {e}")
+                continue
 
             # Handle 401 with retry logic
             if response.status_code == 401 and _retry_on_401:
@@ -367,20 +439,20 @@ class TPClient:
                 self._token_cache.clear()
                 return await self._request(method, endpoint, json=json, params=params, _retry_on_401=False)
 
-            return self._handle_response(response)
+            if response.status_code == 429 or (is_read and response.status_code in (502, 503, 504)):
+                last = self._handle_response(response)
+                last.retry_after = _retry_after_seconds(response)
+                continue
 
-        except httpx.TimeoutException:
-            return APIResponse(
-                success=False,
-                error_code=ErrorCode.NETWORK_ERROR,
-                message="Request timed out. Check your network connection.",
-            )
-        except httpx.RequestError as e:
-            return APIResponse(
-                success=False,
-                error_code=ErrorCode.NETWORK_ERROR,
-                message=f"Network error: {e}",
-            )
+            res = self._handle_response(response)
+            if attempt:
+                logger.info("%s %s succeeded on attempt %d", method, endpoint, attempt + 1)
+            return res
+
+        assert last is not None
+        if attempt > 0:
+            last.message = f"{last.message} (gave up after {attempt + 1} attempts)"
+        return last
 
     def _handle_response(self, response: httpx.Response) -> APIResponse:
         """Handle API response and convert to APIResponse.
