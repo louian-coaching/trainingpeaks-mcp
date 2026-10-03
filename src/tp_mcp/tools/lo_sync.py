@@ -74,13 +74,74 @@ def save_snapshot(rows: list[dict[str, Any]], start: str, end: str, key: str | N
         for r in rows:
             if r.get("id") is not None:
                 ws[str(r["id"])] = r
+        windows = [w for w in (snap.get("windows") or []) if isinstance(w, dict)]
+        if {"start": start, "end": end} not in windows:
+            windows.append({"start": start, "end": end})
         snap = {"workouts": ws, "updated": datetime.now().isoformat(timespec="seconds"),
-                "last_window": {"start": start, "end": end}}
+                "last_window": {"start": start, "end": end}, "windows": windows[-12:]}
         p = _snap_path(key)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(snap, ensure_ascii=False, indent=1), encoding="utf-8")
         return str(p)
     except Exception:  # noqa: BLE001 — a snapshot must never break a read-back
+        return None
+
+
+def _covered(snap: dict[str, Any], day: str) -> bool:
+    wins = list(snap.get("windows") or [])
+    if isinstance(snap.get("last_window"), dict):
+        wins.append(snap["last_window"])
+    return any(isinstance(w, dict) and str(w.get("start")) <= day <= str(w.get("end")) for w in wins)
+
+
+def upsert_snapshot_rows(rows: list[dict[str, Any]], key: str | None = None) -> str | None:
+    """FORK (2026/10/03): record our OWN writes in the baseline. Never raises.
+
+    Without this, every edit made through an lo_ write tool stayed in the
+    snapshot as its pre-edit version, so the next ``lo_diff_week`` reported
+    Claude's own change as "the coach edited this" and the real coach edits
+    were buried among them. Only rows the snapshot already knows (same id, or
+    a date inside a window it has read) are written — a partial snapshot must
+    not pretend to cover a week it never read."""
+    try:
+        snap = load_snapshot(key)
+        ws: dict[str, Any] = snap.get("workouts") or {}
+        touched = 0
+        for r in rows or []:
+            wid = r.get("id")
+            if wid is None:
+                continue
+            if str(wid) in ws or _covered(snap, _day(r.get("date"))):
+                ws[str(wid)] = r
+                touched += 1
+        if not touched:
+            return None
+        snap["workouts"] = ws
+        snap["updated"] = datetime.now().isoformat(timespec="seconds")
+        p = _snap_path(key)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(snap, ensure_ascii=False, indent=1), encoding="utf-8")
+        return str(p)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def drop_snapshot_ids(ids: list[str], key: str | None = None) -> str | None:
+    """FORK (2026/10/03): forget workouts we deleted ourselves. Never raises."""
+    try:
+        snap = load_snapshot(key)
+        ws: dict[str, Any] = snap.get("workouts") or {}
+        gone = [i for i in map(str, ids or []) if i in ws]
+        if not gone:
+            return None
+        for i in gone:
+            ws.pop(i, None)
+        snap["workouts"] = ws
+        snap["updated"] = datetime.now().isoformat(timespec="seconds")
+        p = _snap_path(key)
+        p.write_text(json.dumps(snap, ensure_ascii=False, indent=1), encoding="utf-8")
+        return str(p)
+    except Exception:  # noqa: BLE001
         return None
 
 
@@ -135,6 +196,33 @@ def _text_diff(a: str, b: str, limit: int = 30) -> list[str]:
     return list(difflib.unified_diff(a.splitlines(), b.splitlines(), lineterm="", n=0))[2:2 + limit]
 
 
+# A "number with meaning": has a unit, a pace/time colon, or a range. Bare
+# integers (「5」) are everywhere in prose and would only produce noise.
+_NUM_TOKEN = re.compile(
+    r"\d+(?:[.:]\d+)?(?:\s*[~～\-]\s*\d+(?:[.:]\d+)?)?"
+    r"(?:\s*(?:公里|公尺|分鐘|秒|W|/km|/100m|km|k|組|趟|%|bpm))?"
+)
+
+
+def _meaningful_numbers(text: str) -> set[str]:
+    out = set()
+    for m in _NUM_TOKEN.finditer(text or ""):
+        tok = re.sub(r"\s+", "", m.group(0))
+        if re.search(r"[:~～\-]|[^\d.]$", tok):
+            out.add(tok)
+    return out
+
+
+def stale_explanation_numbers(old_body: str, new_body: str, new_explanation: str) -> list[str]:
+    """FORK (2026/10/03): numbers the coach removed from the body that the
+    explanation still quotes (e.g. body 3×1.6k → 4×1.2k, explanation still
+    says 「1.6公里」). The explanation is never rewritten automatically; this
+    just points at what to update."""
+    removed = _meaningful_numbers(old_body) - _meaningful_numbers(new_body)
+    expl = re.sub(r"\s+", "", new_explanation or "")
+    return sorted(t for t in removed if t in expl)
+
+
 def diff_rows(before: dict[str, dict[str, Any]], after: list[dict[str, Any]], start: str, end: str) -> dict[str, Any]:
     now = {str(w.get("id")): w for w in after if w.get("id") is not None}
     in_window_before = {i: w for i, w in before.items() if start <= _day(w.get("date")) <= end}
@@ -156,6 +244,9 @@ def diff_rows(before: dict[str, dict[str, Any]], after: list[dict[str, Any]], st
         nb, ne = split_description(w.get("description"))
         if ob.strip() != nb.strip():
             ch["body"] = _text_diff(ob, nb)
+            stale_nums = stale_explanation_numbers(ob, nb, ne)
+            if stale_nums:
+                ch["stale_explanation_numbers"] = stale_nums
         if oe.strip() != ne.strip():
             ch["explanation"] = _text_diff(oe, ne)
         if _steps_sig(old.get("structured_workout")) != _steps_sig(w.get("structured_workout")):
@@ -167,7 +258,13 @@ def diff_rows(before: dict[str, dict[str, Any]], after: list[dict[str, Any]], st
     for wid, w in in_window_before.items():
         if wid not in now:
             deleted.append({"id": wid, "date": _day(w.get("date")), "sport": w.get("sport"), "title": w.get("title")})
-    return {"added": added, "deleted": deleted, "changed": changed, "unchanged": unchanged}
+    stale_expl = [{"id": c["id"], "date": c["date"], "title": c["title"],
+                   "numbers": c["changes"]["stale_explanation_numbers"]}
+                  for c in changed if c["changes"].get("stale_explanation_numbers")]
+    out = {"added": added, "deleted": deleted, "changed": changed, "unchanged": unchanged}
+    if stale_expl:
+        out["stale_explanations"] = stale_expl
+    return out
 
 
 async def _settings_thresholds() -> tuple[dict[str, Any], str | None]:
@@ -326,6 +423,8 @@ async def lo_delete_workouts_batch(workout_ids: list[Any], expect_athlete_name: 
     for r in rows:
         summary[r["status"]] = summary.get(r["status"], 0) + 1
     bad = {"not_found", "delete_failed", "still_present"}
+    if not dry_run:
+        drop_snapshot_ids([r["id"] for r in rows if r.get("status") == "deleted" and r.get("id")])
     out: dict[str, Any] = {"success": not any(r["status"] in bad for r in rows), "dry_run": dry_run,
                            "summary": summary, "results": rows}
     if not out["success"]:

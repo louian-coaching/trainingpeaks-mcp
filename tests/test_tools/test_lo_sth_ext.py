@@ -418,3 +418,31 @@ def test_calc_loads_writes_sidecar_with_signature(tmp_path):
     side = json.loads(open(out["loads_sidecar"], encoding="utf-8").read())
     ent = side["2026-10-07|RIDE|節奏騎"]
     assert ent["stl"] == 84 and ent["sig"] == lo_sth.stages_sig(bike_cj())
+
+
+def test_prep_week_swim_completion_is_metres_not_time(tmp_path):
+    """FORK 2026/10/03: STH completionPercent is time-based; 原則五 wants metres."""
+    class SwimFake(Fake):
+        async def call(self, tool, a):
+            if tool == "list_recent_activities":
+                self.calls.append((tool, a))
+                return {"activities": [
+                    {"activityId": "S1", "sourceType": "device", "date": "2026-09-30", "sportType": "SWIM",
+                     "title": "有氧耐力", "durationMin": 61.8, "distanceKm": 1.1, "classScheduleId": 700,
+                     "completionPercent": 123.6}]}
+            return await super().call(tool, a)
+
+    f = SwimFake()
+    f.store[700] = {"date": "2026-09-30", "ver": 1, "ref": "r700",
+                    "cj": {"title": "有氧耐力", "sportType": "SWIM", "durationSeconds": 3000,
+                           "summary": "- 暖身游200公尺\n- 200公尺@70-75%, 4趟, 間休20秒", "stages": []}}
+    run(ext.lo_sth_prep_week("T1", "2026-10-05", str(tmp_path / "prep"), client_factory=lambda: f))
+    d = json.loads((tmp_path / "prep" / "prep.json").read_text(encoding="utf-8"))
+    row = next(r for r in d["plan_vs_actual"] if r["id"] == 700)
+    assert (row["plan_m"], row["act_m"], row["done_pct"]) == (1000, 1100, 110.0)
+    assert row["completion_basis"] == "metres" and row["completion"] == 123.6
+
+
+def test_reps_marker_allows_lianxu():
+    from tp_mcp.tools.lo_review import planned_distance_m
+    assert planned_distance_m("- 25公尺衝刺+75公尺慢游, 連續5組") == 500

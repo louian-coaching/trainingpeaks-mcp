@@ -305,3 +305,73 @@ def test_device_split_fragment_is_merged():
     assert out["merged_fragments"][0]["into"] == "a"
     raw = summarize_workouts(ws, merge_fragments=False)
     assert raw["count"] == 2 and raw["unplanned"]
+
+
+# ---------------------------------------------------------------------------
+# 2026/10/03 週檢 — missed / pending_today, tri vs other TSS, identity
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _identity():
+    prof = AsyncMock(return_value={"name": "Test Athlete", "athlete_id": 42})
+    with patch("tp_mcp.tools.profile.tp_get_profile", prof):
+        yield prof
+
+
+def _planned(**over):
+    return _w(type="planned", duration_planned=1.0, duration_actual=None, **over)
+
+
+def test_missed_and_pending_today_split_on_today():
+    out = summarize_workouts([
+        _planned(id="a", date="2026-10-01", title="閾值騎"),
+        _planned(id="b", date="2026-10-03", title="輕鬆跑", sport="Run"),
+        _planned(id="c", date="2026-10-04", title="長騎"),
+    ], today="2026-10-03")
+    assert [m["title"] for m in out["missed"]] == ["閾值騎"]
+    assert [m["title"] for m in out["pending_today"]] == ["輕鬆跑"]
+    assert out["today"] == "2026-10-03"
+
+
+def test_rest_day_reminder_is_never_missed():
+    out = summarize_workouts([_planned(date="2026-10-01", sport="Other", title="休息日")],
+                             today="2026-10-03")
+    assert "missed" not in out
+
+
+def test_completed_sessions_are_not_missed():
+    out = summarize_workouts([_w(date="2026-10-01", duration_planned=1.0, duration_actual=1.0)],
+                             today="2026-10-03")
+    assert "missed" not in out and "pending_today" not in out
+
+
+def test_tss_totals_split_tri_from_other():
+    out = summarize_workouts([
+        _w(sport="Bike", tss_planned=80, tss_actual=70, duration_planned=1, duration_actual=1),
+        _w(id="2", sport="Strength", tss_planned=52, tss_actual=None, duration_planned=0.75),
+    ], today="2026-10-03")
+    t = out["totals"]
+    assert (t["tss_planned"], t["tss_planned_tri"], t["tss_planned_other"]) == (132, 80, 52)
+    assert (t["tss_actual_tri"], t["tss_actual_other"]) == (70, 0)
+
+
+@pytest.mark.asyncio
+async def test_tool_names_the_athlete_it_read(tmp_path):
+    listed = {"workouts": [_planned(date="2026-10-01")], "count": 1}
+    with patch("tp_mcp.tools.workouts.tp_get_workouts", AsyncMock(return_value=listed)):
+        full = await lo_get_workouts_summary("2026-09-28", "2026-10-04", today="2026-10-03")
+        saved = await lo_get_workouts_summary("2026-09-28", "2026-10-04", today="2026-10-03",
+                                              save_to=str(tmp_path / "s.json"))
+    for out in (full, saved):
+        assert out["athlete_name"] == "Test Athlete" and out["athlete_id"] == 42
+    assert saved["missed"][0]["date"] == "2026-10-01"
+
+
+@pytest.mark.asyncio
+async def test_identity_failure_never_blocks_the_read(_identity):
+    _identity.return_value = {"isError": True, "error_code": "X", "message": "x"}
+    listed = {"workouts": [], "count": 0}
+    with patch("tp_mcp.tools.workouts.tp_get_workouts", AsyncMock(return_value=listed)):
+        out = await lo_get_workouts_summary("2026-09-28", "2026-10-04")
+    assert out["count"] == 0 and "athlete_name" not in out

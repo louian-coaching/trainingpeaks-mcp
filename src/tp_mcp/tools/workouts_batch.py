@@ -413,6 +413,11 @@ async def tp_create_workouts_batch(
         if "warnings" not in row:
             row["warnings"] = _row_warnings(item, None, None)
 
+    if readback_rows:  # FORK (2026/10/03): our own creations join the diff baseline
+        from tp_mcp.tools.lo_sync import upsert_snapshot_rows
+
+        upsert_snapshot_rows(readback_rows)
+
     counts = {"created": 0, "skipped": 0, "failed": 0, "uncertain": 0}
     for row in results:
         status = row.get("status", "")

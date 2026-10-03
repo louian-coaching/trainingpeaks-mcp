@@ -71,7 +71,7 @@ _NOTE = (
 # Everything after 「－－」 is the coaching write-up, which is full of numbers
 # that are not volume (每100公尺1:52), so it is cut off first.
 _BODY_SPLIT = "－－"
-_REPS_RX = re.compile(r"[,，]\s*(\d+)\s*[趟組]")
+_REPS_RX = re.compile(r"[,，]\s*(?:連續)?\s*(\d+)\s*[趟組]")
 _METRE_RX = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*公尺")
 _KM_RX = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*公里")
 
@@ -159,6 +159,16 @@ def _pair(w: dict[str, Any], basis: str) -> tuple[float | None, float | None, st
     )
 
 
+# FORK (2026/10/03 週檢): the load figures the coach plans with are the tri
+# disciplines. Strength/Other TSS mixed into one total made a target week read
+# "coach-changed" when only a strength session's estimate differed (Carrie
+# 573.6 vs 521.6). Totals now carry the split; the mixed figure stays for
+# backward compatibility.
+_TRI_SPORTS = {"Swim", "Bike", "MtnBike", "Run", "Brick"}
+# Calendar markers that are never "missed": rest-day reminders, notes-as-workouts.
+_NOT_TRAINING = {"Other", "DayOff", "Day Off", "Custom"}
+
+
 def _num(val: Any) -> float:
     return float(val) if isinstance(val, (int, float)) else 0.0
 
@@ -202,14 +212,26 @@ def summarize_workouts(
     workouts: list[dict[str, Any]],
     incomplete_below: float = 90.0,
     merge_fragments: bool = True,
+    today: str | None = None,
 ) -> dict[str, Any]:
     """Strip descriptions, add per-sport completion, flag the gaps.
 
+    ``today`` (YYYY-MM-DD, default: the server's local date) splits planned
+    sessions with nothing recorded into ``missed`` (before today) and
+    ``pending_today`` (today — may still happen). Future planned sessions are
+    neither.
+
     Split out from the tool so it is testable without touching the API.
     """
+    import datetime as _dt
+
+    today = today or _dt.date.today().isoformat()
     rows: list[dict[str, Any]] = []
     incomplete: list[dict[str, Any]] = []
     unplanned: list[dict[str, Any]] = []
+    missed: list[dict[str, Any]] = []
+    pending_today: list[dict[str, Any]] = []
+    tss_group = {"tri": {"planned": 0.0, "actual": 0.0}, "other": {"planned": 0.0, "actual": 0.0}}
     per_sport: dict[str, dict[str, float]] = {}
     tss_planned_total = tss_actual_total = 0.0
     merged: list[dict[str, Any]] = []
@@ -244,6 +266,9 @@ def summarize_workouts(
 
         tss_planned_total += _num(w.get("tss_planned"))
         tss_actual_total += _num(w.get("tss_actual"))
+        grp = tss_group["tri" if (w.get("sport") in _TRI_SPORTS) else "other"]
+        grp["planned"] += _num(w.get("tss_planned"))
+        grp["actual"] += _num(w.get("tss_actual"))
 
         bucket = per_sport.setdefault(
             w.get("sport") or "?", {f"planned_{unit}": 0.0, f"actual_{unit}": 0.0}
@@ -253,6 +278,15 @@ def summarize_workouts(
 
         if completed and not planned:
             unplanned.append({k: row[k] for k in ("date", "sport", "title", "actual", "unit")})
+        elif not completed and (w.get("sport") or "") not in _NOT_TRAINING and (
+                planned or w.get("tss_planned")):
+            day = str(w.get("date") or "")[:10]
+            item = {"date": day, "sport": row["sport"], "title": row["title"],
+                    "planned": planned, "unit": unit}
+            if day and day < today:
+                missed.append(item)
+            elif day == today:
+                pending_today.append(item)
         elif completed and row.get("done_pct") is not None and row["done_pct"] < incomplete_below:
             incomplete.append({
                 "date": row["date"], "sport": row["sport"], "title": row["title"],
@@ -263,16 +297,45 @@ def summarize_workouts(
     totals: dict[str, Any] = {
         "tss_planned": round(tss_planned_total, 1),
         "tss_actual": round(tss_actual_total, 1),
+        "tss_planned_tri": round(tss_group["tri"]["planned"], 1),
+        "tss_actual_tri": round(tss_group["tri"]["actual"], 1),
+        "tss_planned_other": round(tss_group["other"]["planned"], 1),
+        "tss_actual_other": round(tss_group["other"]["actual"], 1),
         "per_sport": per_sport,
     }
-    out: dict[str, Any] = {"workouts": rows, "count": len(rows), "totals": totals, "note": _NOTE}
+    out: dict[str, Any] = {"workouts": rows, "count": len(rows), "totals": totals, "note": _NOTE,
+                           "today": today}
     if incomplete:
         out["incomplete"] = incomplete
     if unplanned:
         out["unplanned"] = unplanned
+    if missed:
+        out["missed"] = missed
+    if pending_today:
+        out["pending_today"] = pending_today
     if merged:
         out["merged_fragments"] = merged
     return out
+
+
+_LIST_KEYS = ("incomplete", "unplanned", "missed", "pending_today", "merged_fragments")
+
+
+async def athlete_identity() -> dict[str, Any]:
+    """FORK: who this read actually resolved to — {athlete_name, athlete_id}.
+
+    Every review result carries it so a mistyped ``athlete`` can never pass as
+    the right person's week. Best-effort: an identity failure never blocks the
+    read; it returns {} and the caller still gets its data."""
+    try:
+        from tp_mcp.tools.profile import tp_get_profile
+        prof = await tp_get_profile()
+    except Exception:  # pragma: no cover - network/auth failure
+        logger.exception("identity lookup failed")
+        return {}
+    if not isinstance(prof, dict) or prof.get("isError"):
+        return {}
+    return {"athlete_name": prof.get("name"), "athlete_id": prof.get("athlete_id")}
 
 
 async def lo_get_workouts_summary(
@@ -282,6 +345,7 @@ async def lo_get_workouts_summary(
     incomplete_below: float = 90.0,
     save_to: str | None = None,
     merge_fragments: bool = True,
+    today: str | None = None,
 ) -> dict[str, Any]:
     """List workouts without their descriptions, with per-sport completion.
 
@@ -304,17 +368,19 @@ async def lo_get_workouts_summary(
         return res
 
     out = summarize_workouts(res.get("workouts") or [], incomplete_below=incomplete_below,
-                             merge_fragments=merge_fragments)
+                             merge_fragments=merge_fragments, today=today)
     out["date_range"] = res.get("date_range") or {"start": start_date, "end": end_date}
+    out = {**(await athlete_identity()), **out}
     if save_to:
         import json
         from pathlib import Path
         p = Path(save_to).expanduser()
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
-        return {"saved_to": str(p), "count": out["count"], "totals": out["totals"],
-                **{k: out[k] for k in ("incomplete", "unplanned", "merged_fragments") if k in out},
-                "date_range": out["date_range"]}
+        return {**{k: out[k] for k in ("athlete_name", "athlete_id") if k in out},
+                "saved_to": str(p), "count": out["count"], "totals": out["totals"],
+                **{k: out[k] for k in _LIST_KEYS if k in out},
+                "date_range": out["date_range"], "today": out["today"]}
     return out
 
 
@@ -332,7 +398,10 @@ def register_lo_review(tools: list[Any], handlers: dict[str, Any]) -> None:
             "it returns the five columns that decision needs instead of ~11 full "
             "coaching write-ups, and flags every session under `incomplete_below` "
             "plus any unplanned session the athlete added. TSS is returned as raw "
-            "planned/actual figures for load planning only, never as a ratio."
+            "planned/actual figures for load planning only, never as a ratio; totals split "
+            "tri (swim/bike/run) from strength/other. Planned sessions with nothing recorded "
+            "are listed under `missed` (before today) or `pending_today`. Every result names "
+            "the athlete it resolved to (athlete_name/athlete_id)."
         ),
         input_schema={
             "type": "object",
@@ -351,6 +420,9 @@ def register_lo_review(tools: list[Any], handlers: dict[str, Any]) -> None:
                 "merge_fragments": {"type": "boolean", "default": True, "description": (
                     "Fold an untitled, unplanned completed activity into the same-day, same-sport planned "
                     "session (device-split recordings). Set false to see the raw rows.")},
+                "today": {"type": "string", "description": (
+                    "YYYY-MM-DD; defaults to the server's local date. Splits unrecorded planned "
+                    "sessions into missed / pending_today.")},
                 "incomplete_below": {
                     "type": "number",
                     "default": 90,
@@ -371,6 +443,7 @@ def register_lo_review(tools: list[Any], handlers: dict[str, Any]) -> None:
             incomplete_below=float(args.get("incomplete_below", 90)),
             save_to=args.get("save_to"),
             merge_fragments=bool(args.get("merge_fragments", True)),
+            today=args.get("today"),
         )
 
     handlers["lo_get_workouts_summary"] = _h_summary

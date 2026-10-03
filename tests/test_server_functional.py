@@ -61,6 +61,7 @@ class TestListTools:
             "lo_render_body",
             "lo_delete_workouts_batch",
             "lo_get_workouts_summary",
+            "lo_weekly_check",
             "lo_sth_call",
             "lo_sth_calc_loads",
             "lo_sth_create_week",

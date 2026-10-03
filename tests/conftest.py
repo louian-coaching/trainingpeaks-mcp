@@ -159,3 +159,9 @@ def mock_api_responses():
             },
         ],
     }
+
+
+@pytest.fixture(autouse=True)
+def _isolated_snapshot_dir(tmp_path, monkeypatch):
+    """FORK: lo_ write tools now refresh the diff snapshot; never touch the real one in tests."""
+    monkeypatch.setenv("TP_LO_SNAPSHOT_DIR", str(tmp_path / "_snapshots"))

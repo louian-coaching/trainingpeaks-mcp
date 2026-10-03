@@ -1646,6 +1646,7 @@ _ATHLETE_PARAM = {
 from tp_mcp.tools.lo_strength import register_lo_strength  # noqa: E402
 from tp_mcp.tools.lo_tools import normalize_aliases, peek_payload_athlete, register_lo_tools  # noqa: E402
 from tp_mcp.tools.lo_review import register_lo_review  # noqa: E402
+from tp_mcp.tools.lo_weekly import register_lo_weekly  # noqa: E402
 from tp_mcp.tools.lo_verify import register_lo_verify  # noqa: E402
 from tp_mcp.tools.lo_sync import register_lo_sync  # noqa: E402
 from tp_mcp.tools.lo_sth import LO_STH_TOOLS, register_lo_sth  # noqa: E402
@@ -1655,11 +1656,13 @@ _LO_HANDLERS: dict[str, Any] = {}
 register_lo_tools(TOOLS, _LO_HANDLERS)
 register_lo_strength(TOOLS, _LO_HANDLERS)
 register_lo_review(TOOLS, _LO_HANDLERS)
+register_lo_weekly(TOOLS, _LO_HANDLERS)  # FORK 2026-10-03: 週檢一次抓完
 register_lo_verify(TOOLS, _LO_HANDLERS)
 register_lo_sync(TOOLS, _LO_HANDLERS)
 register_lo_sth(TOOLS, _LO_HANDLERS)  # FORK 2026-09-27: StrongTri proxy
 register_lo_sth_ext(TOOLS, _LO_HANDLERS)  # FORK 2026-10-02: STH 提速 A/B/D
 _ATHLETE_EXEMPT_TOOLS |= set(LO_STH_TOOLS) | set(LO_STH_EXT_TOOLS)  # STH 用 tri_user_id，不吃 TP athlete
+_ATHLETE_EXEMPT_TOOLS.add("lo_weekly_check")  # takes its own `athletes` list
 
 for _tool in TOOLS:
     if _tool.name not in _ATHLETE_EXEMPT_TOOLS:
@@ -1730,8 +1733,22 @@ def _dump_and_summarize(name: str, result: Any, save_to: str) -> dict[str, Any]:
             "current": result.get("current"),
             "daily_count": len(result.get("daily_data", [])),
         })
+    elif name == "tp_get_workout":
+        # FORK (2026/10/03): the generic 10-key cut hid metrics/structured_workout and
+        # read as "tp_get_workout has no structure". Say what is actually in the file.
+        sw = result.get("structured_workout")
+        summary.update({
+            "id": result.get("id"), "date": result.get("date"), "title": result.get("title"),
+            "sport": result.get("sport"),
+            "has_structured_workout": bool(isinstance(sw, dict) and sw.get("structure")),
+            "structure_blocks": len(sw.get("structure") or []) if isinstance(sw, dict) else 0,
+            "metrics": {k: v for k, v in (result.get("metrics") or {}).items()
+                        if k in ("duration_planned", "tss_planned", "distance_planned_km",
+                                 "duration_actual", "tss_actual", "distance_actual_km") and v is not None},
+            "top_level_keys": list(result),
+        })
     else:
-        summary["top_level_keys"] = list(result)[:10]
+        summary["top_level_keys"] = list(result)
     return summary
 # --- END LOCAL PATCH -------------------------------------------------------
 
@@ -1747,7 +1764,7 @@ def _dump_and_summarize(name: str, result: Any, save_to: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _READ_ONLY_PREFIXES = ("tp_get_", "tp_list_", "tp_download_", "tp_search_", "tp_validate_", "tp_analyze_")
-_READ_ONLY_EXTRA = {"tp_auth_status", "lo_get_week_for_validate", "lo_diff_week"}  # FORK: lo_ read tool
+_READ_ONLY_EXTRA = {"tp_auth_status", "lo_get_week_for_validate", "lo_diff_week", "lo_weekly_check"}  # FORK: lo_ read tool
 
 # Irrecoverable data removal. Everything else that writes is recoverable by a
 # follow-up call (update/re-add), so destructiveHint stays False there.

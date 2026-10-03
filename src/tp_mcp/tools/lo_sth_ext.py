@@ -412,6 +412,28 @@ async def lo_sth_prep_week(tri_user_id: str, week_start: str, save_dir: str, his
                 templates[str(cid)] = {"date": date, "title": w.get("title"), "file": str(f)}
                 save_snapshot(tri_user_id, cid, got["cj"], date, got["version"], w.get("title"), "prep")
 
+        # FORK (2026/10/03): STH's completionPercent is time-based; method/0 原則五
+        # judges swims by metres (程亮 09/29: 123.6% by time, 2100 m swum).
+        from tp_mcp.tools.lo_review import planned_distance_m
+        for row in plan_rows:
+            if row.get("sport") != "SWIM" or row.get("done") is not True:
+                continue
+            row["completion_basis"] = "time"
+            act_km = row.get("act_km")
+            if not isinstance(act_km, (int, float)) or act_km <= 0:
+                continue
+            try:
+                tf = templates.get(str(row.get("id")))
+                cj = (json.loads(Path(tf["file"]).read_text(encoding="utf-8")) if tf
+                      else (await fetch_cj(cli, tri_user_id, row.get("id")))["cj"]) or {}
+            except Exception:  # noqa: BLE001 — 只是加值，失敗不擋前置
+                continue
+            plan_m = planned_distance_m(cj.get("summary"))
+            if plan_m:
+                act_m = round(act_km * 1000)
+                row.update({"plan_m": plan_m, "act_m": act_m,
+                            "done_pct": round(100.0 * act_m / plan_m, 1), "completion_basis": "metres"})
+
     hdaily = [{k: r.get(k) for k in ("date", "hrv", "rhr", "sleepHours") if r.get(k) is not None}
               for r in (health.get("daily") or [])]
     digest = {**out, "plan_vs_actual": plan_rows, "unplanned_activities": extra,

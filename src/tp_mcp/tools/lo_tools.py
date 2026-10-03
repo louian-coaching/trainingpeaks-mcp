@@ -209,6 +209,11 @@ def _landed_value(field: str, detail: dict[str, Any]) -> Any:
 
 
 def _compare(field: str, sent: Any, landed: Any) -> bool:
+    # FORK (2026/10/03 Gou Cai): clearing a number by sending 0 lands as null in TP.
+    # That is the clear having worked, not WRITE_NOT_LANDED.
+    if field in ("duration_minutes", "tss_planned", "distance_km") and landed is None \
+            and isinstance(sent, (int, float)) and sent == 0:
+        return True
     if field in ("duration_minutes",):
         return _num_close(sent, landed, 0.05)
     if field in ("tss_planned",):
@@ -399,6 +404,16 @@ async def _update_verified(workout_id: str, verbose: bool = False, **fields: Any
             "Strength via tp_update_workout is the China-region text path; "
             "Strength Builder workouts are not visible here (TECH-18)."
         )
+
+    # FORK (2026/10/03): what landed becomes the diff baseline, so the next
+    # lo_diff_week shows only the coach's edits, not ours.
+    try:
+        from tp_mcp.tools.lo_sync import upsert_snapshot_rows
+        from tp_mcp.tools.workouts_batch import _flatten_readback
+
+        upsert_snapshot_rows([_flatten_readback(after)])
+    except Exception:  # noqa: BLE001 — the baseline is best-effort
+        pass
 
     result: dict[str, Any] = {
         "_after": after,  # consumed by lo_update_workouts_batch, stripped before returning

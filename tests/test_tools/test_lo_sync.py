@@ -306,3 +306,58 @@ def test_render_run_strides_keep_target_and_match_both_writings():
     # a body written with the pace, or as bare 衝刺跑, both count as in sync
     assert compare_body("- 30秒@4:10~3:59/km, 慢跑恢復1分30秒, 2組\n- 伸展", lines)["in_sync"]
     assert compare_body("- 30秒衝刺跑, 慢跑恢復1分30秒, 2組\n- 伸展", lines)["in_sync"]
+
+
+# ---------------------------------------------------------------------------
+# 2026/10/03: our own writes join the baseline; stale explanation numbers
+# ---------------------------------------------------------------------------
+
+from tp_mcp.tools.lo_sync import (  # noqa: E402
+    drop_snapshot_ids,
+    stale_explanation_numbers,
+    upsert_snapshot_rows,
+)
+
+
+def test_upsert_only_touches_rows_the_snapshot_covers():
+    save_snapshot([_row("1", "2026-09-29")], "2026-09-28", "2026-10-04")
+    assert upsert_snapshot_rows([_row("1", "2026-09-29", title="改過"), _row("2", "2026-09-30"),
+                                 _row("3", "2026-11-20")])
+    ws = load_snapshot()["workouts"]
+    assert ws["1"]["title"] == "改過" and "2" in ws and "3" not in ws
+
+
+def test_upsert_without_any_snapshot_writes_nothing():
+    assert upsert_snapshot_rows([_row("1", "2026-09-29")]) is None
+    assert load_snapshot()["workouts"] == {}
+
+
+def test_our_own_edit_is_not_reported_as_a_coach_change():
+    save_snapshot([_row("1", "2026-09-29")], "2026-09-28", "2026-10-04")
+    mine = _row("1", "2026-09-29", desc="- 90分鐘@172~191W\n－－\n說明")
+    upsert_snapshot_rows([mine])
+    d = diff_rows(load_snapshot()["workouts"], [mine], "2026-09-28", "2026-10-04")
+    assert d["changed"] == [] and d["unchanged"] == 1
+
+
+def test_deleted_ids_leave_the_baseline():
+    save_snapshot([_row("1", "2026-09-29"), _row("2", "2026-09-30")], "2026-09-28", "2026-10-04")
+    drop_snapshot_ids(["2"])
+    d = diff_rows(load_snapshot()["workouts"], [_row("1", "2026-09-29")], "2026-09-28", "2026-10-04")
+    assert d["deleted"] == []
+
+
+def test_stale_explanation_numbers_found():
+    old = "- 1.6公里@4:05~3:58/km+恢復慢跑400公尺, 3組"
+    new = "- 1.2公里@4:05~3:58/km+恢復慢跑400公尺, 4組"
+    expl = "今天三組1.6公里，配速4:05~3:58/km，組間400公尺慢跑。"
+    assert stale_explanation_numbers(old, new, expl) == ["1.6公里"]
+
+
+def test_stale_explanation_numbers_surface_in_diff():
+    before = {"1": _row("1", "2026-10-07", sport="Run",
+                        desc="- 1.6公里@4:05~3:58/km, 3組\n－－\n三組1.6公里")}
+    after = [_row("1", "2026-10-07", sport="Run", desc="- 1.2公里@4:05~3:58/km, 4組\n－－\n三組1.6公里")]
+    d = diff_rows(before, after, "2026-10-05", "2026-10-11")
+    assert d["changed"][0]["changes"]["stale_explanation_numbers"] == ["1.6公里"]
+    assert d["stale_explanations"][0]["numbers"] == ["1.6公里"]

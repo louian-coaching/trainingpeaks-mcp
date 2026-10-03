@@ -695,3 +695,39 @@ def test_text_compare_ignores_trailing_whitespace():
     from tp_mcp.tools.lo_tools import _compare
     assert _compare("description", "a\n－－\nb\n", "a\n－－\nb")
     assert not _compare("description", "a b", "a  b")
+
+
+# ---------------------------------------------------------------------------
+# 2026/10/03 小修
+# ---------------------------------------------------------------------------
+
+
+def test_clearing_a_number_with_zero_counts_as_landed():
+    from tp_mcp.tools.lo_tools import _compare
+    assert _compare("distance_km", 0, None)
+    assert _compare("tss_planned", 0, None)
+    assert not _compare("distance_km", 5.0, None)
+    assert not _compare("title", 0, None)
+
+
+@pytest.mark.asyncio
+async def test_verified_update_refreshes_the_diff_baseline():
+    from tp_mcp.tools.lo_sync import diff_rows, load_snapshot, save_snapshot
+    from tp_mcp.tools.workouts_batch import _flatten_readback
+
+    fake = FakeTP(_detail())
+    save_snapshot([_flatten_readback(_detail())], "2026-09-21", "2026-09-27")
+    with _wire(fake):
+        res = await lo_update_workout_verified("1001", title="改名")
+    assert res["success"]
+    after = _flatten_readback(fake.state)
+    d = diff_rows(load_snapshot()["workouts"], [after], "2026-09-21", "2026-09-27")
+    assert d["changed"] == []
+
+
+def test_get_workout_save_summary_names_the_structure(tmp_path):
+    from tp_mcp.server import _dump_and_summarize
+    detail = _detail(structured_workout=_SW)
+    out = _dump_and_summarize("tp_get_workout", detail, str(tmp_path / "w.json"))
+    assert out["has_structured_workout"] is True and out["structure_blocks"] == 2
+    assert "structured_workout" in out["top_level_keys"] and "metrics" in out["top_level_keys"]
