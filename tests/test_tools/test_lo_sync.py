@@ -361,3 +361,32 @@ def test_stale_explanation_numbers_surface_in_diff():
     d = diff_rows(before, after, "2026-10-05", "2026-10-11")
     assert d["changed"][0]["changes"]["stale_explanation_numbers"] == ["1.6公里"]
     assert d["stale_explanations"][0]["numbers"] == ["1.6公里"]
+
+
+@pytest.mark.asyncio
+async def test_lo_diff_week_logs_human_edits_once(tmp_path, monkeypatch):
+    import json as _json
+
+    monkeypatch.setenv("TP_LO_SNAPSHOT_DIR", str(tmp_path / "snap"))
+    monkeypatch.setenv("TP_LO_LEARNING_DIR", str(tmp_path / "learn"))
+    old = _row("7", "2026-10-03", title="長距離騎乘", desc="- 2小時@172~191W\n－－\n說明", sw=None)
+    save_snapshot([old], "2026-09-28", "2026-10-04")
+    new = dict(old, description="- 1小時40分@172~191W\n－－\n說明", tss_planned=95.0)
+    week = {"success": True, "rows": [new], "week_load": {"tri_tss": 95.0}}
+    with patch("tp_mcp.tools.lo_tools.lo_get_week_for_validate", AsyncMock(return_value=week)):
+        out = await lo_diff_week("2026-09-28", "2026-10-04", render=False, save_snapshot_after=False)
+        again = await lo_diff_week("2026-09-28", "2026-10-04", render=False, save_snapshot_after=False)
+    assert len(out["edit_log_ids"]) == 1 and "edit_log_ids" not in again
+    rec = _json.loads((tmp_path / "learn" / "coach_edits.jsonl").read_text(encoding="utf-8").strip())
+    assert rec["kind"] == "changed" and rec["workout_id"] == "7" and rec["reasons"] == []
+    assert rec["changes"]["tss_planned"]["to"] == 95.0 and "body" in rec["changes"]
+
+
+@pytest.mark.asyncio
+async def test_lo_diff_week_without_snapshot_logs_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("TP_LO_SNAPSHOT_DIR", str(tmp_path / "snap"))
+    monkeypatch.setenv("TP_LO_LEARNING_DIR", str(tmp_path / "learn"))
+    week = {"success": True, "rows": [_row("1", "2026-09-29")], "week_load": {}}
+    with patch("tp_mcp.tools.lo_tools.lo_get_week_for_validate", AsyncMock(return_value=week)):
+        out = await lo_diff_week("2026-09-28", "2026-10-04", render=False)
+    assert "edit_log_ids" not in out and not (tmp_path / "learn" / "coach_edits.jsonl").exists()

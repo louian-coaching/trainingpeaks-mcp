@@ -8,6 +8,10 @@ import pytest
 # FORK 2026-10-03: the suite tests the full upstream surface; the coach toolset
 # has its own test (test_fork_toolset.py).
 os.environ.setdefault("TP_MCP_TOOLSET", "full")
+# Never let a test append to the coach's real learning log on the Mac.
+import tempfile  # noqa: E402
+
+os.environ.setdefault("TP_LO_LEARNING_DIR", tempfile.mkdtemp(prefix="tp-lo-learning-"))
 
 # Test cookie (fake, for testing only)
 TEST_COOKIE = "test_cookie_value_12345"

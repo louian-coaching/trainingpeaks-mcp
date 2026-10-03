@@ -267,6 +267,75 @@ def diff_rows(before: dict[str, dict[str, Any]], after: list[dict[str, Any]], st
     return out
 
 
+# ---------------------------------------------------------------------------
+# FORK 2026-10-03: learning log. Since 6f47736 every lo_ write refreshes the
+# snapshot, so what lo_diff_week reports is (almost always) a HUMAN edit — the
+# coach in the TP calendar, occasionally the athlete moving a session. Those
+# edits are the most valuable training signal this system has ("TP stores what
+# I changed but not why"). Each one is appended to coach_edits.jsonl with an
+# empty reason; the session then asks the coach for the reason (menu) and
+# tp-ai-layer/tools/learning.py tags it. Nothing here asks or judges anything.
+# ---------------------------------------------------------------------------
+def learning_dir() -> Path | None:
+    env = os.environ.get("TP_LO_LEARNING_DIR")
+    if env:
+        return Path(env).expanduser()
+    default = Path.home() / "Claude" / "Projects" / "TP 訓練助理" / "tp-ai-layer" / "learning"
+    return default if default.parent.exists() else None
+
+
+def _compact_change(ch: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in ch.items():
+        if k in ("body", "explanation") and isinstance(v, list):
+            out[k] = v[:20]
+        else:
+            out[k] = v
+    return out
+
+
+def log_coach_edits(diff: dict[str, Any], athlete: str, window: tuple[str, str]) -> list[str]:
+    """Append one record per added/deleted/changed workout; returns new edit ids.
+    Idempotent: the same change on the same workout is never logged twice."""
+    d = learning_dir()
+    if d is None:
+        return []
+    import hashlib
+
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / "coach_edits.jsonl"
+    seen: set[str] = set()
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                seen.add(json.loads(line).get("fingerprint"))
+            except ValueError:
+                continue
+    now = datetime.now().isoformat(timespec="seconds")
+    new_ids: list[str] = []
+    records = []
+    for kind in ("added", "deleted", "changed"):
+        for item in diff.get(kind) or []:
+            payload = {"kind": kind, "workout_id": item.get("id"),
+                       "changes": _compact_change(item.get("changes") or {}) if kind == "changed" else None,
+                       "tss_planned": item.get("tss_planned")}
+            fp = hashlib.sha256(json.dumps([athlete, payload], ensure_ascii=False, sort_keys=True,
+                                           default=str).encode("utf-8")).hexdigest()[:12]
+            if fp in seen:
+                continue
+            seen.add(fp)
+            eid = f"E{now[:10].replace('-', '')}-{fp[:6]}"
+            records.append({"edit_id": eid, "logged_at": now, "athlete": athlete, "window": list(window),
+                            "date": item.get("date"), "sport": item.get("sport"), "title": item.get("title"),
+                            **payload, "fingerprint": fp, "reasons": [], "note": None})
+            new_ids.append(eid)
+    if records:
+        with path.open("a", encoding="utf-8") as fh:
+            for r in records:
+                fh.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+    return new_ids
+
+
 async def _settings_thresholds() -> tuple[dict[str, Any], str | None]:
     from tp_mcp.tools.settings import tp_get_athlete_settings
 
@@ -296,6 +365,16 @@ async def lo_diff_week(start_date: str, end_date: str, save_snapshot_after: bool
         out["warning"] = ("No snapshot covers this window yet — everything is reported as 'added'. "
                           "Snapshots are written by every planned-week read-back from now on.")
     out.update(diff_rows(before, rows, start_date, end_date))
+    if had_snapshot and (out.get("added") or out.get("deleted") or out.get("changed")):
+        try:
+            ids = log_coach_edits(out, _athlete_key(), (start_date, end_date))
+        except OSError as e:  # the log is a side channel; never fail the diff
+            ids, out["learning_log_warning"] = [], str(e)
+        if ids:
+            out["edit_log_ids"] = ids
+            out["edit_log_next"] = ("Ask the coach WHY (menu, ≤4 workouts per question set, options tailored "
+                                    "to each change) and tag with tp-ai-layer/tools/learning.py edits tag "
+                                    "(PROC-86, sop-learning.md).")
     if render:
         th, err = await _settings_thresholds()
         if err:
