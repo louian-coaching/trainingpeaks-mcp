@@ -208,6 +208,59 @@ def _merge_fragments(workouts: list[dict[str, Any]]) -> tuple[list[dict[str, Any
     return [w for i, w in enumerate(out) if i not in drop], merged
 
 
+def _week_monday(day: str) -> str:
+    import datetime as _dt
+    d = _dt.date.fromisoformat(day[:10])
+    return (d - _dt.timedelta(days=d.weekday())).isoformat()
+
+
+def run_km_totals(workouts: list[dict[str, Any]]) -> dict[str, Any]:
+    """FORK (2026/10/05, PER-75): every kilometre the athlete actually ran.
+
+    ``per_sport.Run`` only sums rows judged on distance, so time-prescribed
+    easy runs and unplanned races dropped out — Gou Cai's 9/28 week read
+    61.6 km when he ran ~100 km, and a pure runner's deload is judged on
+    distance (validate ``--prev-km``). Here every Run row counts:
+    ``actual_km`` sums ``distance_actual_km`` of all completed runs (planned or
+    not); ``planned_km`` sums what has a distance plan, and time-only plans are
+    reported as minutes beside it instead of being guessed. ``by_week`` keys
+    are the Monday of each week; ``weekly_avg_actual_km`` averages the weeks
+    that have any run recorded — feed it to validate_week ``--prev-km``."""
+    actual = planned = 0.0
+    time_only_min = 0.0
+    no_distance = 0
+    by_week: dict[str, float] = {}
+    for w in workouts:
+        if (w.get("sport") or "") != "Run":
+            continue
+        day = str(w.get("date") or "")[:10]
+        if w.get("type") == "completed":
+            km = w.get("distance_actual_km")
+            if isinstance(km, (int, float)) and km > 0:
+                actual += km
+                if day:
+                    wk = _week_monday(day)
+                    by_week[wk] = round(by_week.get(wk, 0.0) + km, 2)
+            else:
+                no_distance += 1
+        pk = _planned_km(w)[0]
+        if pk:
+            planned += pk
+        elif isinstance(w.get("duration_planned"), (int, float)) and w["duration_planned"] > 0:
+            time_only_min += w["duration_planned"] * 60
+    out: dict[str, Any] = {
+        "actual_km": round(actual, 2),
+        "planned_km": round(planned, 2),
+        "planned_time_only_min": round(time_only_min, 1),
+        "by_week": dict(sorted(by_week.items())),
+    }
+    if by_week:
+        out["weekly_avg_actual_km"] = round(sum(by_week.values()) / len(by_week), 1)
+    if no_distance:
+        out["completed_without_distance"] = no_distance
+    return out
+
+
 def summarize_workouts(
     workouts: list[dict[str, Any]],
     incomplete_below: float = 90.0,
@@ -295,6 +348,7 @@ def summarize_workouts(
             })
 
     totals: dict[str, Any] = {
+        "run_km": run_km_totals(workouts),
         "tss_planned": round(tss_planned_total, 1),
         "tss_actual": round(tss_actual_total, 1),
         "tss_planned_tri": round(tss_group["tri"]["planned"], 1),
@@ -401,7 +455,10 @@ def register_lo_review(tools: list[Any], handlers: dict[str, Any]) -> None:
             "planned/actual figures for load planning only, never as a ratio; totals split "
             "tri (swim/bike/run) from strength/other. Planned sessions with nothing recorded "
             "are listed under `missed` (before today) or `pending_today`. Every result names "
-            "the athlete it resolved to (athlete_name/athlete_id)."
+            "the athlete it resolved to (athlete_name/athlete_id). `totals.run_km` counts EVERY "
+            "completed run's distance (time-prescribed and unplanned runs included) with "
+            "`by_week` (Monday keys) and `weekly_avg_actual_km` — query the three weeks before "
+            "a pure runner's deload week and pass that average to validate_week --prev-km (PER-75)."
         ),
         input_schema={
             "type": "object",

@@ -375,3 +375,29 @@ async def test_identity_failure_never_blocks_the_read(_identity):
     with patch("tp_mcp.tools.workouts.tp_get_workouts", AsyncMock(return_value=listed)):
         out = await lo_get_workouts_summary("2026-09-28", "2026-10-04")
     assert out["count"] == 0 and "athlete_name" not in out
+
+
+# FORK 2026/10/05 (PER-75): run_km counts every completed run, not just distance-basis rows
+def test_run_km_counts_time_based_and_unplanned_runs():
+    from tp_mcp.tools.lo_review import summarize_workouts
+
+    ws = [
+        {"id": 1, "date": "2026-09-29", "sport": "Run", "type": "completed", "title": "有氧耐力",
+         "distance_planned_km": 14.97, "distance_actual_km": 16.0, "duration_actual": 1.2},
+        {"id": 2, "date": "2026-10-02", "sport": "Run", "type": "completed", "title": "輕鬆跑",
+         "duration_planned": 1.0, "duration_actual": 1.6, "distance_actual_km": 16.9},
+        {"id": 3, "date": "2026-10-01", "sport": "Run", "type": "completed", "title": "10K 比賽",
+         "duration_actual": 0.59, "distance_actual_km": 10.09},
+        {"id": 4, "date": "2026-10-05", "sport": "Run", "type": "completed", "title": "輕鬆跑",
+         "duration_planned": 1.0, "duration_actual": 1.0, "distance_actual_km": 10.0},
+        {"id": 5, "date": "2026-10-06", "sport": "Run", "type": "planned", "title": "輕鬆跑",
+         "duration_planned": 1.5},
+        {"id": 6, "date": "2026-10-06", "sport": "Bike", "type": "completed", "title": "x",
+         "duration_actual": 1.0, "distance_actual_km": 30.0},
+    ]
+    rk = summarize_workouts(ws, today="2026-10-06")["totals"]["run_km"]
+    assert rk["actual_km"] == 52.99
+    assert rk["by_week"] == {"2026-09-28": 42.99, "2026-10-05": 10.0}
+    assert rk["weekly_avg_actual_km"] == 26.5
+    assert rk["planned_km"] == 14.97
+    assert rk["planned_time_only_min"] == 210.0

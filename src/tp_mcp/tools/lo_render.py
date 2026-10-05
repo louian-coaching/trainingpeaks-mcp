@@ -254,6 +254,7 @@ _TOK_RX = re.compile(
     r"|(?P<s>\d+)秒"
     r"|(?P<km>\d+(?:\.\d+)?)公里"
     r"|(?P<mt>\d+)公尺"
+    r"|(?:不要快過|不快過|不得快過|不要快於|不快於)(?P<u>\d:\d\d)"
     r"|(?P<w>\d+~\d+)W"
     r"|(?P<p>\d:\d\d~\d:\d\d)"
     r"|(?P<rpm>\d+~\d+)rpm"
@@ -270,6 +271,25 @@ def _tok_eq(a: str, b: str) -> bool:
     """
     if a == b:
         return True
+    # FORK 2026/10/05: an upper-limit sentence ("配速不要快過5:00/km", the house
+    # rule for athletes who always run the fast end) states only the range's
+    # fast end — equal to a rendered range whose fast end is within 3 s.
+    if {a[0], b[0]} == {"u", "p"}:
+        u, p_ = (a, b) if a[0] == "u" else (b, a)
+        try:
+            us = int(u[1:].split(":")[0]) * 60 + int(u[1:].split(":")[1])
+            fast = p_[1:].split("~")[-1]
+            fs = int(fast.split(":")[0]) * 60 + int(fast.split(":")[1])
+            return abs(us - fs) <= 3
+        except (ValueError, IndexError):
+            return False
+    # distances written rounded ("12.2公里" for 12195 m): ≤10 m apart on legs ≥1 km
+    if a[0] == b[0] == "d":
+        try:
+            x, y = int(a[1:]), int(b[1:])
+            return min(x, y) >= 1000 and abs(x - y) <= 10
+        except ValueError:
+            return False
     if a[0] != b[0] or a[0] not in "wp":
         return False
     try:
@@ -305,7 +325,15 @@ def _drop_short_intensity(sig: tuple[str, ...]) -> tuple[str, ...]:
 
 def sig_eq(a: tuple[str, ...], b: tuple[str, ...]) -> bool:
     a, b = _drop_short_intensity(a), _drop_short_intensity(b)
-    return len(a) == len(b) and all(_tok_eq(x, y) for x, y in zip(a, b, strict=True))
+    if len(a) == len(b) and all(_tok_eq(x, y) for x, y in zip(a, b, strict=True)):
+        return True
+    # an upper-limit note on a line the graph renders without a target
+    # ("緩跑5分鐘，配速不要快過5:00/km" vs "緩跑5分鐘") is commentary, not a change
+    a2 = tuple(t for t in a if t[0] != "u")
+    b2 = tuple(t for t in b if t[0] != "u")
+    if (a2, b2) == (a, b):
+        return False
+    return len(a2) == len(b2) and all(_tok_eq(x, y) for x, y in zip(a2, b2, strict=True))
 
 
 def line_signature(line: str) -> tuple[str, ...]:
@@ -322,6 +350,8 @@ def line_signature(line: str) -> tuple[str, ...]:
             toks.append(f"d{int(round(float(g['km']) * 1000))}")
         elif g["mt"]:
             toks.append(f"d{int(g['mt'])}")
+        elif g["u"]:
+            toks.append(f"u{g['u']}")
         elif g["w"]:
             toks.append(f"w{g['w']}")
         elif g["p"]:

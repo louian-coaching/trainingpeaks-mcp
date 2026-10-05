@@ -436,3 +436,33 @@ def test_compact_keeps_stryd_lap_power():
     c = _compact(full)
     assert c["channels_min_max_avg"] == {"Power": [0, 380, 248]}
     assert c["laps"] == [{"name": "Lap 11", "sec": 222, "lap_w": 299}]
+
+
+# FORK 2026/10/05: fixed-distance splits from the chart stream
+def test_compute_splits_interpolates_and_reports_moving_time():
+    from tp_mcp.tools.analyze import compute_splits
+
+    # 10 s samples at 4:00/km (15 km/h) for 2.5 km, with a 120 s stop at the start
+    ts = [{"time": 0, "Distance": 0.0, "HeartRate": 120, "Altitude": 10},
+          {"time": 120, "Distance": 0.0, "HeartRate": 120, "Altitude": 10}]
+    t, dist = 120, 0.0
+    while dist < 2.5 - 1e-9:
+        t += 10
+        dist = round(dist + 15 / 360, 6)
+        ts.append({"time": t, "Distance": min(dist, 2.5), "HeartRate": 160,
+                   "Altitude": 10 + (2 if dist > 1 else 0)})
+    sp = compute_splits(ts, 1)
+    assert [s["km_to"] for s in sp] == [1.0, 2.0, 2.5]
+    assert sp[0]["sec"] == 360            # includes the 120 s wait
+    assert sp[0]["moving_pace_s"] == 240  # stop removed
+    assert sp[1]["pace_s"] == 240 and "moving_pace_s" not in sp[1]
+    assert sp[1]["gain_m"] == 2
+    assert sp[1]["avg_hr"] == 160
+
+
+def test_compute_splits_empty_inputs():
+    from tp_mcp.tools.analyze import compute_splits
+
+    assert compute_splits([], 5) == []
+    assert compute_splits([{"time": 0, "Distance": 0}], 5) == []
+    assert compute_splits([{"time": 0, "Distance": 0}, {"time": 10, "Distance": 0.1}], 0) == []

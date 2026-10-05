@@ -390,3 +390,37 @@ async def test_lo_diff_week_without_snapshot_logs_nothing(tmp_path, monkeypatch)
     with patch("tp_mcp.tools.lo_tools.lo_get_week_for_validate", AsyncMock(return_value=week)):
         out = await lo_diff_week("2026-09-28", "2026-10-04", render=False)
     assert "edit_log_ids" not in out and not (tmp_path / "learn" / "coach_edits.jsonl").exists()
+
+
+# FORK 2026/10/05: upper-limit wording is the fast end of the rendered range
+def test_upper_limit_sentence_matches_rendered_range():
+    from tp_mcp.tools.lo_render import compare_body
+
+    cur = "- 30公里@3:55~3:50/km\n- 12.2公里慢跑，配速不要快過5:00/km\n- 伸展\n"
+    rendered = ["- 30公里@3:55~3:50/km", "- 12.195公里@5:32~5:00/km", "- 伸展"]
+    r = compare_body(cur, rendered)
+    assert r["in_sync"] is True
+    assert "12.2公里慢跑，配速不要快過5:00/km" in r["suggested_body"]
+
+
+def test_upper_limit_on_untargeted_cooldown_still_in_sync():
+    from tp_mcp.tools.lo_render import compare_body
+
+    cur = "- 8公里@3:55~3:50/km\n- 緩跑5分鐘，配速不要快過5:00/km\n- 伸展\n"
+    r = compare_body(cur, ["- 8公里@3:55~3:50/km", "- 緩跑5分鐘", "- 伸展"])
+    assert r["in_sync"] is True
+
+
+def test_upper_limit_that_disagrees_is_reported():
+    from tp_mcp.tools.lo_render import compare_body
+
+    cur = "- 12公里慢跑，配速不要快過4:30/km\n- 伸展\n"
+    r = compare_body(cur, ["- 12公里@5:32~5:00/km", "- 伸展"])
+    assert r["in_sync"] is False
+
+
+def test_rounded_distance_mismatch_beyond_10m_is_reported():
+    from tp_mcp.tools.lo_render import compare_body
+
+    r = compare_body("- 12.2公里@5:32~5:00/km\n", ["- 12.1公里@5:32~5:00/km"])
+    assert r["in_sync"] is False

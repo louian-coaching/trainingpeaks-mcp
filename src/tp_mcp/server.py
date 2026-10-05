@@ -668,6 +668,15 @@ TOOLS = [
                         "writes the (deliberately time-series-free) return value."
                     ),
                 },
+                "split_km": {
+                    "type": "number",
+                    "description": (
+                        "FORK: also return fixed-distance splits (e.g. 1 or 5) built from the "
+                        "time series — pace, moving pace when there were stops, HR, power, "
+                        "elevation gain/loss per split. For races recorded as one or a few laps "
+                        "(race plans, PROC-41c marathon reviews)."
+                    ),
+                },
             },
             "required": ["workout_id"],
         },
@@ -2095,7 +2104,7 @@ async def _h_get_peaks(args):
 @_handler("tp_analyze_workout")
 async def _h_analyze(args):
     return await tp_analyze_workout(workout_id=args["workout_id"], save_to=args.get("save_to"),
-                                    detail=args.get("detail", "compact"))
+                                    detail=args.get("detail", "compact"), split_km=args.get("split_km"))
 
 # --- Structured strength / gym ---
 @_handler("tp_search_exercises")

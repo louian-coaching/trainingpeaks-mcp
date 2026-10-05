@@ -205,6 +205,102 @@ _TOTAL_KEEP = ("Duration", "Moving time", "Distance", "TSS", "rTSS", "IF", "rIF"
 _CHANNEL_KEEP = ("HeartRate", "Power", "Pace", "Speed", "Cadence")
 
 
+def compute_splits(time_series: list[dict[str, Any]], split_km: float) -> list[dict[str, Any]]:
+    """FORK (2026/10/05): fixed-distance splits from the chart time series.
+
+    Races recorded as one or three laps (Gou Cai 杭州 2024: 3 laps for 42 km)
+    left the race plan / PROC-41c review reconstructing per-5-km pace by hand.
+    Boundaries are linearly interpolated on (time, Distance) so a split's time
+    is not quantised to the chart's sample spacing; ``moving_sec`` drops
+    samples slower than 3 km/h (start-corral wait, stops). HR/power are
+    time-weighted means of the samples inside the split; ``gain_m``/``loss_m``
+    sum altitude moves of ≥2 m (hysteresis; SmoothedAltitude preferred). Resolution note: the
+    chart stream is ~1000 points, i.e. ~10 s apart on a 3-hour run."""
+    pts = [p for p in time_series
+           if isinstance(p.get("time"), (int, float)) and isinstance(p.get("Distance"), (int, float))]
+    if len(pts) < 2 or not split_km or split_km <= 0:
+        return []
+    pts.sort(key=lambda p: p["time"])
+    total = pts[-1]["Distance"]
+
+    def t_at(km: float) -> float:
+        for i in range(1, len(pts)):
+            d0, d1 = pts[i - 1]["Distance"], pts[i]["Distance"]
+            if d1 >= km:
+                t0, t1 = pts[i - 1]["time"], pts[i]["time"]
+                if d1 == d0:
+                    return float(t1)
+                return t0 + (t1 - t0) * (km - d0) / (d1 - d0)
+        return float(pts[-1]["time"])
+
+    def alt(p: dict[str, Any]) -> Any:
+        v = p.get("SmoothedAltitude")
+        return v if isinstance(v, (int, float)) else p.get("Altitude")
+
+    bounds = []
+    k = 0.0
+    while k < total - 1e-6:
+        bounds.append((k, min(k + split_km, total)))
+        k += split_km
+    out: list[dict[str, Any]] = []
+    for lo, hi in bounds:
+        if hi - lo < 0.05:
+            continue
+        t_lo = float(pts[0]["time"]) if lo == 0 else t_at(lo)
+        t_hi = t_at(hi)
+        inside = [p for p in pts if lo <= p["Distance"] <= hi]
+        stopped = 0.0
+        hr_w = hr_t = pw_w = pw_t = 0.0
+        gain = loss = 0.0
+        # altitude hysteresis: GPS/baro jitter on a flat road read as 30 m of "climb";
+        # the anchor starts at the last sample before the split so a step at the boundary counts once
+        before = [p for p in pts if p["Distance"] < lo]
+        anchor = alt(before[-1]) if before else None
+        if not isinstance(anchor, (int, float)):
+            anchor = None
+        prev = None
+        for p in inside:
+            if prev is not None:
+                dt = p["time"] - prev["time"]
+                dd = p["Distance"] - prev["Distance"]
+                if dt > 0 and dd / (dt / 3600.0) < 3.0:
+                    stopped += dt
+                for key, acc in (("HeartRate", "hr"), ("Power", "pw")):
+                    v = p.get(key)
+                    if isinstance(v, (int, float)) and v > 0 and dt > 0:
+                        if acc == "hr":
+                            hr_w += v * dt; hr_t += dt
+                        else:
+                            pw_w += v * dt; pw_t += dt
+            a1 = alt(p)
+            if isinstance(a1, (int, float)):
+                if anchor is None:
+                    anchor = a1
+                elif a1 - anchor >= 2:
+                    gain += a1 - anchor
+                    anchor = a1
+                elif anchor - a1 >= 2:
+                    loss += anchor - a1
+                    anchor = a1
+            prev = p
+        km = hi - lo
+        sec = t_hi - t_lo
+        row: dict[str, Any] = {"km_from": round(lo, 2), "km_to": round(hi, 2),
+                               "sec": round(sec), "pace_s": round(sec / km)}
+        moving = sec - stopped
+        if stopped > sec * 0.03:
+            row["moving_sec"] = round(moving)
+            row["moving_pace_s"] = round(moving / km)
+        if hr_t:
+            row["avg_hr"] = round(hr_w / hr_t)
+        if pw_t:
+            row["avg_w"] = round(pw_w / pw_t)
+        row["gain_m"] = round(gain)
+        row["loss_m"] = round(loss)
+        out.append(row)
+    return out
+
+
 def _compact(full: dict[str, Any]) -> dict[str, Any]:
     """FORK: lap table + key totals only (the full dump is still written to data_file)."""
     laps = []
@@ -227,12 +323,14 @@ def _compact(full: dict[str, Any]) -> dict[str, Any]:
         "lap_units": "sec=timer seconds, pace_s/ngp_s=seconds per km, km=distance",
         "single_lap": full.get("single_lap"),
         "time_series_points": full.get("time_series_points"),
+        **({"splits": full["splits"], "split_units": full.get("split_units")} if full.get("splits") else {}),
         "data_file": full.get("data_file"),
         "detail": "compact (pass detail='full' for zones, all lap columns and channel metadata)",
     }
 
 
-async def tp_analyze_workout(workout_id: str, save_to: str | None = None, detail: str = "compact") -> dict[str, Any]:
+async def tp_analyze_workout(workout_id: str, save_to: str | None = None, detail: str = "compact",
+                             split_km: float | None = None) -> dict[str, Any]:
     """Get detailed workout analysis including metrics, zones, and lap data.
 
     Full time-series data is saved to a JSON file for further analysis.
@@ -412,4 +510,11 @@ async def tp_analyze_workout(workout_id: str, save_to: str | None = None, detail
         "time_series_points": len(analysis.data),
         "data_file": data_file,
     }
+    if split_km:
+        try:
+            full["splits"] = compute_splits(time_series, float(split_km))
+            full["split_units"] = ("sec=elapsed (interpolated), pace_s=sec/km; moving_* only when stops "
+                                   "(<3 km/h) took >3%; chart stream ~1000 points")
+        except (TypeError, ValueError):
+            logger.exception("split computation failed")
     return full if str(detail or "compact").lower() == "full" else _compact(full)
