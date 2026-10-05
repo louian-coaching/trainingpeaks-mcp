@@ -97,7 +97,10 @@ async def validate_auth(cookie: str) -> AuthResult:
                     if data.get("success") is False:
                         return AuthResult(
                             status=AuthStatus.EXPIRED,
-                            message="Session rejected by TrainingPeaks (success: false) - re-authenticate with a fresh cookie",
+                            message=(
+                                "Session rejected by TrainingPeaks (success: false) - "
+                                "re-authenticate with a fresh cookie"
+                            ),
                         )
                     return AuthResult(
                         status=AuthStatus.INVALID,
