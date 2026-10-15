@@ -466,3 +466,30 @@ def test_compute_splits_empty_inputs():
     assert compute_splits([], 5) == []
     assert compute_splits([{"time": 0, "Distance": 0}], 5) == []
     assert compute_splits([{"time": 0, "Distance": 0}, {"time": 10, "Distance": 0.1}], 0) == []
+
+
+def test_compute_splits_rezeroes_multisport_distance():
+    """FORK 2026/10/15: IM run child file starts at ~185 km of race Distance."""
+    from tp_mcp.tools.analyze import compute_splits
+
+    ts = [{"time": i * 10, "Distance": 185.0 + i * 0.04, "HeartRate": 140} for i in range(0, 126)]
+    sp = compute_splits(ts, 1)
+    assert sp[0]["km_from"] == 0.0 and sp[0]["km_to"] == 1.0
+    assert all(s["sec"] > 0 for s in sp)
+    assert sp[0]["pace_s"] == 250
+
+
+def test_compute_splits_power_from_accumulated_power():
+    """FORK 2026/10/15: avg_w = AccumulatedPower delta / elapsed, not the sample mean."""
+    from tp_mcp.tools.analyze import compute_splits
+
+    ts = []
+    accp = 0.0
+    for i in range(0, 61):
+        w = 300 if i % 2 else 100           # spiky samples: sample mean 200 W
+        if i:
+            accp += 250 * 10                # true work: 250 W over every 10 s
+        ts.append({"time": i * 10, "Distance": i * 0.1, "Power": w, "AccumulatedPower": accp})
+    sp = compute_splits(ts, 3)
+    assert sp[0]["avg_w"] == 250
+    assert sp[1]["avg_w"] == 250

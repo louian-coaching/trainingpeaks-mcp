@@ -221,7 +221,34 @@ def compute_splits(time_series: list[dict[str, Any]], split_km: float) -> list[d
     if len(pts) < 2 or not split_km or split_km <= 0:
         return []
     pts.sort(key=lambda p: p["time"])
+    # FORK (2026/10/15): multisport child files (IM bike/run) carry the Distance of the
+    # whole race — the run of an IM starts at ~185 km. Re-zero so splits start at 0,
+    # otherwise every split before the offset comes out as garbage (negative seconds).
+    offset = pts[0]["Distance"]
+    if offset:
+        pts = [{**p, "Distance": p["Distance"] - offset} for p in pts]
     total = pts[-1]["Distance"]
+
+    # FORK (2026/10/15): split power from AccumulatedPower deltas (TP TotalWork/elapsed),
+    # same rule as lo_verify_intervals 80b1d6d — the ~1000-point chart stream is sampled
+    # every 10-20 s and right-skewed, so a time-weighted mean of the samples is biased.
+    acc_pts = [(float(p["time"]), float(p["AccumulatedPower"])) for p in pts
+           if isinstance(p.get("AccumulatedPower"), (int, float))]
+
+    def acc_at(t: float) -> float | None:
+        if len(acc_pts) < 2:
+            return None
+        # clamp: the first chart samples of a file often carry no AccumulatedPower yet
+        if t <= acc_pts[0][0]:
+            return acc_pts[0][1]
+        if t >= acc_pts[-1][0]:
+            return acc_pts[-1][1]
+        for i in range(1, len(acc_pts)):
+            t0, a0 = acc_pts[i - 1]
+            t1, a1 = acc_pts[i]
+            if t1 >= t:
+                return a0 if t1 == t0 else a0 + (a1 - a0) * (t - t0) / (t1 - t0)
+        return None
 
     def t_at(km: float) -> float:
         for i in range(1, len(pts)):
@@ -293,7 +320,10 @@ def compute_splits(time_series: list[dict[str, Any]], split_km: float) -> list[d
             row["moving_pace_s"] = round(moving / km)
         if hr_t:
             row["avg_hr"] = round(hr_w / hr_t)
-        if pw_t:
+        a_lo, a_hi = acc_at(t_lo), acc_at(t_hi)
+        if a_lo is not None and a_hi is not None and sec > 0 and a_hi >= a_lo:
+            row["avg_w"] = round((a_hi - a_lo) / sec)
+        elif pw_t:
             row["avg_w"] = round(pw_w / pw_t)
         row["gain_m"] = round(gain)
         row["loss_m"] = round(loss)
@@ -514,7 +544,9 @@ async def tp_analyze_workout(workout_id: str, save_to: str | None = None, detail
         try:
             full["splits"] = compute_splits(time_series, float(split_km))
             full["split_units"] = ("sec=elapsed (interpolated), pace_s=sec/km; moving_* only when stops "
-                                   "(<3 km/h) took >3%; chart stream ~1000 points")
+                                   "(<3 km/h) took >3%; km re-zeroed at the file start (multisport child "
+                                   "files); avg_w from AccumulatedPower deltas when present; chart stream "
+                                   "~1000 points")
         except (TypeError, ValueError):
             logger.exception("split computation failed")
     return full if str(detail or "compact").lower() == "full" else _compact(full)
