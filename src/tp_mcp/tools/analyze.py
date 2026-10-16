@@ -540,6 +540,15 @@ async def tp_analyze_workout(workout_id: str, save_to: str | None = None, detail
         "time_series_points": len(analysis.data),
         "data_file": data_file,
     }
+    # FORK (2026/10/16): multisport child files keep the whole-race odometer (an IM run
+    # starts at ~180 km). split_km re-zeroes internally; scripts reading data_file must
+    # subtract this themselves (Nathan Gurye 2026 run file started at 180.84 km).
+    _d0 = next((p.get("Distance") for p in (time_series or [])
+                if isinstance(p, dict) and isinstance(p.get("Distance"), (int, float))), None)
+    if _d0:
+        full["distance_offset"] = round(float(_d0), 3)
+        full["distance_offset_note"] = ("first Distance sample of data_file (same unit as the stream, km on "
+                                        "TP charts); subtract it before per-km work")
     if split_km:
         try:
             full["splits"] = compute_splits(time_series, float(split_km))

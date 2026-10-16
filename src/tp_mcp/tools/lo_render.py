@@ -67,6 +67,10 @@ def thresholds_from_settings(settings: dict[str, Any]) -> dict[str, Any]:
     run_s = _group(speed, 3)
     if run_s and run_s.get("threshold"):
         out["run_pace_sec"] = 1000.0 / float(run_s["threshold"])
+    # FORK 2026/10/16: swim CSS (s/100 m) for the swim duration/TSS estimate in lo_diff_week
+    swim_s = _group(speed, 1)
+    if swim_s and swim_s.get("threshold"):
+        out["swim_css_sec"] = round(100.0 / float(swim_s["threshold"]), 1)
     return out
 
 
@@ -257,7 +261,10 @@ _TOK_RX = re.compile(
     r"|(?:不要快過|不快過|不得快過|不要快於|不快於)(?P<u>\d:\d\d)"
     r"|(?P<w>\d+~\d+)W"
     r"|(?P<p>\d:\d\d~\d:\d\d)"
-    r"|(?P<rpm>\d+~\d+)rpm"
+    # FORK 2026/10/16: coach/house text writes cadence as 90-100rpm, 90~100rpm or
+    # 90-100 rpm 高踏頻 — all the same target; only "~" was matched, so a long ride whose
+    # numbers were identical came back as a stale body (黃之震 10/24).
+    r"|(?P<rpm>\d+\s*[~\-－～]\s*\d+)\s*rpm"
     r"|(?P<reps>\d+)[組趟]"
 )
 
@@ -357,7 +364,7 @@ def line_signature(line: str) -> tuple[str, ...]:
         elif g["p"]:
             toks.append(f"p{g['p']}")
         elif g["rpm"]:
-            toks.append(f"c{g['rpm']}")
+            toks.append("c" + re.sub(r"\s*[~\-－～]\s*", "~", g["rpm"]))
         elif g["reps"]:
             toks.append(f"x{g['reps']}")
     return tuple(toks)

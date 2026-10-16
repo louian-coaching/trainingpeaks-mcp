@@ -424,3 +424,44 @@ def test_rounded_distance_mismatch_beyond_10m_is_reported():
 
     r = compare_body("- 12.2公里@5:32~5:00/km\n", ["- 12.1公里@5:32~5:00/km"])
     assert r["in_sync"] is False
+
+
+def test_cadence_dash_and_tilde_are_same_target():
+    """2026/10/16 黃之震 10/24：本體寫 90-100rpm 高踏頻、圖形渲染 90~100rpm，數字相同不是過期本體。"""
+    from tp_mcp.tools.lo_render import compare_body
+
+    cur = ("- 熱身騎10分鐘@115~150W\n"
+           "- 5分鐘@150~173W（90-100rpm 高踏頻）+5分鐘@150~173W（自然踏頻）, 4組\n"
+           "- 緩騎5分鐘@115~150W\n")
+    rendered = ["- 熱身騎10分鐘@115~150W", "- 5分鐘@150~173W（90~100rpm）+5分鐘@150~173W, 4組",
+                "- 緩騎5分鐘@115~150W"]
+    r = compare_body(cur, rendered)
+    assert r["in_sync"] is True
+    assert "90-100rpm 高踏頻" in r["suggested_body"]
+
+
+def test_cadence_value_change_still_reported():
+    from tp_mcp.tools.lo_render import compare_body
+
+    r = compare_body("- 5分鐘@150~173W（90-100rpm）\n", ["- 5分鐘@150~173W（95~105rpm）"])
+    assert r["in_sync"] is False
+
+
+def test_swim_estimate_matches_project_model():
+    """lo_swim 與專案 swim_gen.py --css 同口徑（黃之震 10/23 2300m、CSS 2:03 → 80 分／35.4）。"""
+    from tp_mcp.tools.lo_swim import estimate_swim
+
+    desc = ("- 下水前｜肩胸動態熱身：靠牆天使10下\n==\n- 暖身游200公尺\n- 腳蹼浮板打腿100公尺, 2組\n"
+            "- 單手划水左右各25公尺+慢游50公尺, 2組\n==\n- 100公尺@70%, 15趟, 間休15~25秒\n==\n"
+            "- 緩游200公尺\n－－\n說明")
+    est = estimate_swim(desc, 123)
+    assert est["meters"] == 2300
+    assert est["duration_minutes"] == 80
+    assert abs(est["tss_planned"] - 35.4) < 0.2
+
+
+def test_swim_css_from_settings():
+    from tp_mcp.tools.lo_render import thresholds_from_settings
+
+    th = thresholds_from_settings({"speedZones": [{"workoutTypeId": 1, "threshold": 100 / 123}]})
+    assert th["swim_css_sec"] == 123.0
