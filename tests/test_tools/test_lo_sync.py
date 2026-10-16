@@ -476,3 +476,19 @@ def test_warmup_label_not_carried_to_cooldown():
     r = compare_body(cur, rendered)
     assert r["suggested_body"] == "- 熱身騎5分鐘@126~164W\n- 1小時@164~189W\n- 緩騎5分鐘@126~151W\n"
     assert r["in_sync"] is False
+
+
+@pytest.mark.asyncio
+async def test_lo_diff_week_completed_is_not_deleted(tmp_path, monkeypatch):
+    """FORK 2026/10/16: 選手做完的課離開 planned 讀回，不得當成教練刪課、也不得進改課紀錄。"""
+    monkeypatch.setenv("TP_LO_SNAPSHOT_DIR", str(tmp_path / "snap"))
+    monkeypatch.setenv("TP_LO_LEARNING_DIR", str(tmp_path / "learn"))
+    save_snapshot([_row("5", "2026-10-14", title="輕鬆騎"), _row("6", "2026-10-15")], "2026-10-12", "2026-10-18")
+    week = {"success": True, "rows": [_row("6", "2026-10-15")], "week_load": {}}
+    listed = {"workouts": [{"id": "5", "type": "completed"}, {"id": "6", "type": "planned"}]}
+    with patch("tp_mcp.tools.lo_tools.lo_get_week_for_validate", AsyncMock(return_value=week)), \
+         patch("tp_mcp.tools.workouts.tp_get_workouts", AsyncMock(return_value=listed)):
+        out = await lo_diff_week("2026-10-12", "2026-10-18", render=False, save_snapshot_after=False)
+    assert out["deleted"] == []
+    assert [c["id"] for c in out["completed_since"]] == ["5"]
+    assert "edit_log_ids" not in out

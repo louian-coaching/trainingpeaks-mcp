@@ -97,6 +97,8 @@ def planned_distance_m(description: str | None) -> float | None:
     total = 0.0
     for line in body.splitlines():
         line = line.strip().lstrip("-－ 　")
+        # FORK 2026/10/16: 括號裡是執行指示（「每100公尺抬頭定位1次」「段間休10秒」），不是量
+        line = re.sub(r"[（(][^）)]*[）)]", "", line)
         if not line:
             continue
         metres = sum(float(x) for x in _METRE_RX.findall(line))

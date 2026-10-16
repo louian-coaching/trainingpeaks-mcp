@@ -411,7 +411,7 @@ async def _update_verified(workout_id: str, verbose: bool = False, **fields: Any
         from tp_mcp.tools.lo_sync import upsert_snapshot_rows
         from tp_mcp.tools.workouts_batch import _flatten_readback
 
-        upsert_snapshot_rows([_flatten_readback(after)])
+        upsert_snapshot_rows([_flatten_readback(after)], only_fields=set(sent))
     except Exception:  # noqa: BLE001 — the baseline is best-effort
         pass
 

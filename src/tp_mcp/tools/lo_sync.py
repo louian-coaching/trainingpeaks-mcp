@@ -94,7 +94,17 @@ def _covered(snap: dict[str, Any], day: str) -> bool:
     return any(isinstance(w, dict) and str(w.get("start")) <= day <= str(w.get("end")) for w in wins)
 
 
-def upsert_snapshot_rows(rows: list[dict[str, Any]], key: str | None = None) -> str | None:
+_FIELD_MAP = {
+    "description": ("description",), "title": ("title",), "sport": ("sport",), "date": ("date",),
+    "tss_planned": ("tss_planned",), "duration_minutes": ("duration_planned",),
+    "distance_km": ("distance_planned_km",),
+    "structured_workout": ("structured_workout", "tss_planned", "duration_planned"),
+    "structure": ("structured_workout", "tss_planned", "duration_planned"),
+}
+
+
+def upsert_snapshot_rows(rows: list[dict[str, Any]], key: str | None = None,
+                         only_fields: set[str] | None = None) -> str | None:
     """FORK (2026/10/03): record our OWN writes in the baseline. Never raises.
 
     Without this, every edit made through an lo_ write tool stayed in the
@@ -112,7 +122,17 @@ def upsert_snapshot_rows(rows: list[dict[str, Any]], key: str | None = None) -> 
             if wid is None:
                 continue
             if str(wid) in ws or _covered(snap, _day(r.get("date"))):
-                ws[str(wid)] = r
+                if only_fields is not None and str(wid) in ws:
+                    # FORK 2026/10/16: only what WE sent joins the baseline. Copying the whole
+                    # read-back also swallowed a coach edit made between the last snapshot and
+                    # our update (Bullet 10/24 bike: structure change never logged).
+                    merged = dict(ws[str(wid)])
+                    for f in only_fields:
+                        for col in _FIELD_MAP.get(f, ()):
+                            merged[col] = r.get(col)
+                    ws[str(wid)] = merged
+                else:
+                    ws[str(wid)] = r
                 touched += 1
         if not touched:
             return None
@@ -365,6 +385,21 @@ async def lo_diff_week(start_date: str, end_date: str, save_snapshot_after: bool
         out["warning"] = ("No snapshot covers this window yet — everything is reported as 'added'. "
                           "Snapshots are written by every planned-week read-back from now on.")
     out.update(diff_rows(before, rows, start_date, end_date))
+    # FORK 2026/10/16: a planned workout the athlete has since COMPLETED drops out of the planned
+    # read-back and looked like a coach deletion (3742891 10/14 輕鬆騎). Re-list with "all" and move
+    # those ids to `completed_since` — they are not edits and must not reach the edit log.
+    if out.get("deleted"):
+        try:
+            from tp_mcp.tools.workouts import tp_get_workouts
+
+            listed = await tp_get_workouts(start_date=start_date, end_date=end_date, workout_filter="all")
+            alive = {str(x.get("id")): x for x in (listed.get("workouts") or [])} if isinstance(listed, dict) else {}
+            done = [d for d in out["deleted"] if d["id"] in alive]
+            if done:
+                out["completed_since"] = done
+                out["deleted"] = [d for d in out["deleted"] if d["id"] not in alive]
+        except Exception as e:  # noqa: BLE001 — keep the raw diff if the re-list fails
+            out["completed_check_warning"] = str(e)
     if had_snapshot and (out.get("added") or out.get("deleted") or out.get("changed")):
         try:
             ids = log_coach_edits(out, _athlete_key(), (start_date, end_date))
