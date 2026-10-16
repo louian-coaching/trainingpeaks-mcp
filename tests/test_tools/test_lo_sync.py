@@ -465,3 +465,14 @@ def test_swim_css_from_settings():
 
     th = thresholds_from_settings({"speedZones": [{"workoutTypeId": 1, "threshold": 100 / 123}]})
     assert th["swim_css_sec"] == 123.0
+
+
+def test_warmup_label_not_carried_to_cooldown():
+    """2026/10/16 Nathan 10/22：教練把熱身改成 126~164W，舊熱身行 126~151W 不可被搬到緩騎位置。"""
+    from tp_mcp.tools.lo_render import compare_body
+
+    cur = "- 熱身騎5分鐘@126~151W\n- 50分鐘@151~176W\n- 緩騎5分鐘@126~151W\n"
+    rendered = ["- 熱身騎5分鐘@126~164W", "- 1小時@164~189W", "- 緩騎5分鐘@126~151W"]
+    r = compare_body(cur, rendered)
+    assert r["suggested_body"] == "- 熱身騎5分鐘@126~164W\n- 1小時@164~189W\n- 緩騎5分鐘@126~151W\n"
+    assert r["in_sync"] is False

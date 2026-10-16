@@ -388,6 +388,14 @@ def _sig_lines(body: str) -> list[tuple[str, tuple[str, ...]]]:
     return out
 
 
+def _line_role(line: str) -> str | None:
+    if "熱身" in line or "暖身" in line:
+        return "warm"
+    if any(k in line for k in ("緩騎", "緩跑", "緩和", "收操", "緩游")):
+        return "cool"
+    return None
+
+
 def compare_body(current_body: str, rendered: list[str]) -> dict[str, Any]:
     """Match rendered lines to current lines by numeric signature.
 
@@ -406,7 +414,13 @@ def compare_body(current_body: str, rendered: list[str]) -> dict[str, Any]:
         if not sig:
             suggested.append(r)
             continue
-        hit = next((i for i, (_, s) in enumerate(pool) if not used[i] and sig_eq(s, sig)), None)
+        # FORK 2026/10/16: numbers alone let the old 熱身騎5分鐘@126~151W be kept for the
+        # cool-down slot once the coach widened the warm-up (Nathan 10/22) — the suggested
+        # body then had two 熱身 lines. Same-role lines first; a warm/cool label clash never matches.
+        rr = _line_role(r)
+        cands = [i for i, (ln, s) in enumerate(pool) if not used[i] and sig_eq(s, sig)
+                 and not (rr and _line_role(ln) and rr != _line_role(ln))]
+        hit = next((i for i in cands if _line_role(pool[i][0]) == rr), cands[0] if cands else None)
         if hit is not None:
             used[hit] = True
             suggested.append(pool[hit][0])
