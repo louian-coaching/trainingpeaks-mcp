@@ -1662,6 +1662,7 @@ from tp_mcp.tools.lo_threshold import register_lo_threshold  # noqa: E402
 from tp_mcp.tools.lo_tools import normalize_aliases, peek_payload_athlete, register_lo_tools  # noqa: E402
 from tp_mcp.tools.lo_verify import register_lo_verify  # noqa: E402
 from tp_mcp.tools.lo_version import register_lo_version, stale_notice  # noqa: E402
+from tp_mcp.tools.lo_weather import register_lo_weather  # noqa: E402
 from tp_mcp.tools.lo_weekly import register_lo_weekly  # noqa: E402
 
 _LO_HANDLERS: dict[str, Any] = {}
@@ -1676,6 +1677,7 @@ register_lo_sth_ext(TOOLS, _LO_HANDLERS)  # FORK 2026-10-02: STH 提速 A/B/D
 register_lo_version(TOOLS, _LO_HANDLERS)  # FORK 2026-10-03: 重啟偵測
 register_lo_threshold(TOOLS, _LO_HANDLERS)  # FORK 2026-10-03: 閾值驗證寫入（TECH-22/24）
 register_lo_capability(TOOLS, _LO_HANDLERS)  # FORK 2026-10-03: 能力層 PROC-84/85
+register_lo_weather(TOOLS, _LO_HANDLERS)  # FORK 2026-10-17: 歷史天氣 PROC-93
 _ATHLETE_EXEMPT_TOOLS |= set(LO_STH_TOOLS) | set(LO_STH_EXT_TOOLS)  # STH 用 tri_user_id，不吃 TP athlete
 _ATHLETE_EXEMPT_TOOLS.add("lo_weekly_check")  # takes its own `athletes` list
 _ATHLETE_EXEMPT_TOOLS.add("lo_version")  # local, not athlete-scoped
@@ -1783,7 +1785,7 @@ def _dump_and_summarize(name: str, result: Any, save_to: str) -> dict[str, Any]:
 _READ_ONLY_PREFIXES = ("tp_get_", "tp_list_", "tp_download_", "tp_search_", "tp_validate_", "tp_analyze_")
 _READ_ONLY_EXTRA = {  # FORK: lo_ read tools
     "tp_auth_status", "lo_get_week_for_validate", "lo_diff_week", "lo_weekly_check",
-    "lo_version", "lo_capability_scan",
+    "lo_version", "lo_capability_scan", "lo_weather_history",
 }
 
 # Irrecoverable data removal. Everything else that writes is recoverable by a
