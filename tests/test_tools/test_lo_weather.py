@@ -140,3 +140,24 @@ async def test_manual_mode_and_fetch_failure_gives_fallback_urls():
 async def test_manual_mode_requires_location():
     res = await lo_weather_history(start="2026-10-15T06:00")
     assert res["error_code"] == "INVALID_ARGS"
+
+
+async def test_zwift_title_is_indoor(tmp_path):
+    a, _ = _patched(tmp_path, _ride())
+    w = patch("tp_mcp.tools.workouts.tp_get_workout",
+              AsyncMock(return_value={"id": "9", "title": "Zwift - Pacer Group Ride with Coco", "sport": "Bike"}))
+    fetch = AsyncMock()
+    with a, w:
+        res = await lo_weather_history("9", fetcher=fetch)
+    assert res["outdoor"] is False and "zwift" in res["message"]
+    fetch.assert_not_called()
+
+
+async def test_watopia_gps_is_indoor_even_untitled(tmp_path):
+    pts = [{"time": t, "PositionLat": -11.6526, "PositionLong": 166.9797} for t in range(0, 600, 60)]
+    a, _ = _patched(tmp_path, pts)
+    w = patch("tp_mcp.tools.workouts.tp_get_workout", AsyncMock(return_value={"id": "9", "title": "Ride"}))
+    fetch = AsyncMock()
+    with a, w:
+        res = await lo_weather_history("9", fetcher=fetch)
+    assert res["outdoor"] is False and "virtual world" in res["message"]

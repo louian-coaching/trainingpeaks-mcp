@@ -59,6 +59,29 @@ HUMID_DEW_C = 20.0            # dew point at or above this = 濕熱 flag
 STRONG_SUN_WM2 = 600.0        # shortwave radiation; shade WBGT under-reads by ~2–3 °C above this
 
 
+# Virtual rides carry fake GPS: Zwift's Watopia/Makuri sit in the Solomon Islands and its
+# real-world maps (London, NYC, Paris…) replay real coordinates. Title keywords catch both;
+# the boxes catch an untitled Watopia/Makuri file.
+VIRTUAL_TITLE_KEYS = ("zwift", "mywhoosh", "rouvy", "trainerroad", "wahoo systm", "systm", "bkool",
+                      "fulgaz", "kinomap", "indoor", "virtual", "treadmill", "室內", "跑步機", "訓練台")
+VIRTUAL_BOXES = ((-11.75, -11.55, 166.85, 167.05),   # Watopia
+                 (-10.90, -10.60, 165.70, 166.00))   # Makuri Islands
+
+
+def is_virtual(title: str | None, first_fix: dict[str, Any] | None) -> str | None:
+    t = (title or "").lower()
+    for k in VIRTUAL_TITLE_KEYS:
+        if k in t:
+            return f"title contains '{k}'"
+    if first_fix:
+        lat, lon = first_fix.get("lat"), first_fix.get("lon")
+        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+            for la0, la1, lo0, lo1 in VIRTUAL_BOXES:
+                if la0 <= lat <= la1 and lo0 <= lon <= lo1:
+                    return "GPS inside a Zwift virtual world"
+    return None
+
+
 def _err(code: str, message: str, **extra: Any) -> dict[str, Any]:
     return {"isError": True, "error_code": code, "message": message, **extra}
 
@@ -358,6 +381,11 @@ async def lo_weather_history(
         else:
             targets = sample_track(pts, n_points)
             meta["location_source"] = "gps"
+            why = is_virtual(meta.get("title"), targets[0] if targets else None)
+            if why:
+                return {"success": True, "outdoor": False, **meta,
+                        "message": f"Virtual / indoor session ({why}). Weather not applicable; "
+                                   "pass lat/lon to force a location."}
             if not targets:
                 return {"success": True, "outdoor": False, **meta,
                         "message": "No GPS in this activity (indoor / Zwift / treadmill / pool). "
