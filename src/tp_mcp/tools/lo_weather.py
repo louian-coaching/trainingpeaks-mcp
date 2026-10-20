@@ -329,9 +329,12 @@ async def lo_weather_history(
     athlete: str | None = None,
     today: dt.date | None = None,
     fetcher: Any = None,
+    analysis: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """See module docstring. ``start`` (manual mode) is local wall-clock time
-    'YYYY-MM-DDTHH:MM' at the given lat/lon. ``fetcher`` is for tests."""
+    'YYYY-MM-DDTHH:MM' at the given lat/lon. ``fetcher`` is for tests.
+    ``analysis`` = an already-fetched ``tp_analyze_workout`` result for this
+    workout (skips the second analysis call; used by the auto-weather hook)."""
     totals: dict[str, Any] = {}
     meta: dict[str, Any] = {}
     targets: list[dict[str, Any]] = []      # {lat, lon, when_utc | when_local, offset_s}
@@ -341,7 +344,8 @@ async def lo_weather_history(
         from tp_mcp.tools.analyze import tp_analyze_workout
         from tp_mcp.tools.workouts import tp_get_workout
 
-        analysis = await tp_analyze_workout(str(workout_id))
+        if analysis is None:
+            analysis = await tp_analyze_workout(str(workout_id))
         if analysis.get("isError"):
             return analysis
         raw: dict[str, Any] = {}
@@ -472,6 +476,43 @@ async def lo_weather_history(
         }
         out["heat_log"] = append_heat_log(rec)
     return out
+
+
+async def weather_brief(
+    workout_id: str,
+    analysis: dict[str, Any],
+    athlete: str | None = None,
+    today: dt.date | None = None,
+    fetcher: Any = None,
+) -> dict[str, Any]:
+    """PROC-93b (2026/10/20): compact weather block that ``tp_analyze_workout``
+    attaches to every analysis, so no outdoor session is ever judged without
+    the day's weather. Never raises — a weather failure must not cost the
+    analysis itself."""
+    try:
+        res = await lo_weather_history(str(workout_id), athlete=athlete, analysis=analysis,
+                                       today=today, fetcher=fetcher)
+    except Exception as e:  # noqa: BLE001
+        return {"outdoor": None, "error": f"{type(e).__name__}: {e}",
+                "note": "天氣抓取失敗——判讀前改跑 lo_weather_history（PROC-93）"}
+    if res.get("isError"):
+        return {"outdoor": None, "error": res.get("error_code"),
+                **({"fallback_urls": res["fallback_urls"]} if res.get("fallback_urls") else {}),
+                "note": "天氣抓取失敗——判讀前改跑 lo_weather_history 或用 fallback_urls（PROC-93）"}
+    if not res.get("outdoor"):
+        return {"outdoor": False, "note": res.get("message", "indoor / no GPS")}
+    s = res.get("summary") or {}
+    return {
+        "outdoor": True,
+        "verdict": s.get("verdict"),
+        "heat_level": s.get("heat_level"),
+        "humid": s.get("humid"),
+        "strong_sun": s.get("strong_sun"),
+        "wbgt_max": (s.get("wbgt_shade_est_c") or {}).get("max"),
+        "dew_mean": (s.get("dew_point_c") or {}).get("mean"),
+        "correct_interpretation": s.get("correct_interpretation"),
+        "note": "PROC-93：correct_interpretation=true ⇒ 掉速／漂移先歸環境、不單獨下修閾值；跨日比較先對齊天氣。完整逐點＝lo_weather_history",
+    }
 
 
 def register_lo_weather(tools: list[Any], handlers: dict[str, Any]) -> None:

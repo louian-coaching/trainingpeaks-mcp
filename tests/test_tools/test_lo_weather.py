@@ -161,3 +161,54 @@ async def test_watopia_gps_is_indoor_even_untitled(tmp_path):
     with a, w:
         res = await lo_weather_history("9", fetcher=fetch)
     assert res["outdoor"] is False and "virtual world" in res["message"]
+
+
+# --- PROC-93b (2026/10/20): auto-weather block on tp_analyze_workout ---
+
+async def test_weather_brief_reuses_analysis_and_is_compact(tmp_path, monkeypatch):
+    from tp_mcp.tools.lo_weather import weather_brief
+
+    monkeypatch.setenv("TP_LO_LEARNING_DIR", str(tmp_path / "learn"))
+    a, w = _patched(tmp_path, _ride())
+
+    async def fetch(url):
+        return _KONA
+
+    with a as analyze_mock, w:
+        analysis = await __import__("tp_mcp.tools.analyze", fromlist=["x"]).tp_analyze_workout("9")
+        analyze_mock.reset_mock()
+        brief = await weather_brief("9", analysis, athlete="2154879",
+                                    today=dt.date(2026, 10, 17), fetcher=fetch)
+        analyze_mock.assert_not_called()          # no second analysis call
+    assert brief["outdoor"] is True and brief["correct_interpretation"] is True
+    assert brief["humid"] is True and "露點" in brief["verdict"]
+    assert "samples" not in brief
+
+
+async def test_weather_brief_never_raises(tmp_path):
+    import httpx
+
+    from tp_mcp.tools.lo_weather import weather_brief
+
+    a, w = _patched(tmp_path, _ride())
+
+    async def boom(url):
+        raise httpx.ConnectError("blocked")
+
+    with a, w:
+        analysis = {"data_file": str(tmp_path / "a.json"), "startTimestamp": "2026-10-10T18:21:15"}
+        brief = await weather_brief("9", analysis, today=dt.date(2026, 10, 17), fetcher=boom)
+    assert brief["outdoor"] is None and brief["error"] == "WEATHER_FETCH_FAILED"
+    assert brief["fallback_urls"]
+
+
+async def test_weather_brief_indoor(tmp_path):
+    from tp_mcp.tools.lo_weather import weather_brief
+
+    a, w = _patched(tmp_path, [{"time": t, "Power": 200} for t in range(0, 600, 60)])
+    fetch = AsyncMock()
+    with a, w:
+        analysis = {"data_file": str(tmp_path / "a.json"), "startTimestamp": "2026-10-10T18:21:15"}
+        brief = await weather_brief("9", analysis, fetcher=fetch)
+    assert brief["outdoor"] is False
+    fetch.assert_not_called()

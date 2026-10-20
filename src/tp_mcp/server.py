@@ -677,6 +677,14 @@ TOOLS = [
                         "(race plans, PROC-41c marathon reviews)."
                     ),
                 },
+                "weather": {
+                    "type": "boolean", "default": True,
+                    "description": (
+                        "FORK PROC-93b: attach `weather` (verdict, heat_level, humid, WBGT max, dew "
+                        "point, correct_interpretation) from Open-Meteo history for outdoor GPS "
+                        "sessions; indoor/Zwift ⇒ outdoor:false. Logs to heat_log. false to skip."
+                    ),
+                },
             },
             "required": ["workout_id"],
         },
@@ -2105,8 +2113,14 @@ async def _h_get_peaks(args):
 
 @_handler("tp_analyze_workout")
 async def _h_analyze(args):
-    return await tp_analyze_workout(workout_id=args["workout_id"], save_to=args.get("save_to"),
-                                    detail=args.get("detail", "compact"), split_km=args.get("split_km"))
+    res = await tp_analyze_workout(workout_id=args["workout_id"], save_to=args.get("save_to"),
+                                   detail=args.get("detail", "compact"), split_km=args.get("split_km"))
+    # FORK PROC-93b (2026/10/20): every analysis carries the day's weather
+    if args.get("weather", True) and isinstance(res, dict) and not res.get("isError"):
+        from tp_mcp.tools.lo_weather import weather_brief
+        res["weather"] = await weather_brief(str(args["workout_id"]), res,
+                                             athlete=args.get("athlete") or athlete_override.get())
+    return res
 
 # --- Structured strength / gym ---
 @_handler("tp_search_exercises")
