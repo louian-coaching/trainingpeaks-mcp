@@ -95,7 +95,8 @@ async def test_scan_end_to_end(tmp_path):
          patch.object(settings, "tp_get_athlete_settings", AsyncMock(return_value=st)), \
          patch.object(cap, "summary_totals", AsyncMock(side_effect=lambda wid: totals[str(wid)])), \
          patch.object(peaks, "tp_get_peaks", pk):
-        r = await cap.lo_capability_scan(["Mark"], end="2026-10-03", save_dir=str(tmp_path))
+        r = await cap.lo_capability_scan(["Mark"], end="2026-10-03", save_dir=str(tmp_path),
+                                         weather="never", swim=False, ledger=False)
     row = r["athletes"][0]
     assert row["level"] == "red"
     assert row["bike"]["latest"]["workout_id"] == "11"

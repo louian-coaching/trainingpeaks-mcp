@@ -66,6 +66,7 @@ class TestListTools:
             "lo_update_threshold_verified",
             "lo_capability_scan",
             "lo_weather_history",
+            "lo_weather_forecast",
             "lo_sth_call",
             "lo_sth_calc_loads",
             "lo_sth_create_week",

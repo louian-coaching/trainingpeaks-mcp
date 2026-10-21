@@ -141,11 +141,14 @@ def _excluded_reason(row: dict[str, Any], sport: str, heat_c: float) -> str | No
 
 
 def assess_sport(sport: str, rows: list[dict[str, Any]], window_start: str, heat_c: float = 30.0,
-                 ef_up_pct: float = 3.0) -> dict[str, Any]:
-    """rows: steady sessions of one sport, newest first, with summary metrics."""
+                 ef_up_pct: float = 3.0, hot_ids: set[str] | None = None) -> dict[str, Any]:
+    """rows: steady sessions of one sport, newest first, with summary metrics.
+    hot_ids: sessions PROC-93 marked correct_interpretation (hot / humid) — out of the trend."""
     usable, excluded = [], []
     for r in rows:
         why = _excluded_reason(r, sport, heat_c)
+        if not why and hot_ids and str(r.get("workout_id")) in hot_ids:
+            why = "熱／濕熱（PROC-93）：不進趨勢、不算連兩週"
         (excluded if why else usable).append({**r, **({"excluded": why} if why else {})})
     out: dict[str, Any] = {"metric": _DECOUPLE_KEY[sport], "excluded": excluded}
     in_window = [r for r in usable if r["date"] >= window_start]
@@ -222,9 +225,113 @@ async def _peaks(ftp: float | None) -> dict[str, Any]:
     return out
 
 
+
+def _base(title: str | None) -> str:
+    return _base_title(title)
+
+
+async def _progress_layer(requested: str, ident: dict[str, Any], ws: list[dict[str, Any]],
+                          picks: dict[str, list[dict[str, Any]]], metrics: Any, window_start: str, end: str,
+                          *, ledger: bool, swim: bool, weather: str, max_swims: int) -> dict[str, Any]:
+    """PROC-84d ledger + PROC-93 weather on steady sessions + SWIM-91 swims + PROC-37b baselines.
+    Each session is analysed once in its life: anything already in the ledger is reused."""
+    from tp_mcp.tools import lo_progress as lp
+    from tp_mcp.tools.analyze import tp_analyze_workout
+    from tp_mcp.tools.lo_weather import weather_brief
+
+    aid = str(ident.get("athlete_id") or requested)
+    hist = lp.read_ledger(aid) if ledger else []
+    by_id = {str(r.get("workout_id")): r for r in hist}
+    new: list[dict[str, Any]] = []
+    out: dict[str, Any] = {"_hot_ids": set(), "weather": [], "baselines": [], "swims": []}
+    base_rec = {"athlete_id": aid, "athlete": str(ident.get("athlete_name") or requested)}
+
+    async def analyse(wid: str) -> dict[str, Any] | None:
+        a = await tp_analyze_workout(wid)
+        return None if a.get("isError") else a
+
+    # 1) steady sessions: weather + ledger
+    for sport in ("Bike", "Run"):
+        for w in picks.get(sport) or []:
+            wid = str(w.get("id"))
+            row = await metrics(w)
+            old = by_id.get(wid)
+            wx = (old or {}).get("weather")
+            if old is None and str(w.get("date"))[:10] >= window_start:
+                if weather == "auto":
+                    an = await analyse(wid)
+                    if an:
+                        wb = await weather_brief(wid, an, athlete=requested)
+                        wx = {k: wb.get(k) for k in ("outdoor", "heat_level", "humid", "wbgt_max", "dew_mean",
+                                                       "correct_interpretation", "verdict") if k in wb}
+                rec = {**base_rec, "workout_id": wid, "date": row.get("date"), "sport": sport, "kind": "steady",
+                       "title": row.get("title"), "duration_min": row.get("duration_min"),
+                       "decoupling_pct": row.get("decoupling_pct"), "ef": row.get("ef"), "if": row.get("if"),
+                       "avg_speed_ms": row.get("avg_speed_ms"), "weather": wx, "logged": end}
+                new.append(rec)
+                if wx:
+                    out["weather"].append({"date": row.get("date"), "sport": sport, "title": row.get("title"),
+                                           "verdict": wx.get("verdict"),
+                                           "correct_interpretation": wx.get("correct_interpretation")})
+            if (wx or {}).get("correct_interpretation"):
+                out["_hot_ids"].add(wid)
+
+    # 2) baselines (PROC-37b) anywhere in the history window
+    for w in ws:
+        sport = w.get("sport")
+        if sport not in ("Bike", "Run", "Swim") or not _base(w.get("title")).startswith(lp.BASELINE_TITLE):
+            continue
+        wid = str(w.get("id"))
+        if wid in by_id:
+            continue
+        an = await analyse(wid)
+        if not an:
+            continue
+        m = lp.baseline_metrics(sport, an)
+        wx = None
+        if sport != "Swim" and weather == "auto":
+            wb = await weather_brief(wid, an, athlete=requested)
+            wx = {k: wb.get(k) for k in ("outdoor", "heat_level", "correct_interpretation", "verdict") if k in wb}
+        prev = sorted([r for r in hist if r.get("kind") == "baseline" and r.get("sport") == sport
+                       and str(r.get("date")) < str(w.get("date"))[:10]], key=lambda r: str(r.get("date")))
+        p = prev[-1] if prev else None
+        cmp = lp.compare_baseline(sport, m or {}, (p or {}).get("metrics"), wx, (p or {}).get("weather"))
+        if p:
+            cmp["vs"] = p.get("date")
+        rec = {**base_rec, "workout_id": wid, "date": str(w.get("date"))[:10], "sport": sport, "kind": "baseline",
+               "title": w.get("title"), "metrics": m, "weather": wx, "compare": cmp, "logged": end}
+        new.append(rec)
+        out["baselines"].append(rec)
+
+    # 3) swims in the window (SWIM-91)
+    if swim:
+        swims = [w for w in ws if w.get("sport") == "Swim" and str(w.get("date"))[:10] >= window_start
+                 and str(w.get("id")) not in by_id and not _base(w.get("title")).startswith(lp.BASELINE_TITLE)]
+        for w in swims[:max_swims]:
+            wid = str(w.get("id"))
+            an = await analyse(wid)
+            m = lp.swim_metrics(an) if an else None
+            if not m:
+                continue
+            tb = _base(w.get("title"))
+            same = [r for r in hist if r.get("kind") == "swim" and r.get("title_base") == tb
+                    and str(r.get("date")) < str(w.get("date"))[:10]][-8:]
+            cmp = lp.compare_swim(m, same)
+            rec = {**base_rec, "workout_id": wid, "date": str(w.get("date"))[:10], "sport": "Swim", "kind": "swim",
+                   "title": w.get("title"), "title_base": tb, "swim": m, "compare": cmp, "logged": end}
+            new.append(rec)
+            out["swims"].append(rec)
+
+    if ledger and new:
+        out["ledger"] = lp.append_ledger(new)
+    out["logged"] = len(new) if ledger else 0
+    return {k: v for k, v in out.items() if v or k == "_hot_ids"}
+
+
 async def _one(requested: str, *, end: str, window_days: int, history_days: int, max_per_sport: int,
                heat_c: float, bike_if_max: float, ef_up_pct: float, peaks: str,
-               save_dir: Path | None) -> dict[str, Any]:
+               save_dir: Path | None, ledger: bool = True, swim: bool = True,
+               weather: str = "auto", max_swims: int = 6) -> dict[str, Any]:
     from tp_mcp.tools.lo_review import athlete_identity
     from tp_mcp.tools.settings import tp_get_athlete_settings
     from tp_mcp.tools.workouts import tp_get_workouts
@@ -268,9 +375,14 @@ async def _one(requested: str, *, end: str, window_days: int, history_days: int,
             return cache[wid]
 
         result: dict[str, Any] = {}
+        prog = await _progress_layer(requested, ident, ws, picks, metrics, window_start, end,
+                                     ledger=ledger, swim=swim, weather=weather, max_swims=max_swims)
+        hot_ids = prog.pop("_hot_ids", set())
         for sport in ("Bike", "Run"):
             rows = [await metrics(w) for w in picks[sport]]
-            result[sport.lower()] = assess_sport(sport, rows, window_start, heat_c, ef_up_pct)
+            result[sport.lower()] = assess_sport(sport, rows, window_start, heat_c, ef_up_pct, hot_ids=hot_ids)
+        if prog:
+            result["progress"] = prog
         bike_easy = [await metrics(w) for w in easy_picks["Bike"]]
         run_easy = [await metrics(w) for w in easy_picks["Run"]]
         run_set = _zone_threshold(settings, "speedZones", 3) or {}
@@ -308,6 +420,17 @@ async def _one(requested: str, *, end: str, window_days: int, history_days: int,
     if result["grey_zone"]["flag"]:
         flags.append(f"灰區 {len(result['grey_zone']['hits'])} 堂（說明段寫數字上限）")
         level = "yellow" if level == "green" else level
+    pr = result.get("progress") or {}
+    for b in pr.get("baselines") or []:
+        v = (b.get("compare") or {}).get("verdict")
+        if v in ("進步", "退步"):
+            flags.append(f"基準測驗 {b['sport']} {v}（{b['date']}）")
+            if v == "退步":
+                level = "yellow" if level == "green" else level
+    sw_down = [x for x in pr.get("swims") or [] if (x.get("compare") or {}).get("verdict") == "退步"]
+    if len(sw_down) >= 2:
+        flags.append(f"游泳同課型配速／划距退步 {len(sw_down)} 堂")
+        level = "yellow" if level == "green" else level
     if (result.get("peaks") or {}).get("ftp_maybe_low"):
         flags.append("20 分最佳×0.95 ≥ FTP×1.03（FTP 可能偏低）")
         level = "yellow" if level == "green" else level
@@ -343,6 +466,16 @@ def _compact(row: dict[str, Any]) -> dict[str, Any]:
         out["grey_zone"] = {"hits": gz.get("hits"), "flag": gz.get("flag")}
     if row.get("peaks"):
         out["peaks"] = row["peaks"]
+    pr = row.get("progress") or {}
+    if pr:
+        out["progress"] = {k: v for k, v in {
+            "logged": pr.get("logged"),
+            "baselines": [{k2: b.get(k2) for k2 in ("sport", "date", "title", "metrics", "compare")}
+                          for b in pr.get("baselines") or []] or None,
+            "swims": [{k2: x.get(k2) for k2 in ("date", "title", "swim", "compare")}
+                      for x in pr.get("swims") or []] or None,
+            "weather": pr.get("weather") or None,
+        }.items() if v}
     return out
 
 
@@ -377,9 +510,15 @@ async def lo_capability_scan(
     peaks: str = "auto",
     save_dir: str | None = None,
     concurrency: int = 3,
+    ledger: bool = True,
+    swim: bool = True,
+    weather: str = "auto",
+    max_swims: int = 6,
 ) -> dict[str, Any]:
     if not athletes:
         return {"isError": True, "error_code": "INVALID_ARGS", "message": "athletes is empty"}
+    if weather not in ("auto", "never"):
+        return {"isError": True, "error_code": "INVALID_ARGS", "message": "weather must be auto|never"}
     if peaks not in ("auto", "always", "never"):
         return {"isError": True, "error_code": "INVALID_ARGS", "message": "peaks must be auto|always|never"}
     end = end or dt.date.today().isoformat()
@@ -394,7 +533,8 @@ async def lo_capability_scan(
         async with sem:
             return await _one(str(a).strip(), end=end, window_days=window_days, history_days=history_days,
                               max_per_sport=max_per_sport, heat_c=heat_c, bike_if_max=bike_if_max,
-                              ef_up_pct=ef_up_pct, peaks=peaks, save_dir=sd)
+                              ef_up_pct=ef_up_pct, peaks=peaks, save_dir=sd, ledger=ledger, swim=swim,
+                              weather=weather, max_swims=max_swims)
 
     rows = await asyncio.gather(*(run(a) for a in athletes))
     order = {"error": 0, "red": 1, "yellow": 2, "green": 3}
@@ -407,7 +547,10 @@ async def lo_capability_scan(
         "note": ("漂移／EF 取 TP 分析摘要的 Pw:Hr、Pa:Hr、EF（完整檔計算，非 12 秒取樣）。"
                  "穩態長課＝標題 有氧耐力／長距離騎乘／長跑（排除熱訓練、間歇類）。"
                  "TP 摘要沒有氣溫：熱天的紅燈是待確認，不是結論。閾值新鮮度（8f ③）仍走 athlete_card.py。"
-                 "燈號只分流，裁決由教練做。"),
+                 "燈號只分流，裁決由教練做。"
+                 "progress＝PROC-84d 帳本（learning/capability_log.jsonl）：本週新記的穩態課（含天氣）、"
+                 "游泳（SWIM-91：配速／划頻／划距／SWOLF，同課型比較）、基準測驗（PROC-37b：同輸出比心率）。"
+                 "6–8 週趨勢表＝專案 tools/progress_trend.py。"),
     }
 
 
@@ -424,7 +567,9 @@ def register_lo_capability(tools: list[Any], handlers: dict[str, Any]) -> None:
             "(bike IF > 0.78, run avg speed above the Z2 ceiling; ≥2 hits = flag), and power-20min "
             "peaks vs FTP when EF jumps (peaks=auto) or always. Reads only TP's analysis summary "
             "(full-file numbers, no 12 s samples). Read-only. One compact row per athlete + text "
-            "table; full JSON per athlete in save_dir."
+            "table; full JSON per athlete in save_dir. PROC-84d/98, SWIM-91: also logs every newly analysed "
+            "steady session (with weather), swim (pace/stroke rate/DPS/SWOLF) and 基準測驗 baseline (HR at the "
+            "same output) to learning/capability_log.jsonl and compares with earlier entries."
         ),
         input_schema={
             "type": "object",
@@ -441,6 +586,14 @@ def register_lo_capability(tools: list[Any], handlers: dict[str, Any]) -> None:
                 "peaks": {"type": "string", "enum": ["auto", "always", "never"], "default": "auto"},
                 "save_dir": {"type": "string", "description": "Directory ON THE MACHINE RUNNING THIS SERVER."},
                 "concurrency": {"type": "integer", "default": 3},
+                "ledger": {"type": "boolean", "default": True,
+                           "description": "PROC-84d: append analysed sessions to learning/capability_log.jsonl."},
+                "swim": {"type": "boolean", "default": True,
+                         "description": "SWIM-91: analyse swims in the window (pace, stroke rate, DPS, SWOLF)."},
+                "weather": {"type": "string", "enum": ["auto", "never"], "default": "auto",
+                            "description": "PROC-93 weather for steady sessions in the window; "
+                                           "hot/humid ones leave the trend."},
+                "max_swims": {"type": "integer", "default": 6},
             },
             "required": ["athletes"],
         },
@@ -454,6 +607,8 @@ def register_lo_capability(tools: list[Any], handlers: dict[str, Any]) -> None:
             bike_if_max=float(args.get("bike_if_max", 0.78)), ef_up_pct=float(args.get("ef_up_pct", 3)),
             peaks=str(args.get("peaks", "auto")), save_dir=args.get("save_dir"),
             concurrency=int(args.get("concurrency", 3)),
+            ledger=bool(args.get("ledger", True)), swim=bool(args.get("swim", True)),
+            weather=str(args.get("weather", "auto")), max_swims=int(args.get("max_swims", 6)),
         )
 
     handlers["lo_capability_scan"] = _h
