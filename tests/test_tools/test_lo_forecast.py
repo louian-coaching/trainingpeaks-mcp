@@ -112,6 +112,13 @@ def test_description_ok_only_when_confident():
     assert d["confidence"] == "高" and d["description_ok"]
 
 
+def test_humid_but_mild_is_not_hot():
+    hrs = [{"hour": h, "temp": 21.5, "dew": 21.0, "wbgt": 21.5, "rain_prob": 10, "rain_mm": 0, "gust": 20,
+            "solar": 200} for h in range(6, 21)]
+    d = assess_day("2026-10-26", hrs, [], 1)
+    assert d["humid"] and d["heat_level"] == "溫和" and not d["hit"] and d["flags"] == []
+
+
 def test_quiet_day_no_actions():
     h = _hours("2026-10-22", temp=19, rh=50, dew=8)
     hrs = [{"hour": int(t[11:13]), "temp": 19, "dew": 8, "wbgt": 15.0, "rain_prob": 0, "rain_mm": 0,

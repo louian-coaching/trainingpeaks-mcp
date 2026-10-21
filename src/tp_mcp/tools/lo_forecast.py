@@ -176,9 +176,11 @@ def assess_day(day: str, hours: list[dict[str, Any]], aqi: list[float], lead: in
 
     flags: list[str] = []
     actions: dict[str, list[str]] = {"run_quality": [], "long": [], "bike": [], "all": []}
-    heat_key = "高熱" if level == "高熱" else ("熱" if (level == "熱" or humid) else None)
+    # 熱等級只看 WBGT（WBGT 已含濕度）；露點 ≥20 只註記「濕」，不單獨升級——10/21 實測上海
+    # WBGT 21.5、露點 21 被判「熱」是誤報（2026/10/21 修正）
+    heat_key = "高熱" if level == "高熱" else ("熱" if level == "熱" else None)
     if heat_key:
-        flags.append(f"{heat_key}（WBGT 最高 {_r(wbgt_max)}°C{'、露點 ≥20 濕熱' if humid else ''}）")
+        flags.append(f"{heat_key}（WBGT 最高 {_r(wbgt_max)}°C{'、露點 ≥20 濕' if humid else ''}）")
         a = ACTIONS[heat_key]
         actions["run_quality"].append(a["run_quality"])
         actions["long"].append(a["long"])
