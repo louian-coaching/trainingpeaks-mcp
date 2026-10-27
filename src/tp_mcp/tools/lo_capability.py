@@ -262,7 +262,7 @@ async def _progress_layer(requested: str, ident: dict[str, Any], ws: list[dict[s
                     an = await analyse(wid)
                     if an:
                         wb = await weather_brief(wid, an, athlete=requested)
-                        wx = {k: wb.get(k) for k in ("outdoor", "heat_level", "humid", "wbgt_max", "dew_mean",
+                        wx = {k: wb.get(k) for k in ("outdoor", "heat_level", "cold_level", "humid", "wbgt_max", "dew_mean",
                                                        "correct_interpretation", "verdict") if k in wb}
                 rec = {**base_rec, "workout_id": wid, "date": row.get("date"), "sport": sport, "kind": "steady",
                        "title": row.get("title"), "duration_min": row.get("duration_min"),

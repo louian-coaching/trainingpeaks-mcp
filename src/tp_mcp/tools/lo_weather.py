@@ -57,6 +57,7 @@ TIMEOUT_S = 20.0
 WBGT_LEVELS = ((18.0, "涼爽"), (23.0, "溫和"), (28.0, "熱"), (math.inf, "高熱"))
 HUMID_DEW_C = 20.0            # dew point at or above this = 濕熱 flag
 STRONG_SUN_WM2 = 600.0        # shortwave radiation; shade WBGT under-reads by ~2–3 °C above this
+COLD_MEAN_C = 5.0             # PROC-93c (2026/10/27): mean air temp at or below this = 冷天
 
 
 # Virtual rides carry fake GPS: Zwift's Watopia/Makuri sit in the Solomon Islands and its
@@ -120,6 +121,13 @@ def heat_index_c(t_c: float, rh: float) -> float:
         elif rh > 85 and 80 <= t_f <= 87:
             hi_f += ((rh - 85) / 10) * ((87 - t_f) / 5)
     return (hi_f - 32) * 5 / 9
+
+
+def cold_level(mean_temp: float | None) -> str | None:
+    """PROC-93c: outdoor session with mean air temperature <= 5 °C is a 冷天 (cold) session."""
+    if mean_temp is None:
+        return None
+    return "冷" if mean_temp <= COLD_MEAN_C else None
 
 
 def heat_level(wbgt: float | None) -> str | None:
@@ -242,6 +250,8 @@ def summarise(samples: list[dict[str, Any]], precip_total: float | None) -> dict
     s["heat_level"] = level
     s["humid"] = humid
     s["strong_sun"] = strong_sun
+    cold = cold_level(mean(t))
+    s["cold_level"] = cold
     parts = []
     if t:
         parts.append(f"氣溫 {s['temp_c']['min']}~{s['temp_c']['max']}°C")
@@ -251,6 +261,8 @@ def summarise(samples: list[dict[str, Any]], precip_total: float | None) -> dict
         parts.append(f"WBGT(陰影估) 最高 {s['wbgt_shade_est_c']['max']}°C＝{level}")
     if humid:
         parts.append(f"露點 ≥{HUMID_DEW_C:.0f}°C＝濕熱")
+    if cold:
+        parts.append(f"平均氣溫 {s['temp_c']['mean']}°C ≤{COLD_MEAN_C:.0f}°C＝冷天（PROC-93c）")
     if strong_sun:
         parts.append(f"日照最高 {s['solar_wm2_max']:.0f} W/m²（陰影 WBGT 低估約 2~3°C）")
     if wind:
@@ -258,8 +270,8 @@ def summarise(samples: list[dict[str, Any]], precip_total: float | None) -> dict
     if precip_total:
         parts.append(f"降雨 {s['precip_mm']} mm")
     s["verdict"] = "；".join(parts)
-    # 校正判讀（PROC-93）：熱或濕熱時，掉速／漂移／心率偏高先歸環境，不判體能、不拿來改閾值
-    s["correct_interpretation"] = level in ("熱", "高熱") or humid
+    # 校正判讀（PROC-93／93c）：熱、濕熱或冷天時，掉速／漂移／心率異常先歸環境，不判體能、不拿來下修閾值
+    s["correct_interpretation"] = level in ("熱", "高熱") or humid or cold is not None
     return s
 
 
@@ -506,6 +518,7 @@ async def weather_brief(
         "outdoor": True,
         "verdict": s.get("verdict"),
         "heat_level": s.get("heat_level"),
+        "cold_level": s.get("cold_level"),
         "humid": s.get("humid"),
         "strong_sun": s.get("strong_sun"),
         "wbgt_max": (s.get("wbgt_shade_est_c") or {}).get("max"),
@@ -525,7 +538,8 @@ def register_lo_weather(tools: list[Any], handlers: dict[str, Any]) -> None:
             "activity's UTC start and GPS track, samples up to n_points positions at their real "
             "times and returns Open-Meteo hourly history interpolated to each: air temp, RH, dew "
             "point, heat index, shade-WBGT estimate, wind, solar radiation, rain; summary.heat_level "
-            "(涼爽/溫和/熱/高熱 on WBGT 18/23/28), humid (dew ≥20 °C), strong_sun, verdict line and "
+            "(涼爽/溫和/熱/高熱 on WBGT 18/23/28), humid (dew ≥20 °C), strong_sun, cold_level (冷 when mean "
+            "air temp ≤5 °C, PROC-93c), verdict line and "
             "correct_interpretation (true ⇒ fades/drift/high HR are environmental first, never used to "
             "change thresholds). No GPS ⇒ outdoor:false. Manual mode: lat+lon+start (local "
             "'YYYY-MM-DDTHH:MM') + duration_min. Appends EF/Pw:Hr vs dew point to "

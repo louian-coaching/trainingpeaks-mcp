@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, patch
 
 from tp_mcp.tools.lo_weather import (
     build_url,
+    cold_level,
+    summarise,
     heat_index_c,
     heat_level,
     interpolate,
@@ -212,3 +214,32 @@ async def test_weather_brief_indoor(tmp_path):
         brief = await weather_brief("9", analysis, fetcher=fetch)
     assert brief["outdoor"] is False
     fetch.assert_not_called()
+
+
+def test_cold_level_threshold():
+    """PROC-93c: mean air temp ≤5 °C = 冷天."""
+    assert cold_level(None) is None
+    assert cold_level(5.0) == "冷"
+    assert cold_level(-8.2) == "冷"
+    assert cold_level(5.1) is None
+
+
+def _wx(temp: float) -> dict:
+    return {"temp_c": temp, "dew_point_c": temp - 6, "rh_pct": 60, "wbgt_shade_est_c": temp - 2,
+            "heat_index_c": temp, "wind_kmh": 12, "solar_wm2": 200}
+
+
+def test_summarise_cold_session_corrects_interpretation():
+    s = summarise([_wx(2.0), _wx(3.0), _wx(4.0)], None)
+    assert s["cold_level"] == "冷"
+    assert s["heat_level"] == "涼爽"
+    assert s["correct_interpretation"] is True
+    assert "冷天" in s["verdict"]
+
+
+def test_summarise_cool_not_cold():
+    s = summarise([_wx(8.0), _wx(10.0)], None)
+    assert s["cold_level"] is None
+    assert s["correct_interpretation"] is False
+    assert "冷天" not in s["verdict"]
+
