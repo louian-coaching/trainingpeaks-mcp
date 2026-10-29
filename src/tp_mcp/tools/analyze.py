@@ -363,8 +363,8 @@ def compute_splits(time_series: list[dict[str, Any]], split_km: float) -> list[d
     is not quantised to the chart's sample spacing; ``moving_sec`` drops
     samples slower than 3 km/h (start-corral wait, stops). HR/power are
     time-weighted means of the samples inside the split; ``gain_m``/``loss_m``
-    sum altitude moves of ≥2 m (hysteresis; SmoothedAltitude preferred). Resolution note: the
-    chart stream is ~1000 points, i.e. ~10 s apart on a 3-hour run."""
+    sum altitude moves of ≥2 m (hysteresis; SmoothedAltitude preferred). Resolution note: since
+    2026-10-29 (PR #165) the stream is normally 1 s; check ``time_series_avg_dt``."""
     pts = [p for p in time_series
            if isinstance(p.get("time"), (int, float)) and isinstance(p.get("Distance"), (int, float))]
     if len(pts) < 2 or not split_km or split_km <= 0:
@@ -413,6 +413,25 @@ def compute_splits(time_series: list[dict[str, Any]], split_km: float) -> list[d
         v = p.get("SmoothedAltitude")
         return v if isinstance(v, (int, float)) else p.get("Altitude")
 
+    # FORK 2026-10-29: with 1 s data (PR #165) Distance is quantised to 0.01 km, so a
+    # 1-sample delta reads 0 on ~15% of riding seconds and the old "dd/dt < 3 km/h" test
+    # flagged ~50 min of a Kona ride as stopped. Use the Speed channel (km/h) when the
+    # sample has one; otherwise measure distance over a >=10 s look-back window.
+    stopped_flag: dict[int, bool] = {}
+    j = 0
+    for i, p in enumerate(pts):
+        sp = p.get("Speed")
+        if isinstance(sp, (int, float)):
+            stopped_flag[id(p)] = sp < 3.0
+            continue
+        while j < i - 1 and p["time"] - pts[j + 1]["time"] >= 10:
+            j += 1
+        dt = p["time"] - pts[j]["time"]
+        if dt <= 0:
+            stopped_flag[id(p)] = False
+            continue
+        stopped_flag[id(p)] = (p["Distance"] - pts[j]["Distance"]) / (dt / 3600.0) < 3.0
+
     bounds = []
     k = 0.0
     while k < total - 1e-6:
@@ -438,8 +457,7 @@ def compute_splits(time_series: list[dict[str, Any]], split_km: float) -> list[d
         for p in inside:
             if prev is not None:
                 dt = p["time"] - prev["time"]
-                dd = p["Distance"] - prev["Distance"]
-                if dt > 0 and dd / (dt / 3600.0) < 3.0:
+                if dt > 0 and stopped_flag.get(id(p)):
                     stopped += dt
                 for key, acc in (("HeartRate", "hr"), ("Power", "pw")):
                     v = p.get(key)
@@ -713,8 +731,8 @@ async def tp_analyze_workout(workout_id: str, save_to: str | None = None, detail
             full["splits"] = compute_splits(time_series, float(split_km))
             full["split_units"] = ("sec=elapsed (interpolated), pace_s=sec/km; moving_* only when stops "
                                    "(<3 km/h) took >3%; km re-zeroed at the file start (multisport child "
-                                   "files); avg_w from AccumulatedPower deltas when present; chart stream "
-                                   "~1000 points")
+                                   "files); avg_w from AccumulatedPower deltas when present; stops from the "
+                                   "Speed channel (else distance over >=10 s); see time_series_avg_dt")
         except (TypeError, ValueError):
             logger.exception("split computation failed")
     return full if str(detail or "compact").lower() == "full" else _compact(full)

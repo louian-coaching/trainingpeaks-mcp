@@ -648,3 +648,26 @@ def test_avg_dt():
     assert _avg_dt([{"time": 0}, {"time": 1}, {"time": 2}]) == 1.0
     assert _avg_dt([{"time": 0}, {"time": 12}]) == 12.0
     assert _avg_dt([{"time": 0}]) is None
+
+
+# FORK 2026-10-29: 1 s data has Distance quantised to 0.01 km -> zero deltas while riding
+def test_splits_moving_uses_speed_not_quantised_distance():
+    from tp_mcp.tools.analyze import compute_splits
+    ts = []
+    for t in range(0, 1201):  # 20 min at 30 km/h, distance rounded to 0.01 km
+        ts.append({"time": t, "Distance": round(t * 30 / 3600, 2), "Speed": 30.0})
+    sp = compute_splits(ts, 5)
+    assert sp and all("moving_sec" not in r for r in sp)
+
+
+def test_splits_moving_without_speed_uses_lookback_window():
+    from tp_mcp.tools.analyze import compute_splits
+    ts = [{"time": t, "Distance": round(t * 30 / 3600, 2)} for t in range(0, 1201)]
+    # add a real 120 s stop at the end
+    last = ts[-1]["Distance"]
+    ts += [{"time": 1200 + k, "Distance": last} for k in range(1, 121)]
+    sp = compute_splits(ts, 10)
+    r = sp[0]
+    assert r.get("moving_sec") is not None
+    assert abs(r["sec"] - r["moving_sec"] - 120) <= 15
+
