@@ -453,3 +453,187 @@ async def test_single_lap_falls_back_to_counting_compact_laps(tmp_path):
     with a, w:
         res = await lo_verify_intervals("1")
     assert "note" not in res
+
+
+# ---------------------------------------------------------------------------
+# TECH-57 (2026/10/30): a long warm-up must not shift every later segment
+# ---------------------------------------------------------------------------
+
+
+def _late_ride(extra: int = 120):
+    """Same ride as _flat_ride but the warm-up ran `extra` seconds long."""
+    def p(t):
+        t2 = t - extra
+        if t < 600 + extra:
+            return 140
+        if 600 <= t2 < 1800:
+            return 210
+        if 1800 <= t2 < 2100:
+            return 140
+        if 2100 <= t2 < 3300:
+            return 210 if t2 < 2700 else 190
+        return 140
+    return _series(3600 + extra, p)
+
+
+def _laps(bounds):
+    return [{"Name": f"Lap {i + 1}", "startOffsetSeconds": s, "stopOffsetSeconds": e}
+            for i, (s, e) in enumerate(bounds)]
+
+
+def _patched_file(series, laps, tmp_path, detail_sw=None):
+    data_file = tmp_path / "analysis.json"
+    data_file.write_text(json.dumps({"data": series, "lapData": laps}))
+    analysis = {"workoutId": 1, "data_file": str(data_file), "single_lap": len(laps) <= 1}
+    detail = {"id": "1", "structured_workout": detail_sw or _sw()}
+    return (
+        patch("tp_mcp.tools.analyze.tp_analyze_workout", AsyncMock(return_value=analysis)),
+        patch("tp_mcp.tools.workouts.tp_get_workout", AsyncMock(return_value=detail)),
+    )
+
+
+_LATE_LAPS = [(0, 720), (720, 1920), (1920, 2220), (2220, 3420), (3420, 3720), (3720, 3726)]
+
+
+@pytest.mark.asyncio
+async def test_auto_aligns_on_device_laps_after_a_long_warm_up(tmp_path):
+    a, w = _patched_file(_late_ride(), _laps(_LATE_LAPS), tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1", ftp=270)
+    assert res["align"] == "laps" and res["align_requested"] == "auto"
+    first, second = res["segments"]
+    assert (first["start_s"], first["end_s"]) == (720, 1920)
+    assert first["lap"] == "Lap 2" and second["lap"] == "Lap 4"
+    assert first["avg_power"] == 210.0 and first["in_range_pct"] == 100.0
+    assert second["avg_power"] == 200.0
+    assert res["lap_match"]["work_steps_on_lap_bounds"] == "2/2"  # 6 s save-press lap dropped
+    assert "warning" not in res
+
+
+@pytest.mark.asyncio
+async def test_elapsed_still_available_and_shows_the_old_misread(tmp_path):
+    a, w = _patched_file(_late_ride(), _laps(_LATE_LAPS), tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1", ftp=270, align="elapsed")
+    assert res["align"] == "elapsed"
+    assert res["segments"][0]["avg_power"] < 210.0  # the TECH-57 failure, kept on request
+
+
+@pytest.mark.asyncio
+async def test_auto_shifts_when_there_are_no_laps(tmp_path):
+    a, w = _patched_file(_late_ride(), [{"Name": "Lap 1"}], tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1", ftp=270)
+    assert res["align"] == "shift"
+    assert res["shift"]["shift_s"] == 120
+    assert res["segments"][0]["avg_power"] == 210.0
+    assert "shifted +120s" in res["alignment_note"]
+
+
+@pytest.mark.asyncio
+async def test_auto_keeps_elapsed_when_already_aligned(tmp_path):
+    a, w = _patched_file(_flat_ride(), [{"Name": "Lap 1"}], tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1", ftp=270)
+    assert res["align"] == "elapsed"
+    assert "shift" not in res
+
+
+@pytest.mark.asyncio
+async def test_one_lap_over_two_steps_is_split_by_the_prescription(tmp_path):
+    # warm-up and first block recorded as one 1800 s lap
+    laps = _laps([(0, 1800), (1800, 2100), (2100, 3300), (3300, 3600)])
+    a, w = _patched_file(_flat_ride(), laps, tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1", ftp=270, include_rest=True)
+    assert res["align"] == "laps"
+    warm, first = res["segments"][0], res["segments"][1]
+    assert (warm["end_s"], first["start_s"]) == (600, 600)
+    assert "合一圈" in first["lap"]
+    assert first["avg_power"] == 210.0
+
+
+@pytest.mark.asyncio
+async def test_session_cut_short_lists_unmatched_steps(tmp_path):
+    series = _flat_ride()[:2100]
+    laps = _laps([(0, 600), (600, 1800), (1800, 2100)])
+    a, w = _patched_file(series, laps, tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1", ftp=270)
+    assert res["align"] == "laps"
+    assert [r["name"] for r in res["segments"]] == ["比賽強度段 #1"]
+    assert res["lap_match"]["unmatched_steps"] == ["比賽強度段 #2", "恢復 #2"]
+    assert "unmatched_note" in res
+
+
+@pytest.mark.asyncio
+async def test_auto_laps_that_do_not_line_up_fall_back(tmp_path):
+    # 1000 s auto-laps over a 10/20/5/20/5 structure: boundaries never pair up
+    laps = _laps([(0, 1000), (1000, 2000), (2000, 3000), (3000, 3600)])
+    a, w = _patched_file(_flat_ride(), laps, tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1", ftp=270)
+    assert res["align"] == "elapsed"
+    assert "reason" in res["lap_match"]
+    with a, w:
+        err = await lo_verify_intervals("1", ftp=270, align="laps")
+    assert err["error_code"] == "LAPS_UNMATCHED"
+
+
+@pytest.mark.asyncio
+async def test_laps_mode_refuses_manual_segments(tmp_path):
+    a, w = _patched_file(_flat_ride(), _laps(_LATE_LAPS), tmp_path)
+    with a, w:
+        res = await lo_verify_intervals(
+            "1", align="laps", segments=[{"name": "x", "start_s": 0, "end_s": 60}])
+    assert res["error_code"] == "INVALID_ARGS"
+
+
+@pytest.mark.asyncio
+async def test_auto_laps_inside_one_step_are_merged(tmp_path):
+    # 5-minute auto-laps happen to fall on every boundary: 2 + 4 + 1 + 4 + 1 laps
+    laps = _laps([(t, t + 300) for t in range(0, 3600, 300)])
+    a, w = _patched_file(_flat_ride(), laps, tmp_path)
+    with a, w:
+        res = await lo_verify_intervals("1", ftp=270)
+    assert res["align"] == "laps"
+    assert res["segments"][0]["lap"] == "Lap 3–6"
+    assert res["segments"][1]["avg_power"] == 200.0
+
+
+def test_flatten_rescales_time_steps_inside_a_distance_structure():
+    # Cheng Hsun Lu 2026/10/22 5K test: time steps placed on the metre axis
+    st = [
+        {"begin": 0, "end": 824, "length": {"value": 1, "unit": "repetition"},
+         "steps": [{"name": "暖身跑", "length": {"value": 300, "unit": "second"},
+                    "intensityClass": "warmUp", "targets": [{"minValue": 70, "maxValue": 75}]}]},
+        {"begin": 824, "end": 1883, "length": {"value": 3, "unit": "repetition"},
+         "steps": [
+             {"name": "加速跑", "length": {"value": 30, "unit": "second"}, "intensityClass": "active",
+              "targets": [{"minValue": 105, "maxValue": 108}]},
+             {"name": "慢跑恢復", "length": {"value": 90, "unit": "second"}, "intensityClass": "rest",
+              "targets": [{"minValue": 65, "maxValue": 72}]}]},
+        {"begin": 1883, "end": 6883, "length": {"value": 1, "unit": "repetition"},
+         "steps": [{"name": "5公里全力", "length": {"value": 5000, "unit": "meter"},
+                    "intensityClass": "active", "targets": [{"minValue": 100, "maxValue": 110}]}]},
+    ]
+    literal = flatten_structure(st)
+    assert literal[1]["end"] - literal[1]["start"] == 30          # the old misread
+    fixed = flatten_structure(st, "meter")
+    assert fixed[0]["end"] == pytest.approx(824)
+    assert fixed[1]["end"] - fixed[1]["start"] == pytest.approx(1059 / 360 * 30)
+    assert fixed[7]["start"] == pytest.approx(1883)                # 5K starts where TP put it
+    assert fixed[7]["end"] == pytest.approx(6883)
+
+
+def test_detected_pace_interval_laps_are_ignored():
+    from tp_mcp.tools.lo_verify import device_laps
+    raw = {"lapData": [
+        {"Name": "Lap 1", "Source": "Device", "startOffsetSeconds": 0, "stopOffsetSeconds": 200},
+        {"Name": "Pace Interval 1", "Source": "DetectedPaceInterval",
+         "startOffsetSeconds": 10, "stopOffsetSeconds": 400},
+        {"Name": "Lap 2", "Source": "Device", "startOffsetSeconds": 200, "stopOffsetSeconds": 400},
+    ]}
+    pts = [{"time": t} for t in range(0, 401)]
+    laps = device_laps(raw, pts, "time")
+    assert [(lp["n"], lp["start"], lp["end"]) for lp in laps] == [(1, 0, 200), (2, 200, 400)]

@@ -165,6 +165,11 @@ class TPClient:
     # Class-level caches: persist across instances within the MCP server process
     _cached_athlete_id: int | None = None
     _cached_user_data: dict | None = None
+    # FORK (2026/10/30, TECH-58): the roster inside /users/v3/user was cached for the
+    # whole process, so an athlete who connected after the MCP started (謝昌泓 10/23,
+    # 楊升 10/24) answered AUTH_INVALID until Claude desktop was restarted.
+    _cached_user_data_at: float | None = None
+    _USER_DATA_TTL_S: float = 900.0
     _shared_token_cache: TokenCache | None = None
 
     @classmethod
@@ -668,9 +673,16 @@ class TPClient:
         """Set the athlete ID."""
         self._athlete_id = value
 
-    async def _get_user_data(self) -> dict | None:
-        """Get user data, using class-level cache to avoid redundant API calls."""
-        if TPClient._cached_user_data is not None:
+    async def _get_user_data(self, refresh: bool = False) -> dict | None:
+        """Get user data, using class-level cache to avoid redundant API calls.
+
+        FORK (TECH-58): the cache expires after ``_USER_DATA_TTL_S`` and
+        ``refresh=True`` bypasses it — the roster in it changes whenever an
+        athlete connects to the coach.
+        """
+        cached_at = TPClient._cached_user_data_at
+        fresh = cached_at is None or (time.monotonic() - cached_at) < TPClient._USER_DATA_TTL_S
+        if TPClient._cached_user_data is not None and fresh and not refresh:
             return TPClient._cached_user_data
 
         response = await self.get("/users/v3/user")
@@ -679,6 +691,7 @@ class TPClient:
 
         user_data = response.data.get("user", response.data)
         TPClient._cached_user_data = user_data
+        TPClient._cached_user_data_at = time.monotonic()
         return user_data
 
     async def ensure_athlete_id(self) -> int | None:
@@ -714,36 +727,13 @@ class TPClient:
         athlete_id = None
 
         if athlete is not None:
-            # Resolve by explicit athlete name or ID
-            try:
-                target_id = int(athlete)
-                for a in athletes:
-                    if a.get("athleteId") == target_id:
-                        athlete_id = target_id
-                        break
-            except ValueError:
-                # Search by name (case-insensitive), detecting ambiguity
-                search = athlete.lower()
-                matches = []
-                for a in athletes:
-                    first = (a.get("firstName") or "").lower()
-                    last = (a.get("lastName") or "").lower()
-                    full = f"{first} {last}"
-                    if search in (first, last, full):
-                        matches.append(a)
-
-                if len(matches) == 1:
-                    athlete_id = matches[0].get("athleteId")
-                elif len(matches) > 1:
-                    names = [
-                        f"{a.get('firstName', '')} {a.get('lastName', '')} (ID: {a.get('athleteId')})"
-                        for a in matches
-                    ]
-                    raise ValueError(
-                        f"Ambiguous athlete name '{athlete}' matches {len(matches)} athletes: "
-                        + ", ".join(names)
-                        + ". Use full name or athlete ID to disambiguate."
-                    ) from None
+            athlete_id = self._match_athlete(athletes, athlete)
+            if athlete_id is None:
+                # FORK (TECH-58): not on the cached roster — maybe connected since
+                # the roster was fetched. Re-read it once before giving up.
+                fresh_data = await self._get_user_data(refresh=True)
+                if fresh_data:
+                    athlete_id = self._match_athlete(fresh_data.get("athletes", []), athlete)
         elif athletes:
             # Default: find the coach's own athlete entry
             for a in athletes:
@@ -768,6 +758,41 @@ class TPClient:
             if athlete is None:
                 TPClient._cached_athlete_id = athlete_id
 
+        return athlete_id
+
+    @staticmethod
+    def _match_athlete(athletes: list[dict], athlete: str) -> int | None:
+        """Resolve an explicit athlete name or ID against the coach roster."""
+        athlete_id = None
+        try:
+            target_id = int(athlete)
+            for a in athletes:
+                if a.get("athleteId") == target_id:
+                    athlete_id = target_id
+                    break
+        except ValueError:
+            # Search by name (case-insensitive), detecting ambiguity
+            search = athlete.lower()
+            matches = []
+            for a in athletes:
+                first = (a.get("firstName") or "").lower()
+                last = (a.get("lastName") or "").lower()
+                full = f"{first} {last}"
+                if search in (first, last, full):
+                    matches.append(a)
+
+            if len(matches) == 1:
+                athlete_id = matches[0].get("athleteId")
+            elif len(matches) > 1:
+                names = [
+                    f"{a.get('firstName', '')} {a.get('lastName', '')} (ID: {a.get('athleteId')})"
+                    for a in matches
+                ]
+                raise ValueError(
+                    f"Ambiguous athlete name '{athlete}' matches {len(matches)} athletes: "
+                    + ", ".join(names)
+                    + ". Use full name or athlete ID to disambiguate."
+                ) from None
         return athlete_id
 
     async def test_token_exchange(self) -> dict[str, Any]:

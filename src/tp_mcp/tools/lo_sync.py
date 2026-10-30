@@ -65,11 +65,38 @@ def _day(v: Any) -> str:
     return str(v or "")[:10]
 
 
-def save_snapshot(rows: list[dict[str, Any]], start: str, end: str, key: str | None = None) -> str | None:
-    """Replace the snapshot's [start, end] window with ``rows``. Never raises."""
+def save_snapshot(rows: list[dict[str, Any]], start: str, end: str, key: str | None = None,
+                  *, track_pending: bool = True, clear_pending: bool = False) -> str | None:
+    """Replace the snapshot's [start, end] window with ``rows``. Never raises.
+
+    FORK (2026/10/30, TECH-56): every planned-week read-back writes here, and
+    used to overwrite the window silently. A coach edit made between two
+    read-backs (we read back to validate, the coach edits in TP, we read back
+    again for some other reason) therefore became the new baseline and
+    ``lo_diff_week`` later reported nothing — Justin 10/29 swim body and 10/31
+    long-ride structure, 2026/10/21. Our own writes are already merged into
+    the baseline when they happen (``upsert_snapshot_rows``), so what still
+    differs at read-back time is someone else's edit. ``track_pending`` keeps
+    the pre-edit row in ``pending_before`` until ``lo_diff_week`` reports it
+    (``clear_pending``). New ids are not tracked: single creates do not pass
+    through the baseline, so "added" here would mostly be our own work.
+    """
     try:
         snap = load_snapshot(key)
         ws: dict[str, Any] = snap.get("workouts") or {}
+        pending: dict[str, Any] = dict(snap.get("pending_before") or {})
+        if track_pending:
+            now_ids = {str(r.get("id")): r for r in rows if r.get("id") is not None}
+            for wid, old in ws.items():
+                if not (start <= _day(old.get("date")) <= end) or wid in pending:
+                    continue
+                new = now_ids.get(wid)
+                if new is None or _human_change(old, new):
+                    pending[wid] = {**old, "_absorbed_at": datetime.now().isoformat(timespec="seconds")}
+        if clear_pending:
+            ids_now = {str(r.get("id")) for r in rows if r.get("id") is not None}
+            pending = {i: r for i, r in pending.items()
+                       if i not in ids_now and not (start <= _day(r.get("date")) <= end)}
         ws = {i: w for i, w in ws.items() if not (start <= _day(w.get("date")) <= end)}
         for r in rows:
             if r.get("id") is not None:
@@ -79,6 +106,8 @@ def save_snapshot(rows: list[dict[str, Any]], start: str, end: str, key: str | N
             windows.append({"start": start, "end": end})
         snap = {"workouts": ws, "updated": datetime.now().isoformat(timespec="seconds"),
                 "last_window": {"start": start, "end": end}, "windows": windows[-12:]}
+        if pending:
+            snap["pending_before"] = pending
         p = _snap_path(key)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(snap, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -287,6 +316,15 @@ def diff_rows(before: dict[str, dict[str, Any]], after: list[dict[str, Any]], st
     return out
 
 
+def _human_change(old: dict[str, Any], new: dict[str, Any]) -> bool:
+    """A difference a person made (not TP recomputing load for a pace run)."""
+    d = diff_rows({"x": {**old, "id": "x"}}, [{**new, "id": "x"}], "0000-00-00", "9999-99-99")
+    for c in d.get("changed") or []:
+        if set(c["changes"]) - {"tss_planned"}:
+            return True
+    return bool(d.get("deleted"))
+
+
 # ---------------------------------------------------------------------------
 # FORK 2026-10-03: learning log. Since 6f47736 every lo_ write refreshes the
 # snapshot, so what lo_diff_week reports is (almost always) a HUMAN edit — the
@@ -370,7 +408,14 @@ async def lo_diff_week(start_date: str, end_date: str, save_snapshot_after: bool
     from tp_mcp.tools.lo_tools import lo_get_week_for_validate
 
     snap = load_snapshot()
-    before = snap.get("workouts") or {}
+    before = dict(snap.get("workouts") or {})
+    # TECH-56: edits a read-back absorbed since the last diff are compared against
+    # the row as it was BEFORE that read-back, not against the absorbed version.
+    absorbed = {i: r for i, r in (snap.get("pending_before") or {}).items()
+                if start_date <= _day(r.get("date")) <= end_date
+                or start_date <= _day((before.get(i) or {}).get("date")) <= end_date}
+    for i, r in absorbed.items():
+        before[i] = {k: v for k, v in r.items() if k != "_absorbed_at"}
     had_snapshot = any(start_date <= _day(w.get("date")) <= end_date for w in before.values())
     tmp = save_to or str(snapshot_dir() / f"_diff_{_athlete_key()}_{start_date}_{end_date}.json")
     Path(tmp).expanduser().parent.mkdir(parents=True, exist_ok=True)
@@ -385,6 +430,10 @@ async def lo_diff_week(start_date: str, end_date: str, save_snapshot_after: bool
         out["warning"] = ("No snapshot covers this window yet — everything is reported as 'added'. "
                           "Snapshots are written by every planned-week read-back from now on.")
     out.update(diff_rows(before, rows, start_date, end_date))
+    caught = sorted({c["id"] for k in ("changed", "deleted") for c in out.get(k) or []} & set(absorbed))
+    if caught:
+        out["caught_from_readbacks"] = [
+            {"id": i, "absorbed_at": absorbed[i].get("_absorbed_at")} for i in caught]
     # FORK 2026/10/16: a planned workout the athlete has since COMPLETED drops out of the planned
     # read-back and looked like a coach deletion (3742891 10/14 輕鬆騎). Re-list with "all" and move
     # those ids to `completed_since` — they are not edits and must not reach the edit log.
@@ -424,6 +473,14 @@ async def lo_diff_week(start_date: str, end_date: str, save_snapshot_after: bool
                               "suggested_body": r["suggested_body"]})
         out["thresholds"] = th
         out["stale_bodies"] = stale
+        changed_ids = {c["id"] for c in out.get("changed") or []} | {a["id"] for a in out.get("added") or []}
+        unexplained = [s["id"] for s in stale if s["id"] not in changed_ids]
+        if unexplained:
+            out["stale_unexplained"] = unexplained
+            out["stale_unexplained_note"] = (
+                "Body text and graph disagree on these, but nothing changed since the baseline: "
+                "either an older edit nobody synced, or a body we built wrong. Ask the coach "
+                "which before rewriting, and log the reason if it was his edit.")
     # swims have no graph: check the body's metres against TP's distance field
     from tp_mcp.tools.lo_review import planned_distance_m
     from tp_mcp.tools.lo_swim import estimate_swim
@@ -450,7 +507,8 @@ async def lo_diff_week(start_date: str, end_date: str, save_snapshot_after: bool
     if swim_mis:
         out["swim_distance_mismatch"] = swim_mis
     if save_snapshot_after:
-        out["snapshot"] = save_snapshot(rows, start_date, end_date)
+        out["snapshot"] = save_snapshot(rows, start_date, end_date,
+                                        track_pending=False, clear_pending=True)
     out["readback_json_path"] = str(Path(tmp).expanduser())
     out["week_load"] = week.get("week_load")
     out["next"] = ("stale_bodies[].suggested_body is the graph rendered as text (your own labels kept "

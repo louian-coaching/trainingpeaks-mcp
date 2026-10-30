@@ -226,3 +226,60 @@ class TestForbiddenEndpoints:
         # get_raw() is guarded too.
         rr = await client.get_raw("/plans/v1/commands/applyplan")
         assert rr.is_error and rr.error_code == ErrorCode.FORBIDDEN_ENDPOINT
+
+
+class TestRosterRefreshTECH58:
+    """FORK 2026/10/30: an athlete who connected after the roster was cached."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self):
+        TPClient._cached_athlete_id = None
+        TPClient._cached_user_data = None
+        TPClient._cached_user_data_at = None
+        yield
+        TPClient._cached_athlete_id = None
+        TPClient._cached_user_data = None
+        TPClient._cached_user_data_at = None
+
+    @pytest.mark.asyncio
+    async def test_unknown_athlete_triggers_one_roster_refresh(self):
+        from tp_mcp.client.context import athlete_override
+
+        old = APIResponse(success=True, data={"user": {"personId": 1, "athletes": [{"athleteId": 11}]}})
+        new = APIResponse(success=True, data={"user": {"personId": 1,
+                                                       "athletes": [{"athleteId": 11}, {"athleteId": 6052966}]}})
+        client = TPClient()
+        client.get = AsyncMock(side_effect=[old, new])
+        await client._get_user_data()                       # roster cached before 楊升 connected
+        token = athlete_override.set("6052966")
+        try:
+            assert await client.ensure_athlete_id() == 6052966
+        finally:
+            athlete_override.reset(token)
+        assert client.get.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_truly_unknown_athlete_refreshes_only_once(self):
+        from tp_mcp.client.context import athlete_override
+
+        roster = APIResponse(success=True, data={"user": {"personId": 1, "athletes": [{"athleteId": 11}]}})
+        client = TPClient()
+        client.get = AsyncMock(return_value=roster)
+        token = athlete_override.set("424242")
+        try:
+            assert await client.ensure_athlete_id() is None
+        finally:
+            athlete_override.reset(token)
+        assert client.get.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_roster_cache_expires(self, monkeypatch):
+        roster = APIResponse(success=True, data={"user": {"personId": 1, "athletes": []}})
+        client = TPClient()
+        client.get = AsyncMock(return_value=roster)
+        await client._get_user_data()
+        await client._get_user_data()
+        assert client.get.call_count == 1
+        TPClient._cached_user_data_at -= TPClient._USER_DATA_TTL_S + 1
+        await client._get_user_data()
+        assert client.get.call_count == 2

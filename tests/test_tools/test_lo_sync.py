@@ -492,3 +492,84 @@ async def test_lo_diff_week_completed_is_not_deleted(tmp_path, monkeypatch):
     assert out["deleted"] == []
     assert [c["id"] for c in out["completed_since"]] == ["5"]
     assert "edit_log_ids" not in out
+
+
+# ---------------------------------------------------------------------------
+# TECH-56 (2026/10/30): a read-back between the coach's edit and lo_diff_week
+# must not swallow the edit (Justin 10/29 swim body, 10/31 long-ride structure)
+# ---------------------------------------------------------------------------
+
+_SWIM_OLD = "- 200公尺@75-80%, 3趟, 間休20秒\n－－\n說明"
+_SWIM_NEW = "- 150公尺@80-85%, 4趟, 間休20秒\n－－\n說明"
+
+
+@pytest.mark.asyncio
+async def test_readback_in_between_keeps_the_coach_edit(tmp_path, monkeypatch):
+    monkeypatch.setenv("TP_LO_SNAPSHOT_DIR", str(tmp_path / "snap"))
+    monkeypatch.setenv("TP_LO_LEARNING_DIR", str(tmp_path / "learn"))
+    old = _row("5", "2026-10-29", title="力量耐力", sport="Swim", desc=_SWIM_OLD)
+    save_snapshot([old], "2026-10-26", "2026-11-01")            # our build read-back
+    new = dict(old, description=_SWIM_NEW)
+    save_snapshot([new], "2026-10-26", "2026-11-01")            # some other read-back
+    assert "5" in load_snapshot()["pending_before"]
+    week = {"success": True, "rows": [new], "week_load": {}}
+    with patch("tp_mcp.tools.lo_tools.lo_get_week_for_validate", AsyncMock(return_value=week)):
+        out = await lo_diff_week("2026-10-26", "2026-11-01", render=False)
+    assert out["changed"][0]["id"] == "5" and "body" in out["changed"][0]["changes"]
+    assert out["caught_from_readbacks"][0]["id"] == "5"
+    assert len(out["edit_log_ids"]) == 1
+    assert "pending_before" not in load_snapshot()             # reported once, then cleared
+    with patch("tp_mcp.tools.lo_tools.lo_get_week_for_validate", AsyncMock(return_value=week)):
+        again = await lo_diff_week("2026-10-26", "2026-11-01", render=False)
+    assert again["changed"] == []
+
+
+@pytest.mark.asyncio
+async def test_absorbed_structure_change_reaches_changed(tmp_path, monkeypatch):
+    monkeypatch.setenv("TP_LO_SNAPSHOT_DIR", str(tmp_path / "snap"))
+    monkeypatch.setenv("TP_LO_LEARNING_DIR", str(tmp_path / "learn"))
+    old = _row("7", "2026-10-31", title="長距離騎乘", desc="- 2小時@172~191W\n－－\n說明", sw=None)
+    save_snapshot([old], "2026-10-26", "2026-11-01")
+    new = dict(old, structured_workout=ABU_1003, tss_planned=120.9)
+    save_snapshot([new], "2026-10-26", "2026-11-01")            # absorbed
+    week = {"success": True, "rows": [new], "week_load": {}}
+    settings = {"settings": {"powerZones": [{"workoutTypeId": 2, "threshold": 265}], "speedZones": []}}
+    with patch("tp_mcp.tools.lo_tools.lo_get_week_for_validate", AsyncMock(return_value=week)), \
+         patch("tp_mcp.tools.settings.tp_get_athlete_settings", AsyncMock(return_value=settings)):
+        out = await lo_diff_week("2026-10-26", "2026-11-01")
+    assert out["changed"][0]["changes"]["structure"] is True
+    assert out["edit_log_ids"]
+    assert "stale_unexplained" not in out                      # explained by the change above
+
+
+def test_our_own_write_then_readback_is_not_pending(tmp_path, monkeypatch):
+    monkeypatch.setenv("TP_LO_SNAPSHOT_DIR", str(tmp_path))
+    old = _row("5", "2026-10-29", sport="Swim", desc=_SWIM_OLD)
+    save_snapshot([old], "2026-10-26", "2026-11-01")
+    mine = dict(old, description=_SWIM_NEW)
+    upsert_snapshot_rows([mine], only_fields={"description"})
+    save_snapshot([mine], "2026-10-26", "2026-11-01")
+    assert "pending_before" not in load_snapshot()
+
+
+def test_tp_recomputing_tss_is_not_a_human_edit(tmp_path, monkeypatch):
+    monkeypatch.setenv("TP_LO_SNAPSHOT_DIR", str(tmp_path))
+    old = _row("3", "2026-10-28", sport="Run", desc="- 10公里@5:10~4:55/km\n－－\n說明", tss=70.0)
+    save_snapshot([old], "2026-10-26", "2026-11-01")
+    save_snapshot([dict(old, tss_planned=73.4)], "2026-10-26", "2026-11-01")
+    assert "pending_before" not in load_snapshot()
+
+
+@pytest.mark.asyncio
+async def test_stale_body_without_a_change_is_flagged(tmp_path, monkeypatch):
+    monkeypatch.setenv("TP_LO_SNAPSHOT_DIR", str(tmp_path / "snap"))
+    monkeypatch.setenv("TP_LO_LEARNING_DIR", str(tmp_path / "learn"))
+    row = _row("7", "2026-10-31", title="長距離騎乘", desc="- 2小時@172~191W\n－－\n說明",
+               sw=ABU_1003, tss=120.9)
+    save_snapshot([row], "2026-10-26", "2026-11-01")
+    week = {"success": True, "rows": [row], "week_load": {}}
+    settings = {"settings": {"powerZones": [{"workoutTypeId": 2, "threshold": 265}], "speedZones": []}}
+    with patch("tp_mcp.tools.lo_tools.lo_get_week_for_validate", AsyncMock(return_value=week)), \
+         patch("tp_mcp.tools.settings.tp_get_athlete_settings", AsyncMock(return_value=settings)):
+        out = await lo_diff_week("2026-10-26", "2026-11-01")
+    assert out["changed"] == [] and out["stale_unexplained"] == ["7"]

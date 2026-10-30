@@ -38,6 +38,7 @@ Distance-based run workouts align on the ``Distance`` channel instead of
 
 from __future__ import annotations
 
+import bisect
 import json
 import logging
 import math
@@ -55,6 +56,8 @@ _CHANNELS = ("Power", "HeartRate", "Cadence", "Speed")
 _ZERO_MEANS_MISSING = ("Cadence", "HeartRate")
 
 _DRIFT_WARN = 0.05  # |actual/planned - 1| above this ⇒ boundaries unreliable
+
+_ALIGN_MODES = ("auto", "laps", "shift", "elapsed", "scale")
 
 
 def _round_half_up(x: float) -> int:
@@ -78,7 +81,12 @@ def _err(code: str, message: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def flatten_structure(structure: list[dict[str, Any]]) -> list[dict[str, Any]]:
+_UNIT_SCALE = {"second": ("second", 1.0), "minute": ("second", 60.0), "hour": ("second", 3600.0),
+               "meter": ("meter", 1.0), "kilometer": ("meter", 1000.0), "mile": ("meter", 1609.344)}
+
+
+def flatten_structure(structure: list[dict[str, Any]],
+                      length_unit: str | None = None) -> list[dict[str, Any]]:
     """Expand a TP ``structure`` into consecutive segments with absolute bounds.
 
     Each block carries its own ``begin``/``end`` (cumulative seconds for a
@@ -93,6 +101,15 @@ def flatten_structure(structure: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ``target_max``/``intensity_class``. Rest and warm-up steps are kept — the
     caller decides what to look at, and dropping them here would break the
     "segment N of the printed workout" mapping the coach reads from.
+
+    ``length_unit`` (``"second"`` or ``"meter"``, the structure's own axis)
+    fixes mixed-unit structures. A distance run keeps time steps — "暖身跑 300
+    second", "加速跑 30 second" — and TP places them on the metre axis with an
+    estimated length (block begin/end), but the step value is still seconds.
+    Read literally, a 30-second stride became 30 metres and every later step in
+    that block slid (TECH-57: Cheng Hsun Lu's 5K test read 3:45/km instead of
+    3:25). Steps in the other unit now share whatever length the block span
+    leaves after the native steps. Omit it to keep the literal reading.
     """
     out: list[dict[str, Any]] = []
     for block in structure or []:
@@ -107,6 +124,7 @@ def flatten_structure(structure: list[dict[str, Any]]) -> list[dict[str, Any]]:
             except (TypeError, ValueError):
                 reps = 1
         steps = [s for s in (block.get("steps") or []) if isinstance(s, dict)]
+        foreign_factor = _foreign_factor(block, steps, reps, length_unit)
         for rep_i in range(reps):
             for st in steps:
                 sl = st.get("length") or {}
@@ -116,6 +134,11 @@ def flatten_structure(structure: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     val = 0.0
                 if val <= 0:
                     continue
+                if length_unit:
+                    unit, mult = _UNIT_SCALE.get(sl.get("unit"), (length_unit, 1.0))
+                    val *= mult
+                    if unit != length_unit and foreign_factor:
+                        val *= foreign_factor
                 targets = st.get("targets") or [{}]
                 t0 = targets[0] if isinstance(targets[0], dict) else {}
                 name = st.get("name") or st.get("intensityClass") or "step"
@@ -131,6 +154,33 @@ def flatten_structure(structure: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 })
                 cursor += val
     return out
+
+
+def _foreign_factor(block: dict[str, Any], steps: list[dict[str, Any]], reps: int,
+                    length_unit: str | None) -> float | None:
+    """Axis units per foreign-unit unit for one block (see flatten_structure)."""
+    if not length_unit:
+        return None
+    try:
+        span = float(block["end"]) - float(block["begin"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    native = foreign = 0.0
+    for st in steps:
+        sl = st.get("length") or {}
+        try:
+            val = float(sl.get("value") or 0)
+        except (TypeError, ValueError):
+            continue
+        unit, mult = _UNIT_SCALE.get(sl.get("unit"), (length_unit, 1.0))
+        if unit == length_unit:
+            native += val * mult
+        else:
+            foreign += val * mult
+    remaining = span - reps * native
+    if foreign <= 0 or remaining <= 0:
+        return None
+    return remaining / (reps * foreign)
 
 
 def _normalize_manual(segments: list[dict[str, Any]]) -> list[dict[str, Any]] | str:
@@ -302,10 +352,296 @@ def _in_range_pct(points: list[dict[str, Any]], lo: float | None, hi: float | No
     return round(100.0 * inside / len(vals), 1)
 
 
+# ---------------------------------------------------------------------------
+# Alignment: device laps first, then a profile shift, then raw elapsed
+# (TECH-57, 2026/10/30)
+# ---------------------------------------------------------------------------
+#
+# ``align="elapsed"`` lays the prescription's own boundaries over the clock.
+# One long warm-up and every later segment lands on the wrong window: Justin
+# 2026/10/22 rode his first aerobic block 1012s instead of 900s, so twelve
+# intervals that his head unit split perfectly (297~306W / 267~274W /
+# 240~244W, all in range) were rebuilt as 137~158W, "0% in range" — two
+# weekly reviews in a row. drift_pct was only +3.2%, so no warning fired.
+#
+# Device laps carry ``startOffsetSeconds``/``stopOffsetSeconds`` on the same
+# clock as the time series. When the athlete pressed the lap button (or the
+# head unit followed the structured workout) the laps ARE the segments, so
+# use them. When laps are missing or do not line up, slide the whole
+# prescription along the recording and keep the offset whose power profile
+# correlates best with the targets.
+
+_LAP_EDGE_DROP_S = 15.0       # a lap this short at either end = save press / auto-pause artefact
+_LAP_MAX_STEPS_PER_LAP = 3    # steps the athlete did not lap between (split proportionally)
+_LAP_MAX_LAPS_PER_STEP = 12   # auto-laps inside one step (a 10 km tempo at 1 km auto-lap)
+_LAP_ACCEPT_MISMATCH = 0.15   # Σ|lap − prescribed| / Σ prescribed (matched part)
+_LAP_WORK_ANCHORED = 0.5     # share of work steps whose bounds come straight from laps
+_LAP_MIN_COVERAGE = 0.5       # matched steps / all steps when the session stopped early
+_LAP_UNMATCHED_COST = 0.5     # per unit of prescription left without a lap (selection only)
+
+_SHIFT_BIN_S = 5
+_SHIFT_RANGE_S = (-600, 900)
+_SHIFT_MIN_S = 15
+_SHIFT_MIN_CORR = 0.5
+_SHIFT_MIN_GAIN = 0.15
+
+_REST_CLASSES = ("warmUp", "rest", "coolDown")
+
+
+def _time_to_axis(points: list[dict[str, Any]], axis: str):
+    """Return f(t) mapping a clock offset to the alignment axis."""
+    if axis == "time":
+        return lambda t: t
+    pairs = sorted(
+        (float(p["time"]), v)
+        for p in points
+        if isinstance(p.get("time"), (int, float))
+        and (v := _axis_value(p, axis)) is not None
+    )
+    times = [t for t, _ in pairs]
+
+    def at(t: float) -> float | None:
+        if not pairs:
+            return None
+        i = bisect.bisect_left(times, t)
+        return pairs[min(i, len(pairs) - 1)][1]
+    return at
+
+
+def device_laps(raw: dict[str, Any], points: list[dict[str, Any]],
+                axis: str) -> list[dict[str, Any]]:
+    """Device laps as ``[{n, start, end}]`` on the alignment axis.
+
+    ``n`` is the 1-based lap number as the head unit wrote it. Laps without
+    offsets make the whole list unusable (a partial list would mis-number
+    everything after the gap).
+    """
+    laps: list[tuple[float, float, int]] = []
+    numbered = 0
+    for lap in raw.get("lapData") or []:
+        if not isinstance(lap, dict):
+            continue
+        # TP adds its own "DetectedPaceInterval" laps that overlap the device
+        # laps (a 5 km "Pace Interval 3" on top of five 1 km laps); only what
+        # the head unit wrote describes how the athlete split the session.
+        if lap.get("Source") not in (None, "Device"):
+            continue
+        numbered += 1
+        s, e = lap.get("startOffsetSeconds"), lap.get("stopOffsetSeconds")
+        if not isinstance(s, (int, float)) or not isinstance(e, (int, float)) or e <= s:
+            return []
+        laps.append((float(s), float(e), numbered))
+    laps.sort()
+    kept: list[tuple[float, float, int]] = []
+    for lap in laps:
+        if kept and lap[0] < kept[-1][1] - 1.0:
+            continue  # overlaps the previous lap — not part of the device sequence
+        kept.append(lap)
+    laps = kept
+    while laps and laps[-1][1] - laps[-1][0] < _LAP_EDGE_DROP_S:
+        laps.pop()
+    while laps and laps[0][1] - laps[0][0] < _LAP_EDGE_DROP_S:
+        laps.pop(0)
+    conv = _time_to_axis(points, axis)
+    out = []
+    for s, e, n in laps:
+        a, b = conv(s), conv(e)
+        if a is None or b is None or b <= a:
+            return []
+        out.append({"n": n, "start": float(a), "end": float(b)})
+    return out
+
+
+def align_to_laps(segs: list[dict[str, Any]], laps: list[dict[str, Any]],
+                  axis: str = "time") -> tuple[list[dict[str, Any]] | None, dict[str, Any]]:
+    """Map prescription steps onto device laps (monotone, with merges).
+
+    A lap may cover up to three consecutive steps (athlete did not press
+    between them — split proportionally to the prescription), and a step may
+    span up to twelve laps (extra presses, or 1 km auto-laps inside a long
+    block). Dynamic
+    programming minimises Σ|lap duration − step duration| plus a small
+    penalty per merge so 1:1 wins ties. The run must consume every lap (a
+    session cut short leaves trailing steps unmatched) or every step (extra
+    laps after the last step are ignored).
+
+    Returns ``(segments, info)``; segments is None when the laps do not line
+    up well enough to trust, and ``info["reason"]`` says why.
+    """
+    n, m = len(laps), len(segs)
+    info: dict[str, Any] = {"device_laps": n, "prescribed_steps": m}
+    if n < 2 or m < 1:
+        info["reason"] = "fewer than two usable device laps"
+        return None, info
+    ld = [lp["end"] - lp["start"] for lp in laps]
+    sd = [s["end"] - s["start"] for s in segs]
+    pen = 5.0 if axis == "time" else 20.0
+    inf = float("inf")
+    best = [[inf] * (m + 1) for _ in range(n + 1)]
+    back: list[list[tuple[int, int] | None]] = [[None] * (m + 1) for _ in range(n + 1)]
+    best[0][0] = 0.0
+    for i in range(n + 1):
+        for j in range(m + 1):
+            cur = best[i][j]
+            if cur == inf:
+                continue
+            for a in range(1, _LAP_MAX_LAPS_PER_STEP + 1):
+                if i + a > n:
+                    break
+                for b in range(1, _LAP_MAX_STEPS_PER_LAP + 1):
+                    if j + b > m:
+                        break
+                    if a > 1 and b > 1:
+                        break
+                    c = abs(sum(ld[i:i + a]) - sum(sd[j:j + b])) + pen * (a + b - 2)
+                    if cur + c < best[i + a][j + b]:
+                        best[i + a][j + b] = cur + c
+                        back[i + a][j + b] = (a, b)
+    ends = [(n, j) for j in range(1, m + 1)] + [(i, m) for i in range(1, n)]
+    cands = []
+    for i, j in ends:
+        if best[i][j] == inf:
+            continue
+        matched = sum(sd[:j])
+        if matched <= 0 or (j < m and j / m < _LAP_MIN_COVERAGE):
+            continue
+        # Leaving steps unmatched must cost something, or the cheapest answer
+        # is to swallow the cool-down laps into the last work block (Cheng
+        # Hsun Lu 10/22: 5K test + walking cool-down read as 4:13/km).
+        unmatched = sum(sd[j:])
+        cands.append((best[i][j] + _LAP_UNMATCHED_COST * unmatched, -j, i, j, matched))
+    if not cands:
+        info["reason"] = "laps cannot be paired with the prescription"
+        return None, info
+    _, _, i, j, matched_len = min(cands)
+    norm = best[i][j] / matched_len
+    groups = []
+    while i > 0 or j > 0:
+        a, b = back[i][j]
+        groups.append((i - a, a, j - b, b))
+        i, j = i - a, j - b
+    groups.reverse()
+
+    out: list[dict[str, Any]] = []
+    work_total = work_anchored = 0
+    for li, a, sj, b in groups:
+        lap_lo, lap_hi = laps[li], laps[li + a - 1]
+        if a == 1 and b == 1:
+            lap_label = f"Lap {lap_lo['n']}"
+        elif b == 1:
+            lap_label = f"Lap {lap_lo['n']}–{lap_hi['n']}"
+        else:
+            lap_label = f"Lap {lap_lo['n']}（{b} 段合一圈，依處方比例切分）"
+        start, end = lap_lo["start"], lap_hi["end"]
+        span_pres = sum(sd[sj:sj + b]) or 1.0
+        cursor = start
+        for k in range(sj, sj + b):
+            seg = segs[k]
+            seg_end = end if k == sj + b - 1 else cursor + (end - start) * sd[k] / span_pres
+            out.append({**seg, "start": cursor, "end": seg_end, "lap": lap_label})
+            cursor = seg_end
+            if seg.get("intensity_class") not in _REST_CLASSES:
+                work_total += 1
+                if b == 1:
+                    work_anchored += 1
+    info["mismatch_pct"] = round(100.0 * norm, 1)
+    info["merged_groups"] = sum(1 for g in groups if g[1] > 1 or g[3] > 1)
+    if work_total:
+        info["work_steps_on_lap_bounds"] = f"{work_anchored}/{work_total}"
+    if norm > _LAP_ACCEPT_MISMATCH:
+        info["reason"] = (f"lap durations differ from the prescription by "
+                          f"{100 * norm:.0f}% (> {100 * _LAP_ACCEPT_MISMATCH:.0f}%)")
+        return None, info
+    if work_total and work_anchored / work_total < _LAP_WORK_ANCHORED:
+        info["reason"] = "too few work steps start and end on a lap boundary"
+        return None, info
+    matched = len(out)
+    if matched < m:
+        info["unmatched_steps"] = [s["name"] for s in segs[matched:]]
+    return out, info
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float | None:
+    n = len(xs)
+    if n < 3:
+        return None
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    syy = sum((y - my) ** 2 for y in ys)
+    if sxx <= 0 or syy <= 0:
+        return None
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys, strict=True))
+    return sxy / math.sqrt(sxx * syy)
+
+
+def best_shift(points: list[dict[str, Any]], segs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Slide the prescription along the recording (time axis only).
+
+    Score = Pearson correlation between the target midpoints and the 5-second
+    mean of Power (Speed when there is no power). The prescription must stay
+    ≥80% inside the recording for a shift to count. Returns None when there
+    is nothing to correlate (flat targets, flat signal, too few samples).
+    """
+    ch = "Power" if any(isinstance(p.get("Power"), (int, float)) for p in points) else "Speed"
+    bins: dict[int, list[float]] = {}
+    for p in points:
+        t, v = p.get("time"), p.get(ch)
+        if isinstance(t, (int, float)) and isinstance(v, (int, float)):
+            bins.setdefault(int(t // _SHIFT_BIN_S), []).append(float(v))
+    act = {k: sum(v) / len(v) for k, v in bins.items()}
+    tgt: dict[int, float] = {}
+    for s in segs:
+        lo, hi = s.get("target_min"), s.get("target_max")
+        if lo is None or hi is None:
+            continue
+        try:
+            mid = (float(lo) + float(hi)) / 2.0
+        except (TypeError, ValueError):
+            continue
+        for k in range(int(s["start"] // _SHIFT_BIN_S), int(math.ceil(s["end"] / _SHIFT_BIN_S))):
+            tgt[k] = mid
+    if len(tgt) < 6 or len(act) < 6:
+        return None
+
+    def corr(sb: int) -> float | None:
+        xs, ys = [], []
+        for k, mid in tgt.items():
+            a = act.get(k + sb)
+            if a is not None:
+                xs.append(mid)
+                ys.append(a)
+        if len(xs) < 0.8 * len(tgt):
+            return None
+        return _pearson(xs, ys)
+
+    c0 = corr(0)
+    lo_b, hi_b = _SHIFT_RANGE_S[0] // _SHIFT_BIN_S, _SHIFT_RANGE_S[1] // _SHIFT_BIN_S
+    top: tuple[float, int] | None = None
+    for sb in sorted(range(lo_b, hi_b + 1), key=abs):
+        c = corr(sb)
+        if c is not None and (top is None or c > top[0] + 1e-9):
+            top = (c, sb)
+    if top is None:
+        return None
+    return {
+        "shift_s": top[1] * _SHIFT_BIN_S,
+        "corr": round(top[0], 3),
+        "corr_unshifted": round(c0, 3) if c0 is not None else None,
+        "channel": ch,
+    }
+
+
+def _shift_is_convincing(sh: dict[str, Any] | None) -> bool:
+    if not sh or abs(sh["shift_s"]) < _SHIFT_MIN_S or sh["corr"] < _SHIFT_MIN_CORR:
+        return False
+    c0 = sh.get("corr_unshifted")
+    return c0 is None or sh["corr"] - c0 >= _SHIFT_MIN_GAIN
+
+
 async def lo_verify_intervals(
     workout_id: str,
     segments: list[dict[str, Any]] | None = None,
-    align: str = "elapsed",
+    align: str = "auto",
     ftp: float | None = None,
     include_rest: bool = False,
 ) -> dict[str, Any]:
@@ -316,16 +652,19 @@ async def lo_verify_intervals(
         segments: optional explicit ``[{name, start_s, end_s, target_min,
             target_max}]``. Omit to derive them from the workout's own
             ``structured_workout``.
-        align: ``elapsed`` (default, no scaling) or ``scale`` (stretch the
-            prescription onto actual elapsed time).
+        align: ``auto`` (default: device laps when they line up with the
+            prescription, else a whole-prescription shift when the power
+            profile clearly says so, else raw elapsed), ``laps``, ``shift``,
+            ``elapsed`` (prescribed boundaries as-is) or ``scale`` (stretch
+            the prescription onto actual elapsed time).
         ftp: FTP/threshold used for the in-range percentage. Omit to skip it.
         include_rest: also report warm-up/rest/cool-down segments.
     """
     from tp_mcp.tools.analyze import tp_analyze_workout
     from tp_mcp.tools.workouts import tp_get_workout
 
-    if align not in ("elapsed", "scale"):
-        return _err("INVALID_ARGS", "align must be 'elapsed' or 'scale'")
+    if align not in _ALIGN_MODES:
+        return _err("INVALID_ARGS", f"align must be one of {', '.join(_ALIGN_MODES)}")
 
     analysis = await tp_analyze_workout(workout_id)
     if analysis.get("isError"):
@@ -367,7 +706,7 @@ async def lo_verify_intervals(
             )
         if sw.get("primaryLengthMetric") == "distance":
             axis = "distance"
-        segs = flatten_structure(structure)
+        segs = flatten_structure(structure, "meter" if axis == "distance" else "second")
         source = "structured_workout"
         if segs:
             planned_total = segs[-1]["end"]
@@ -386,9 +725,41 @@ async def lo_verify_intervals(
     drift_pct = None
     if planned_total:
         drift_pct = round(100.0 * (actual_total / planned_total - 1.0), 1)
-        if align == "scale":
-            factor = actual_total / planned_total
-            segs = [{**s, "start": s["start"] * factor, "end": s["end"] * factor} for s in segs]
+
+    used = align
+    lap_info: dict[str, Any] | None = None
+    shift_info: dict[str, Any] | None = None
+    if align in ("auto", "laps"):
+        if source == "manual":
+            if align == "laps":
+                return _err("INVALID_ARGS",
+                            "align='laps' maps the workout's own structure onto device laps; "
+                            "it cannot be combined with manual segments.")
+            used = "elapsed"
+        else:
+            mapped, lap_info = align_to_laps(segs, device_laps(raw, points, axis), axis)
+            if mapped is not None:
+                segs, used = mapped, "laps"
+            elif align == "laps":
+                return _err(
+                    "LAPS_UNMATCHED",
+                    f"Device laps do not line up with the prescription "
+                    f"({lap_info.get('reason')}). Use align='auto'.",
+                )
+    if used == "auto" or align == "shift":
+        shift_info = best_shift(points, segs) if axis == "time" else None
+        if align == "shift" and not shift_info:
+            return _err("SHIFT_UNAVAILABLE",
+                        "No shift can be scored (distance axis, flat targets or flat signal).")
+        if align == "shift" or _shift_is_convincing(shift_info):
+            off = shift_info["shift_s"]
+            segs = [{**s, "start": s["start"] + off, "end": s["end"] + off} for s in segs]
+            used = "shift"
+        else:
+            used = "elapsed"
+    if align == "scale" and planned_total:
+        factor = actual_total / planned_total
+        segs = [{**s, "start": s["start"] * factor, "end": s["end"] * factor} for s in segs]
 
     rows = []
     for seg in segs:
@@ -403,6 +774,8 @@ async def lo_verify_intervals(
             "start_s" if axis == "time" else "start_m": round(seg["start"], 1),
             "end_s" if axis == "time" else "end_m": round(seg["end"], 1),
         }
+        if seg.get("lap"):
+            row["lap"] = seg["lap"]
         if seg.get("target_min") is not None:
             row["target_pct"] = [seg["target_min"], seg["target_max"]]
             if ftp:
@@ -433,14 +806,32 @@ async def lo_verify_intervals(
         "success": True,
         "workout_id": workout_id,
         "segment_source": source,
-        "align": align,
+        "align": used,
+        "align_requested": align,
         "axis": axis,
         "segments": rows,
         "time_series_points": len(points),
     }
+    if lap_info is not None:
+        out["lap_match"] = lap_info
+        if lap_info.get("unmatched_steps"):
+            out["unmatched_note"] = (
+                "The device laps end before the prescription does — these steps have no "
+                "recording. Check the athlete's comment before calling them skipped."
+            )
+    if used == "laps":
+        out["alignment_note"] = "Segments use the device lap boundaries (lap column)."
+    elif used == "shift" and shift_info:
+        out["shift"] = shift_info
+        out["alignment_note"] = (
+            f"No usable device laps; the whole prescription was shifted "
+            f"{shift_info['shift_s']:+d}s to match the {shift_info['channel']} profile "
+            f"(correlation {shift_info['corr_unshifted']} -> {shift_info['corr']}). "
+            f"A step the athlete lengthened or cut still skews the segments after it."
+        )
     if drift_pct is not None:
         out["drift_pct"] = drift_pct
-        if align == "elapsed" and abs(drift_pct) > _DRIFT_WARN * 100:
+        if used == "elapsed" and abs(drift_pct) > _DRIFT_WARN * 100:
             out["warning"] = (
                 f"Actual elapsed is {drift_pct:+.1f}% vs the prescription, so segment "
                 f"boundaries drift by up to {abs(actual_total - planned_total):.0f}"
@@ -475,9 +866,14 @@ def register_lo_verify(tools: list[Any], handlers: dict[str, Any]) -> None:
             "structured_workout by default, so an athlete who never presses the lap "
             "button can still be verified — this is the tool for 'did the second "
             "25-minute race-power block hold the same watts as the first' (PER-24). "
-            "Reports drift between prescribed and actual elapsed time; pass "
-            "align='scale' when the session ran uniformly long or short, or supply "
-            "`segments` explicitly to check arbitrary windows."
+            "Default align='auto' puts each step on the device lap that matches it "
+            "when the laps line up (a long warm-up no longer shifts every later "
+            "interval), otherwise slides the whole prescription to the offset whose "
+            "power profile fits best, otherwise uses raw elapsed time; the response "
+            "says which (`align`, `lap` per segment, `lap_match`, `shift`). Reports "
+            "drift between prescribed and actual elapsed time; pass align='scale' "
+            "when the session ran uniformly long or short, or supply `segments` "
+            "explicitly to check arbitrary windows."
         ),
         input_schema={
             "type": "object",
@@ -493,11 +889,13 @@ def register_lo_verify(tools: list[Any], handlers: dict[str, Any]) -> None:
                 },
                 "align": {
                     "type": "string",
-                    "enum": ["elapsed", "scale"],
-                    "default": "elapsed",
+                    "enum": list(_ALIGN_MODES),
+                    "default": "auto",
                     "description": (
-                        "elapsed = use prescribed boundaries as-is; scale = stretch them "
-                        "onto actual elapsed time."
+                        "auto = device laps if they line up, else profile shift if "
+                        "convincing, else elapsed; laps = device laps or error; shift = "
+                        "best whole-prescription offset; elapsed = prescribed boundaries "
+                        "as-is; scale = stretch them onto actual elapsed time."
                     ),
                 },
                 "ftp": {
@@ -522,7 +920,7 @@ def register_lo_verify(tools: list[Any], handlers: dict[str, Any]) -> None:
         return await lo_verify_intervals(
             workout_id=a["workout_id"],
             segments=a.get("segments"),
-            align=a.get("align", "elapsed"),
+            align=a.get("align", "auto"),
             ftp=a.get("ftp"),
             include_rest=bool(a.get("include_rest", False)),
         )

@@ -176,3 +176,95 @@ def test_unwrap_result_json_string():
     res = {"structuredContent": {"result": '{"ok": true, "identityType": "C"}'}}
     assert unwrap(res) == {"ok": True, "identityType": "C"}
     assert unwrap({"structuredContent": {"result": "not json"}}) == {"result": "not json"}
+
+
+# ---------------------------------------------------------------------------
+# 2026/10/30：create 沒拿到 classScheduleId 不能報 created；刪課以整週讀回為準
+# ---------------------------------------------------------------------------
+
+
+class NoIdClient(FakeClient):
+    """後端 500：官方工具外層沒有 ok:false／blocking，只是沒有 classScheduleId（程亮 10/23）。"""
+
+    async def call(self, tool, args):
+        if tool == "create_workout" and args.get("dry_run") is False and args["title"] == "技術":
+            self.calls.append((tool, args))
+            return {"ok": True, "data": {"classScheduleId": None}}
+        return await super().call(tool, args)
+
+
+def test_create_week_without_class_schedule_id_is_a_failure(tmp_path):
+    fc = NoIdClient()
+    out = run(lo_sth.lo_sth_create_week(_payload(tmp_path), write=True, client_factory=lambda: fc))
+    rows = out["rows"]
+    assert [r["status"] for r in rows] == ["created", "failed", "not_attempted"]
+    assert rows[1]["error_code"] == "NO_CLASS_SCHEDULE_ID" and "99.5%" in rows[1]["hint"]
+    assert out["error_code"] == "WRITE_INCOMPLETE"
+
+
+class DeleteClient(FakeClient):
+    def __init__(self, delete_response, really_delete=True, **kw):
+        super().__init__(**kw)
+        self.week = {"2026-10-28": [{"classScheduleId": 101240, "title": "閾值間歇", "sportType": "RIDE"},
+                                    {"classScheduleId": 101235, "title": "閾值耐力", "sportType": "SWIM"}],
+                     "2026-10-29": [{"classScheduleId": 101238, "title": "換項跑", "sportType": "RUN"}]}
+        self.delete_response = delete_response
+        self.really_delete = really_delete
+
+    async def call(self, tool, args):
+        if tool == "get_week_schedule":
+            self.calls.append((tool, args))
+            return {"days": [{"date": d, "workouts": list(ws)} for d, ws in self.week.items()]}
+        if tool == "delete_workout":
+            self.calls.append((tool, args))
+            if self.really_delete:
+                cid = int(args["class_schedule_id"])
+                for d in self.week:
+                    self.week[d] = [w for w in self.week[d] if w["classScheduleId"] != cid]
+            return self.delete_response
+        return await super().call(tool, args)
+
+
+_FALSE_NEG = {"ok": False, "deleted": False, "partialWrite": True, "retryable": True,
+              "error": "DELETE_READBACK_NOT_CONFIRMED",
+              "backendReceipt": {"accepted": True, "result": {"classScheduleUpdateOk": True}}}
+
+
+def test_delete_verified_reads_through_the_false_negative(tmp_path, monkeypatch):
+    monkeypatch.setenv("LO_STH_SNAPSHOT_DIR", str(tmp_path / "snaps"))
+    snap = tmp_path / "snaps" / "abc123" / "101240.json"
+    snap.parent.mkdir(parents=True)
+    snap.write_text("{}", encoding="utf-8")
+    fc = DeleteClient(_FALSE_NEG)
+    out = run(lo_sth.lo_sth_delete_verified("abc123", [101240, "101238"], "2026-10-26", "2026-11-01",
+                                            client_factory=lambda: fc))
+    assert out["summary"].startswith("2/2") and "isError" not in out
+    assert all(r["status"] == "deleted" and "假陰性" in r["note"] for r in out["rows"])
+    assert out["days_after"] == {"2026-10-28": ["閾值耐力"]}
+    assert not snap.exists()
+    assert sum(t == "delete_workout" for t, _ in fc.calls) == 2      # never retried
+
+
+def test_delete_verified_refuses_ids_outside_the_window():
+    fc = DeleteClient(_FALSE_NEG)
+    out = run(lo_sth.lo_sth_delete_verified("abc123", [101240, 999], "2026-10-26", "2026-11-01",
+                                            client_factory=lambda: fc))
+    assert out["error_code"] == "NOT_IN_RANGE" and out["missing"] == ["999"]
+    assert not [1 for t, _ in fc.calls if t == "delete_workout"]
+
+
+def test_delete_verified_stops_when_the_platform_rejects():
+    fc = DeleteClient({"ok": False, "code": "NEED_PICK", "candidates": []}, really_delete=False)
+    out = run(lo_sth.lo_sth_delete_verified("abc123", [101240, 101238], "2026-10-26", "2026-11-01",
+                                            client_factory=lambda: fc))
+    assert [r["status"] for r in out["rows"]] == ["still_there", "not_attempted"]
+    assert out["error_code"] == "DELETE_INCOMPLETE" and "raw_head" in out["rows"][0]
+    assert sum(t == "delete_workout" for t, _ in fc.calls) == 1
+
+
+def test_delete_verified_dry_run_lists_targets_only():
+    fc = DeleteClient(_FALSE_NEG)
+    out = run(lo_sth.lo_sth_delete_verified("abc123", [101238], "2026-10-26", "2026-11-01", dry_run=True,
+                                            client_factory=lambda: fc))
+    assert out["targets"] == [{"id": "101238", "date": "2026-10-29", "title": "換項跑", "sport": "RUN"}]
+    assert not [1 for t, _ in fc.calls if t == "delete_workout"]

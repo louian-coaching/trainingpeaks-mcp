@@ -449,6 +449,14 @@ async def lo_sth_create_week(payload_file: str, write: bool = False, readback_sa
                 row["classScheduleId"] = find_key(res, "classScheduleId")
                 row["readbackOk"] = find_key(res, "readbackOk")
                 row["ok"] = is_ok(res)
+                if row["ok"] and not row["classScheduleId"]:
+                    # 2026/10/23 程亮：後端 calc／create 回 HTTP 500，官方工具外層卻沒有
+                    # ok:false／blocking——沒有 classScheduleId 就是沒建成，不能報 created。
+                    row["ok"] = False
+                    row["error_code"] = "NO_CLASS_SCHEDULE_ID"
+                    row["hint"] = ("平台沒回 classScheduleId＝這堂沒建成（後端多半回了 HTTP 500）。已知兩型："
+                                   "①激活 ≥118% 與主段上緣 100% 同堂→上緣改 99.5%；②結構逐段展開 10+ 段→"
+                                   "改 times>1 重複組（文字仍可逐段列）。改完再跑一次 write=true，已建的課會自動跳過。")
                 row["status"] = "created" if row["ok"] else "failed"
                 if row["classScheduleId"]:
                     w["_classScheduleId"] = row["classScheduleId"]
@@ -669,12 +677,98 @@ async def lo_sth_reorder_week(payload_file: str, retry_wait_s: int = 20, retries
 # ---------------------------------------------------------------------------
 # 註冊
 # ---------------------------------------------------------------------------
-LO_STH_TOOLS = ("lo_sth_call", "lo_sth_calc_loads", "lo_sth_create_week", "lo_sth_reorder_week", "lo_sth_finish_week")
+LO_STH_TOOLS = ("lo_sth_call", "lo_sth_calc_loads", "lo_sth_create_week", "lo_sth_reorder_week", "lo_sth_finish_week",
+                "lo_sth_delete_verified")
 
 _PF = {"type": "string", "description": (
     "Absolute path ON THE COACH'S MAC to the week payload JSON: "
     '{"tri_user_id":"…","workouts":[{"classes_date":"YYYY-MM-DD","sport_type":"RUN|RIDE|SWIM|STRENGTH|REST",'
     '"title":"…","duration_min":60,"distance":0,"classes_json":{…sth_build.py output…}}]}')}
+
+
+# ---------------------------------------------------------------------------
+# 刪課＋整週讀回確認（2026/10/30 教練選單裁示）
+# ---------------------------------------------------------------------------
+# 官方 delete_workout 刪成功也常回 ok:false＋DELETE_READBACK_NOT_CONFIRMED（回讀端點對已不存在
+# 的課回 BAD_RESPONSE，MCP-GAP-…642baf6de6）。每次都要手動 get_week_schedule 確認，而且 retryable:true
+# 會誘導重試——重試若改用標題＋日期定位，移課情境會刪到同名新課。這支把「刪→整週讀回」綁在一起，
+# 以讀回為準回報，永不重試。
+async def lo_sth_delete_verified(tri_user_id: str, class_schedule_ids: list[Any], date_from: str, date_to: str,
+                                 dry_run: bool = False, id_param: str = "class_schedule_id",
+                                 extra_args: dict[str, Any] | None = None,
+                                 client_factory=_default_factory) -> dict[str, Any]:
+    from tp_mcp.tools.lo_sth_ext import iter_week, snap_root
+
+    ids = [str(i) for i in (class_schedule_ids or []) if str(i).strip()]
+    if not ids:
+        return {"isError": True, "error_code": "INVALID_ARGS", "message": "class_schedule_ids 不可為空"}
+    wk_args = {"date_from": date_from, "date_to": date_to, "tri_user_id": tri_user_id}
+    out: dict[str, Any] = {"tri_user_id": tri_user_id, "range": [date_from, date_to],
+                           "mode": "dry_run" if dry_run else "write"}
+    async with client_factory() as cli:
+        out["identity"] = await _ensure_coach(cli)
+        before = await cli.call("get_week_schedule", wk_args)
+        listed = {str(w.get("classScheduleId")): (d, w) for d, w in iter_week(before)}
+        missing = [i for i in ids if i not in listed]
+        if missing:
+            out.update({"isError": True, "error_code": "NOT_IN_RANGE", "missing": missing,
+                        "message": "這些課不在讀回的區間裡——一堂都沒刪。先確認 classScheduleId 與日期範圍。"})
+            return out
+        targets = [{"id": i, "date": listed[i][0], "title": listed[i][1].get("title"),
+                    "sport": listed[i][1].get("sportType")} for i in ids]
+        if dry_run:
+            out["targets"] = targets
+            return out
+        rows, stop = [], False
+        for t in targets:
+            row = dict(t)
+            if stop:
+                row["status"] = "not_attempted"
+                rows.append(row)
+                continue
+            res = await cli.call("delete_workout", {"tri_user_id": tri_user_id, id_param: t["id"],
+                                                    **(extra_args or {})})
+            receipt = find_key(res, "backendReceipt")
+            accepted = isinstance(receipt, dict) and bool(receipt.get("accepted"))
+            update_ok = find_key(res, "classScheduleUpdateOk")
+            row.update({"platform_ok": res.get("ok"), "backend_accepted": accepted,
+                        "classScheduleUpdateOk": update_ok,
+                        "platform_code": find_key(res, "code") or find_key(res, "errorCode")})
+            if not (accepted or update_ok or is_ok(res)):
+                # 平台根本沒收（參數錯、NEED_PICK、權限）→ 停，不連續打錯
+                row["raw_head"] = json.dumps(res, ensure_ascii=False)[:400]
+                stop = True
+            rows.append(row)
+        after = await cli.call("get_week_schedule", wk_args)
+        remaining = {str(w.get("classScheduleId")) for _, w in iter_week(after)}
+        for row in rows:
+            if row.get("status") == "not_attempted":
+                continue
+            gone = row["id"] not in remaining
+            row["status"] = "deleted" if gone else "still_there"
+            if gone and row.get("platform_ok") is False:
+                row["note"] = "平台回 ok:false 但整週讀回已不見＝已知回讀假陰性，已刪"
+        if any(r["status"] == "deleted" for r in rows):
+            try:
+                for r in rows:
+                    if r["status"] == "deleted":
+                        f = snap_root() / tri_user_id / f"{r['id']}.json"
+                        if f.exists():
+                            f.unlink()  # 自己刪的課不留在快照，lo_sth_diff_week 才不會當成教練刪的
+            except OSError:
+                pass
+        days = {}
+        for d, w in iter_week(after):
+            if any(d == t["date"] for t in targets):
+                days.setdefault(d, []).append(w.get("title"))
+        out["rows"] = rows
+        out["days_after"] = days
+    n_del = sum(r["status"] == "deleted" for r in rows)
+    out["summary"] = f"{n_del}/{len(ids)} 堂已從整週讀回消失"
+    if n_del != len(ids):
+        out.update({"isError": True, "error_code": "DELETE_INCOMPLETE",
+                    "message": "有課沒刪掉或沒嘗試；⛔ 不要直接重送，先看 rows 的 raw_head／still_there"})
+    return out
 
 
 def register_lo_sth(tools: list[Any], handlers: dict[str, Any]) -> None:
@@ -744,6 +838,27 @@ def register_lo_sth(tools: list[Any], handlers: dict[str, Any]) -> None:
                                                             readback_save_to=a.get("readback_save_to"),
                                                             time_budget_s=int(a.get("time_budget_s", 45)))
 
+    tools.append(Tool(name="lo_sth_delete_verified", description=(
+        "StrongTri 刪課＋整週讀回確認：先讀 get_week_schedule 確認每個 classScheduleId 都在 [date_from, date_to]（有一個不在就一堂都不刪），"
+        "逐堂 delete_workout（平台沒收就停），再整週讀回——以讀回為準回 deleted／still_there，"
+        "官方的 ok:false＋DELETE_READBACK_NOT_CONFIRMED 假陰性自動判讀、永不重試；自己刪的課同步移出 lo_sth_diff_week 快照。"
+        "dry_run=true 只列目標。刪課前仍須教練同意。"),
+        input_schema={"type": "object", "properties": {
+            "tri_user_id": {"type": "string"},
+            "class_schedule_ids": {"type": "array", "items": {"type": ["string", "integer"]}},
+            "date_from": {"type": "string", "description": "YYYY-MM-DD（讀回區間，要涵蓋所有目標課）"},
+            "date_to": {"type": "string", "description": "YYYY-MM-DD"},
+            "dry_run": {"type": "boolean", "default": False},
+            "id_param": {"type": "string", "default": "class_schedule_id",
+                         "description": "delete_workout 的 ID 參數名（平台改名時才需要）"},
+            "extra_args": {"type": "object", "description": "平台要求的額外參數（例如確認旗標），原樣併入 delete_workout"}},
+            "required": ["tri_user_id", "class_schedule_ids", "date_from", "date_to"]}))
+
+    async def _h_delete(a): return await lo_sth_delete_verified(a["tri_user_id"], a["class_schedule_ids"], a["date_from"],
+                                                                a["date_to"], dry_run=bool(a.get("dry_run", False)),
+                                                                id_param=a.get("id_param") or "class_schedule_id",
+                                                                extra_args=a.get("extra_args"))
+    handlers["lo_sth_delete_verified"] = _h_delete
     handlers.update({"lo_sth_call": _h_call, "lo_sth_calc_loads": _h_calc,
                      "lo_sth_create_week": _h_create, "lo_sth_reorder_week": _h_reorder,
                      "lo_sth_finish_week": _h_finish})

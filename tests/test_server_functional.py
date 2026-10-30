@@ -76,6 +76,7 @@ class TestListTools:
             "lo_sth_diff_week",
             "lo_sth_verify_intervals",
             "lo_sth_finish_week",
+            "lo_sth_delete_verified",
             "tp_update_workout",
             "tp_delete_workout",
             "tp_copy_workout",
