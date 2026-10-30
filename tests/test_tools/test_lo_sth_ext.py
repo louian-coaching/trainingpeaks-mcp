@@ -446,3 +446,20 @@ def test_prep_week_swim_completion_is_metres_not_time(tmp_path):
 def test_reps_marker_allows_lianxu():
     from tp_mcp.tools.lo_review import planned_distance_m
     assert planned_distance_m("- 25公尺衝刺+75公尺慢游, 連續5組") == 500
+
+
+# ---------- VAR-05 游泳課型輪替（2026/10/30）----------
+def test_swim_rotation_check_flags_repeat_and_not_rotated():
+    def wk(items):
+        return {"days": [{"date": d, "workouts": [{"title": t, "sportType": "SWIM"}]} for d, t in items]}
+    prev = wk([("2026-09-15", "有氧耐力"), ("2026-09-18", "技術＋有氧耐力")])
+    this = wk([("2026-09-22", "技術＋有氧耐力"), ("2026-09-24", "閾值耐力"), ("2026-09-26", "閾值間歇")])
+    out = lo_sth.swim_rotation_check(prev, this, {"2026-09-22", "2026-09-24", "2026-09-26"})
+    codes = [w["code"] for w in out["warnings"]]
+    assert "SWIM_TYPE_REPEAT" in codes and "SWIM_QUALITY_ADJACENT" in codes
+    # 有氧接有氧放行；兩期非質量都只有有氧＝課型沒輪替
+    prev2 = wk([("2026-09-15", "有氧耐力"), ("2026-09-17", "有氧耐力")])
+    this2 = wk([("2026-09-22", "有氧耐力"), ("2026-09-24", "速度間歇"), ("2026-09-26", "賽道試游")])
+    out2 = lo_sth.swim_rotation_check(prev2, this2, {"2026-09-22", "2026-09-24", "2026-09-26"})
+    assert [w["code"] for w in out2["warnings"]] == ["SWIM_TYPE_NOT_ROTATED"]
+    assert lo_sth.swim_family("賽道試游") is None and lo_sth.swim_family("CSS 測驗課") == "test"

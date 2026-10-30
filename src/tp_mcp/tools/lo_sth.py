@@ -491,6 +491,62 @@ async def lo_sth_create_week(payload_file: str, write: bool = False, readback_sa
     return out
 
 
+# ---------------------------------------------------------------------------
+# VAR-05 游泳課型輪替檢查（2026/10/30 教練裁示：補進 lo_sth_finish_week）
+# ---------------------------------------------------------------------------
+_SWIM_SKIP = ("賽道試游", "團練", "長訓")
+_SWIM_FAMILY = (("測驗", "test"), ("閾值", "threshold"), ("CSS", "threshold"), ("比賽強度", "race"),
+                ("Taper", "race"), ("速度", "speed"), ("力量間歇", "strength_int"), ("力量耐力", "strength_end"),
+                ("開放水域", "open_water"), ("技術", "technique"), ("恢復", "recovery"), ("有氧", "aerobic"))
+_SWIM_QUALITY = {"threshold", "race", "speed", "strength_int", "test"}
+
+
+def swim_family(title: str | None) -> str | None:
+    t = title or ""
+    if any(k in t for k in _SWIM_SKIP):
+        return None
+    for key, fam in _SWIM_FAMILY:
+        if key in t:
+            return fam
+    return "other"
+
+
+def swim_rotation_check(prev_wk: Any, this_wk: Any, this_dates: set[str]) -> dict[str, Any]:
+    """VAR-05：①相鄰兩堂游泳（含上一期最後一堂）同為非有氧、非質量的同一課型＝WARN（09/19 事故：技術接技術）
+    ②相鄰兩堂都是同一個質量課型＝WARN（SWIM-61 精神）③本週與上一期的非質量游泳全是有氧耐力＝WARN（課型沒輪替）。
+    只回報、不擋；有氧接有氧照常放行。"""
+    from tp_mcp.tools.lo_sth_ext import iter_week as _iw
+    seq: list[dict[str, Any]] = []
+    for src in (prev_wk, this_wk):
+        for d, w in _iw(src or {}):
+            if _sport_key(w.get("sportType")) != "SWIM":
+                continue
+            fam = swim_family(w.get("title"))
+            if fam is None:
+                continue
+            seq.append({"date": d, "title": w.get("title"), "family": fam, "this_week": d in this_dates})
+    seen, uniq = set(), []
+    for x in sorted(seq, key=lambda x: x["date"]):
+        k = (x["date"], x["title"])
+        if k not in seen:
+            seen.add(k)
+            uniq.append(x)
+    warns: list[dict[str, Any]] = []
+    for a, b in zip(uniq, uniq[1:]):
+        if not b["this_week"] or a["family"] != b["family"]:
+            continue
+        if a["family"] == "aerobic":
+            continue
+        code = "SWIM_QUALITY_ADJACENT" if a["family"] in _SWIM_QUALITY else "SWIM_TYPE_REPEAT"
+        warns.append({"code": code, "family": a["family"], "pair": [f"{a['date']} {a['title']}", f"{b['date']} {b['title']}"]})
+    nonq_this = [x["family"] for x in uniq if x["this_week"] and x["family"] not in _SWIM_QUALITY]
+    nonq_prev = [x["family"] for x in uniq if not x["this_week"] and x["family"] not in _SWIM_QUALITY]
+    if nonq_this and nonq_prev and set(nonq_this) == {"aerobic"} and set(nonq_prev) == {"aerobic"}:
+        warns.append({"code": "SWIM_TYPE_NOT_ROTATED", "family": "aerobic",
+                      "note": "本週與上一期的非質量游泳都只有有氧耐力（VAR-05：課型也輪替）"})
+    return {"sessions": [f"{x['date']} {x['title']}（{x['family']}）" for x in uniq], "warnings": warns}
+
+
 async def lo_sth_finish_week(payload_file: str, band: list[int] | None = None, band_sports: list[str] | None = None,
                              readback_save_to: str | None = None, client_factory=_default_factory,
                              sleep=asyncio.sleep, time_budget_s: int = 45, retry_wait_s: int = 15) -> dict[str, Any]:
@@ -509,6 +565,14 @@ async def lo_sth_finish_week(payload_file: str, band: list[int] | None = None, b
         v = await cli.call("validate_schedule_week", {"tri_user_id": p["tri_user_id"], "date": dates[0]})
         wk2 = await cli.call("get_week_schedule", {"date_from": dates[0], "date_to": dates[-1],
                                                    "tri_user_id": p["tri_user_id"]})
+        try:
+            import datetime as _dt
+            _d0 = _dt.date.fromisoformat(dates[0])
+            prev = await cli.call("get_week_schedule", {
+                "date_from": (_d0 - _dt.timedelta(days=14)).isoformat(),
+                "date_to": (_d0 - _dt.timedelta(days=1)).isoformat(), "tri_user_id": p["tri_user_id"]})
+        except Exception:  # noqa: BLE001 — 輪替檢查失敗不擋收尾
+            prev = None
     if readback_save_to:
         out["readback_saved_to"] = _dump(readback_save_to, wk2)
     issues = [i for i in (v.get("issues") or []) if i.get("severity") not in ("info",)]
@@ -525,6 +589,8 @@ async def lo_sth_finish_week(payload_file: str, band: list[int] | None = None, b
     out["week_stl_by_sport"] = by
     if band:
         out["band"] = band_check(by, band, band_sports)
+    if "SWIM" in by:
+        out["swim_rotation"] = swim_rotation_check(prev, wk2, set(dates))
     return out
 
 
