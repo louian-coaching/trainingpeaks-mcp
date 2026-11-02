@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from tp_mcp.client.context import athlete_override
+from tp_mcp.tools import lo_capability_ext as ext
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,112 @@ async def summary_totals(workout_id: str) -> dict[str, Any]:
     if err:
         return err
     data = (body or {}).get("data") or {}
-    return {(m.get("friendlyName") or k): m.get("value") for k, m in data.items() if isinstance(m, dict)}
+    out = {(m.get("friendlyName") or k): m.get("value") for k, m in data.items() if isinstance(m, dict)}
+    out["_start"] = (body or {}).get("startTimestamp")      # UTC, for PER-79b weather (11/02)
+    return out
+
+
+async def session_max_hr(workout_id: str) -> float | None:
+    """PROC-84g gate 1: the session's peak HR from TP's lap table (one light request,
+    no time series)."""
+    import httpx
+
+    from tp_mcp.client import TPClient
+    from tp_mcp.tools.analyze import _LAPS_PATH, ANALYSIS_TIMEOUT, _post_analysis
+
+    async with TPClient() as client:
+        if not await client.ensure_athlete_id():
+            return None
+        tok = await client._ensure_access_token()
+        if not tok.success or not client._token_cache.access_token:
+            return None
+        headers = {
+            "Authorization": f"Bearer {client._token_cache.access_token}",
+            "Accept": "application/json", "Content-Type": "application/json",
+            "Origin": "https://app.trainingpeaks.com", "Referer": "https://app.trainingpeaks.com/",
+        }
+        async with httpx.AsyncClient(timeout=ANALYSIS_TIMEOUT) as http:
+            body, err = await _post_analysis(http, _LAPS_PATH, headers, int(workout_id))
+    if err:
+        return None
+    vals = [_num(lap.get("MaximumHeartRate")) for lap in (body or {}).get("data") or [] if isinstance(lap, dict)]
+    vals = [v for v in vals if v and v > 0]
+    return max(vals) if vals else None
+
+
+async def workout_rpe(workout_id: str) -> float | None:
+    """PROC-84g gate 2: TP's RPE field of a completed workout (None when not filled)."""
+    from tp_mcp.tools.workouts import tp_get_workout
+
+    d = await tp_get_workout(str(workout_id))
+    return None if not isinstance(d, dict) or d.get("isError") else _num(d.get("rpe"))
+
+
+async def mean_temp_c(workout_id: str, athlete: str | None) -> float | None:
+    """PROC-85g: mean air temperature of the session that set a power peak (None = indoor / unknown)."""
+    from tp_mcp.tools.lo_weather import lo_weather_history
+
+    try:
+        r = await lo_weather_history(str(workout_id), athlete=athlete, log=False)
+    except Exception:  # noqa: BLE001 — a weather failure must not cost the scan
+        return None
+    if not isinstance(r, dict) or r.get("isError") or not r.get("outdoor"):
+        return None
+    return _num(((r.get("summary") or {}).get("temp_c") or {}).get("mean"))
+
+
+async def wellness_daily(start: str, end: str) -> list[dict[str, Any]]:
+    """PER-79c: TP daily metrics (resting HR = Pulse, HRV) — empty when the athlete syncs none."""
+    from tp_mcp.tools.metrics import tp_get_metrics
+
+    r = await tp_get_metrics(start_date=start, end_date=end)
+    return [] if not isinstance(r, dict) or r.get("isError") else list(r.get("daily") or [])
+
+
+async def easy_run_weather(athlete_keys: list[str], runs: list[dict[str, Any]]) -> dict[str, str]:
+    """PER-79b: {workout_id: why excluded} for hot (WBGT ≥23) / cold (≤5 °C) easy runs, from the
+    athlete's training location (training-locations.json) at the run's mid-time. Runs with no
+    start time or athletes with no coordinates are left in (and said so by the caller)."""
+    import httpx
+
+    from tp_mcp.tools import lo_weather as lw
+    from tp_mcp.tools.lo_forecast import load_locations, resolve
+
+    table = load_locations()
+    loc = None
+    for k in athlete_keys:
+        if k and (hit := resolve(str(k), table)):
+            loc = hit[1]
+            break
+    lat, lon = _num((loc or {}).get("lat")), _num((loc or {}).get("lon"))
+    if lat is None or lon is None:
+        return {}
+    out: dict[str, str] = {}
+    cache: dict[str, dict[str, Any]] = {}
+    async with httpx.AsyncClient(timeout=lw.TIMEOUT_S) as http:
+        for r in runs:
+            st = lw.parse_utc(r.get("start_utc"))
+            if not st:
+                continue
+            mid = st + dt.timedelta(minutes=(r.get("duration_min") or 0) / 2)
+            day = mid.date()
+            key = day.isoformat()
+            try:
+                if key not in cache:
+                    cache[key] = await lw._fetch(http, lw.build_url(lat, lon, day, lw.pick_endpoint(day)))
+                resp = cache[key]
+                row = lw.interpolate(resp.get("hourly") or {}, int(resp.get("utc_offset_seconds") or 0), mid)
+            except Exception:  # noqa: BLE001
+                continue
+            t, rh = row.get("temperature_2m"), row.get("relative_humidity_2m")
+            if t is None or rh is None:
+                continue
+            wb = lw.wbgt_shade_est(t, rh)
+            if lw.heat_level(wb) in ("熱", "高熱"):
+                out[str(r.get("workout_id"))] = f"熱（WBGT 約 {wb:.0f}）"
+            elif t <= lw.COLD_MEAN_C:
+                out[str(r.get("workout_id"))] = f"冷（{t:.0f}°C）"
+    return out
 
 
 def _session_row(w: dict[str, Any], totals: dict[str, Any]) -> dict[str, Any]:
@@ -119,6 +225,11 @@ def _session_row(w: dict[str, Any], totals: dict[str, Any]) -> dict[str, Any]:
         "if": _num(totals.get("IF")) or _num(totals.get("rIF")),
         "vi": _num(totals.get("VI")),
         "pause_s": round(elapsed - moving) if elapsed and moving else None,
+        "avg_hr": _num(totals.get("Avg heart rate")),
+        "np": _num(totals.get("NP")),
+        "gain_m": _num(totals.get("El. Gain")),
+        "distance_km": dist_km,
+        "start_utc": totals.get("_start"),
     }
     if sport == "Run" and dist_km and moving:
         row["avg_speed_ms"] = round(dist_km * 1000 / moving, 3)
@@ -160,8 +271,23 @@ def assess_sport(sport: str, rows: list[dict[str, Any]], window_start: str, heat
     prev = older[0] if older else None
     out["latest"] = latest
     if prev:
-        out["previous"] = {k: prev[k] for k in ("workout_id", "date", "title", "decoupling_pct", "ef")}
-    out["decoupling_verdict"] = decoupling_verdict(latest["decoupling_pct"], prev and prev["decoupling_pct"])
+        out["previous"] = {k: prev.get(k) for k in ("workout_id", "date", "title", "decoupling_pct", "ef")}
+    # PROC-84h (11/02): the 加長判準 reads the front part (first 10 min out, stops out,
+    # 前 2 小時 only) when the time series was segmented; TP's whole-file value otherwise.
+    d_latest, basis = ext.effective_decoupling(latest)
+    d_prev = ext.effective_decoupling(prev)[0] if prev else None
+    out["decoupling_used"], out["decoupling_basis"] = d_latest, basis
+    out["decoupling_verdict"] = decoupling_verdict(d_latest, d_prev)
+    back = (latest.get("seg") or {}).get("back") or {}
+    if back.get("durability_pct") is not None:
+        prev_back = next(((r.get("seg") or {}).get("back") for r in older
+                          if ((r.get("seg") or {}).get("back") or {}).get("durability_pct") is not None), None)
+        pb = (prev_back or {}).get("durability_pct")
+        out["durability"] = {"latest_pct": back["durability_pct"], "previous_pct": pb,
+                             "weak": back["durability_pct"] > ext.DURABILITY_WEAK_PCT
+                             and pb is not None and pb > ext.DURABILITY_WEAK_PCT}
+    if back.get("drift_into_heavy"):
+        out["drift_into_heavy"] = {"avg_hr": back.get("avg_hr"), "vt1_hr": back.get("vt1_hr")}
     base = [r["ef"] for r in older if r.get("ef")]
     if latest.get("ef") and len(base) >= 2:
         mean = sum(base) / len(base)
@@ -201,27 +327,43 @@ def _zone_threshold(settings: dict[str, Any], key: str, wtid: int) -> dict[str, 
     return None
 
 
-async def _peaks(ftp: float | None) -> dict[str, Any]:
+async def _peaks(ftp: float | None, athlete: str | None = None) -> dict[str, Any]:
+    """PROC-85g (11/02): three tiers instead of ×1.03; peaks set in sessions averaging
+    <5 °C or >30 °C are skipped; the 2nd-best 20-min peak from another session is the
+    automatic second source (a 基準測驗 or a ≥12-min hard session is the manual one)."""
     from tp_mcp.tools.peaks import tp_get_peaks
 
     out: dict[str, Any] = {}
     res = await tp_get_peaks(sport="Bike", pr_type="power20min", days=90)
-    recs = (res or {}).get("records") or []
-    if recs:
-        best = recs[0]
+    recs = [r for r in (res or {}).get("records") or [] if _num(r.get("value"))]
+    usable, skipped = [], []
+    for r in recs[:4]:
+        t = await mean_temp_c(str(r.get("workout_id")), athlete) if r.get("workout_id") else None
+        if t is not None and (t < ext.PEAK_TEMP_LO_C or t > ext.PEAK_TEMP_HI_C):
+            skipped.append({"w": _num(r.get("value")), "date": r.get("date"), "temp_c": round(t, 1)})
+            continue
+        usable.append(r)
+    if skipped:
+        out["skipped_by_temp"] = skipped
+    if usable:
+        best = usable[0]
         v = _num(best.get("value"))
         out["bike_20min_best"] = {"w": v, "date": best.get("date"), "workout_id": best.get("workout_id")}
+        second = next((r for r in usable[1:] if str(r.get("workout_id")) != str(best.get("workout_id"))), None)
+        if second:
+            out["bike_20min_second"] = {"w": _num(second.get("value")), "date": second.get("date")}
         if v and ftp:
-            out["bike_20min_x095"] = round(v * 0.95)
-            out["ftp_x103"] = round(ftp * 1.03)
-            out["ftp_maybe_low"] = v * 0.95 >= ftp * 1.03
+            tier = ext.ftp_tier(v, ftp, _num((second or {}).get("value")))
+            out["ftp_tier"] = tier
+            out["bike_20min_x095"] = tier.get("x095")
+            out["ftp_maybe_low"] = bool(tier.get("report"))
     for pr in ("speed5K", "speed10K"):
         r = await tp_get_peaks(sport="Run", pr_type=pr, days=90)
-        recs = (r or {}).get("records") or []
-        if recs:
-            out[f"run_{pr}_best"] = {"value": recs[0].get("value"), "date": recs[0].get("date")}
+        rr = (r or {}).get("records") or []
+        if rr:
+            out[f"run_{pr}_best"] = {"value": rr[0].get("value"), "date": rr[0].get("date")}
     if any(k.startswith("run_") for k in out):
-        out["run_note"] = "跑步只列近 90 天最佳，對應閾值配速由教練判讀（8g ④）"
+        out["run_note"] = "跑步只列近 90 天最佳，對應閾值配速由教練判讀（8g ④，三級門檻同 PROC-85g）"
     return out
 
 
@@ -232,7 +374,8 @@ def _base(title: str | None) -> str:
 
 async def _progress_layer(requested: str, ident: dict[str, Any], ws: list[dict[str, Any]],
                           picks: dict[str, list[dict[str, Any]]], metrics: Any, window_start: str, end: str,
-                          *, ledger: bool, swim: bool, weather: str, max_swims: int) -> dict[str, Any]:
+                          *, ledger: bool, swim: bool, weather: str, max_swims: int,
+                          segments: bool = True, zones: dict[str, tuple[Any, Any]] | None = None) -> dict[str, Any]:
     """PROC-84d ledger + PROC-93 weather on steady sessions + SWIM-91 swims + PROC-37b baselines.
     Each session is analysed once in its life: anything already in the ledger is reused."""
     from tp_mcp.tools import lo_progress as lp
@@ -243,12 +386,16 @@ async def _progress_layer(requested: str, ident: dict[str, Any], ws: list[dict[s
     hist = lp.read_ledger(aid) if ledger else []
     by_id = {str(r.get("workout_id")): r for r in hist}
     new: list[dict[str, Any]] = []
-    out: dict[str, Any] = {"_hot_ids": set(), "weather": [], "baselines": [], "swims": []}
+    out: dict[str, Any] = {"_hot_ids": set(), "_segs": {}, "weather": [], "baselines": [], "swims": []}
     base_rec = {"athlete_id": aid, "athlete": str(ident.get("athlete_name") or requested)}
 
     async def analyse(wid: str) -> dict[str, Any] | None:
         a = await tp_analyze_workout(wid)
         return None if a.get("isError") else a
+
+    def segment(an: dict[str, Any], sport: str) -> dict[str, Any]:
+        vt1, z2 = (zones or {}).get(sport) or (None, None)
+        return ext.segment_decoupling(lp._points(an), sport, vt1_hr=vt1, z2_upper=z2)
 
     # 1) steady sessions: weather + ledger
     for sport in ("Bike", "Run"):
@@ -257,22 +404,31 @@ async def _progress_layer(requested: str, ident: dict[str, Any], ws: list[dict[s
             row = await metrics(w)
             old = by_id.get(wid)
             wx = (old or {}).get("weather")
-            if old is None and str(w.get("date"))[:10] >= window_start:
-                if weather == "auto":
-                    an = await analyse(wid)
-                    if an:
-                        wb = await weather_brief(wid, an, athlete=requested)
-                        wx = {k: wb.get(k) for k in ("outdoor", "heat_level", "cold_level", "humid", "wbgt_max", "dew_mean",
-                                                       "correct_interpretation", "verdict") if k in wb}
+            seg = (old or {}).get("seg")
+            in_win = str(w.get("date"))[:10] >= window_start
+            if old is None and in_win:
+                an = await analyse(wid) if (weather == "auto" or segments) else None
+                if segments and an:
+                    seg = segment(an, sport)
+                if weather == "auto" and an:
+                    wb = await weather_brief(wid, an, athlete=requested)
+                    wx = {k: wb.get(k) for k in ("outdoor", "heat_level", "cold_level", "humid", "wbgt_max", "dew_mean",
+                                                   "correct_interpretation", "verdict") if k in wb}
                 rec = {**base_rec, "workout_id": wid, "date": row.get("date"), "sport": sport, "kind": "steady",
                        "title": row.get("title"), "duration_min": row.get("duration_min"),
                        "decoupling_pct": row.get("decoupling_pct"), "ef": row.get("ef"), "if": row.get("if"),
-                       "avg_speed_ms": row.get("avg_speed_ms"), "weather": wx, "logged": end}
+                       "avg_speed_ms": row.get("avg_speed_ms"), "weather": wx, "seg": seg, "logged": end}
                 new.append(rec)
                 if wx:
                     out["weather"].append({"date": row.get("date"), "sport": sport, "title": row.get("title"),
                                            "verdict": wx.get("verdict"),
                                            "correct_interpretation": wx.get("correct_interpretation")})
+            elif segments and in_win and seg is None:      # logged before PROC-84h (11/02)
+                an = await analyse(wid)
+                if an:
+                    seg = segment(an, sport)
+            if seg:
+                out["_segs"][wid] = seg
             if (wx or {}).get("correct_interpretation"):
                 out["_hot_ids"].add(wid)
 
@@ -325,13 +481,15 @@ async def _progress_layer(requested: str, ident: dict[str, Any], ws: list[dict[s
     if ledger and new:
         out["ledger"] = lp.append_ledger(new)
     out["logged"] = len(new) if ledger else 0
-    return {k: v for k, v in out.items() if v or k == "_hot_ids"}
+    return {k: v for k, v in out.items() if v or k in ("_hot_ids", "_segs")}
 
 
 async def _one(requested: str, *, end: str, window_days: int, history_days: int, max_per_sport: int,
                heat_c: float, bike_if_max: float, ef_up_pct: float, peaks: str,
                save_dir: Path | None, ledger: bool = True, swim: bool = True,
-               weather: str = "auto", max_swims: int = 6) -> dict[str, Any]:
+               weather: str = "auto", max_swims: int = 6, segments: bool = True, gates: bool = True,
+               easy_index: bool = True, wellness: bool = True,
+               power_runners: list[str] | None = None) -> dict[str, Any]:
     from tp_mcp.tools.lo_review import athlete_identity
     from tp_mcp.tools.settings import tp_get_athlete_settings
     from tp_mcp.tools.workouts import tp_get_workouts
@@ -375,12 +533,30 @@ async def _one(requested: str, *, end: str, window_days: int, history_days: int,
             return cache[wid]
 
         result: dict[str, Any] = {}
+        zones: dict[str, tuple[Any, Any]] = {}
+        for sport, zkey, wtid in (("Bike", "powerZones", 2), ("Run", "speedZones", 3)):
+            lthr = _num((_zone_threshold(settings, "heartRateZones", wtid) or {}).get("threshold"))
+            zs = ((_zone_threshold(settings, zkey, wtid) or (_zone_threshold(settings, zkey, 0) if sport == "Bike"
+                                                             else None) or {}).get("zones") or [])
+            z2u = _num(zs[1].get("maximum")) if len(zs) > 1 and isinstance(zs[1], dict) else None
+            zones[sport] = (lthr * ext.VT1_FROM_LTHR if lthr else None, z2u)
         prog = await _progress_layer(requested, ident, ws, picks, metrics, window_start, end,
-                                     ledger=ledger, swim=swim, weather=weather, max_swims=max_swims)
+                                     ledger=ledger, swim=swim, weather=weather, max_swims=max_swims,
+                                     segments=segments, zones=zones)
         hot_ids = prog.pop("_hot_ids", set())
+        segs = prog.pop("_segs", {})
         for sport in ("Bike", "Run"):
             rows = [await metrics(w) for w in picks[sport]]
+            for r in rows:
+                if r.get("workout_id") in segs:
+                    r["seg"] = segs[r["workout_id"]]
             result[sport.lower()] = assess_sport(sport, rows, window_start, heat_c, ef_up_pct, hot_ids=hot_ids)
+            a = result[sport.lower()]
+            if gates and a.get("ef_up"):
+                try:
+                    a["ef_gates"] = await _ef_gates(sport, ws, window_start, a, picks[sport], metrics)
+                except Exception as e:  # noqa: BLE001
+                    a["ef_gates"] = {"rule": "PROC-84g", "pass": None, "verdict": f"兩關檢查失敗（{e}），人工判"}
         if prog:
             result["progress"] = prog
         bike_easy = [await metrics(w) for w in easy_picks["Bike"]]
@@ -393,10 +569,24 @@ async def _one(requested: str, *, end: str, window_days: int, history_days: int,
         ftp = _num(bike_set.get("threshold"))
         result["thresholds"] = {"bike_ftp": ftp, "run_threshold_ms": _num(run_set.get("threshold")),
                                 "run_z2_upper_ms": z2}
-        ef_up = any((result.get(s) or {}).get("ef_up") for s in ("bike", "run"))
+        # PROC-84g: an EF rise that failed a gate is fatigue, not a reason to look at peaks
+        ef_up = any((result.get(s) or {}).get("ef_up") and ((result.get(s) or {}).get("ef_gates") or {}).get("pass")
+                    is not False for s in ("bike", "run"))
         if peaks == "always" or (peaks == "auto" and ef_up):
-            result["peaks"] = await _peaks(ftp)
-            result["peaks"]["trigger"] = "always" if peaks == "always" else "EF 升 >3%"
+            result["peaks"] = await _peaks(ftp, requested)
+            result["peaks"]["trigger"] = "always" if peaks == "always" else "EF 升 >3%（PROC-84g 未擋）"
+        keys = [requested, str(ident.get("athlete_name") or ""), str(ident.get("athlete_id") or "")]
+        if easy_index:
+            try:
+                result["easy_run"] = await _easy_runs(ws, end, metrics, keys, power_runners or [])
+            except Exception as e:  # noqa: BLE001
+                result["easy_run"] = {"rule": "PER-79b", "verdict": f"計算失敗（{e}）", "abnormal": None}
+        if wellness:
+            try:
+                start_w = (dt.date.fromisoformat(end) - dt.timedelta(days=34)).isoformat()
+                result["wellness"] = ext.wellness_signal(await wellness_daily(start_w, end), end)
+            except Exception as e:  # noqa: BLE001
+                result["wellness"] = {"rule": "PER-79c", "flags": [], "note": f"讀取失敗（{e}）"}
     except Exception as e:  # noqa: BLE001
         logger.exception("capability scan failed for %s", requested)
         return {"athlete": requested, "level": "error", "flags": [f"讀取失敗：{e}"]}
@@ -406,7 +596,7 @@ async def _one(requested: str, *, end: str, window_days: int, history_days: int,
     flags, level = [], "green"
     for s, label in (("bike", "騎"), ("run", "跑")):
         a = result.get(s) or {}
-        d = (a.get("latest") or {}).get("decoupling_pct")
+        d = a.get("decoupling_used", (a.get("latest") or {}).get("decoupling_pct"))
         if d is not None:
             if d > 8:
                 flags.append(f"{label}漂移 {d:g}%>8")
@@ -415,8 +605,25 @@ async def _one(requested: str, *, end: str, window_days: int, history_days: int,
                 flags.append(f"{label}漂移 {d:g}%")
                 level = "yellow" if level == "green" else level
         if a.get("ef_up"):
-            flags.append(f"{label} EF +{a['ef_change_pct']:g}%（閾值可能偏低）")
+            g = (a.get("ef_gates") or {}).get("pass")
+            if g is False:
+                flags.append(f"{label} EF +{a['ef_change_pct']:g}%：疲勞型 EF 上升（PROC-84g，轉 PER-49）")
+            else:
+                gate_txt = "，兩關通過" if g else "，兩關待人工"
+                flags.append(f"{label} EF +{a['ef_change_pct']:g}%（閾值可能偏低{gate_txt}）")
             level = "yellow" if level == "green" else level
+        if (a.get("durability") or {}).get("weak"):
+            flags.append(f"{label}耐久性弱項：2 小時後解耦連 2 次 >8%（PROC-84h）")
+            level = "yellow" if level == "green" else level
+        if a.get("drift_into_heavy"):
+            flags.append(f"{label}長課 2 小時後漂入中強度（該段不算純 Z2）")
+            level = "yellow" if level == "green" else level
+    if (result.get("easy_run") or {}).get("abnormal"):
+        flags.append("輕鬆跑同配速心率 >1 SD（PER-79b，S3 第 4 項）")
+        level = "yellow" if level == "green" else level
+    for f in (result.get("wellness") or {}).get("flags") or []:
+        flags.append(f + "（PER-79c）")
+        level = "yellow" if level == "green" else level
     if result["grey_zone"]["flag"]:
         flags.append(f"灰區 {len(result['grey_zone']['hits'])} 堂（說明段寫數字上限）")
         level = "yellow" if level == "green" else level
@@ -432,7 +639,7 @@ async def _one(requested: str, *, end: str, window_days: int, history_days: int,
         flags.append(f"游泳同課型配速／划距退步 {len(sw_down)} 堂")
         level = "yellow" if level == "green" else level
     if (result.get("peaks") or {}).get("ftp_maybe_low"):
-        flags.append("20 分最佳×0.95 ≥ FTP×1.03（FTP 可能偏低）")
+        flags.append(f"FTP 可能偏低：{((result.get('peaks') or {}).get('ftp_tier') or {}).get('tier')}（PROC-85g）")
         level = "yellow" if level == "green" else level
     row = {"athlete": requested, **ident, **result, "flags": flags, "level": level,
            "windows": {"recent": [window_start, end], "history": [hist_start, end]}}
@@ -443,6 +650,50 @@ async def _one(requested: str, *, end: str, window_days: int, history_days: int,
         p.write_text(json.dumps(row, ensure_ascii=False, indent=1), encoding="utf-8")
         row["saved_to"] = str(p)
     return row
+
+
+async def _ef_gates(sport: str, ws: list[dict[str, Any]], window_start: str, a: dict[str, Any],
+                    steady: list[dict[str, Any]], metrics: Any) -> dict[str, Any]:
+    """PROC-84g: gate 1 = interval-session peak HR (window vs the earlier weeks), gate 2 =
+    RPE of the EF-up session vs the earlier steady sessions of the same kind."""
+    q = [w for w in ws if w.get("sport") == sport and ext.is_quality(w.get("title"))]
+    recent = [w for w in q if str(w.get("date"))[:10] >= window_start][:3]
+    base = [w for w in q if str(w.get("date"))[:10] < window_start][:6]
+    r_hr = [v for v in [await session_max_hr(str(w.get("id"))) for w in recent] if v]
+    b_hr = [v for v in [await session_max_hr(str(w.get("id"))) for w in base] if v]
+    latest = a.get("latest") or {}
+    rpe_l = await workout_rpe(latest.get("workout_id")) if latest.get("workout_id") else None
+    earlier = [w for w in steady if str(w.get("date"))[:10] < str(latest.get("date"))][:4]
+    rpe_b = [v for v in [await workout_rpe(str(w.get("id"))) for w in earlier] if v is not None]
+    return ext.ef_gates(r_hr, b_hr, rpe_l, rpe_b)
+
+
+async def _easy_runs(ws: list[dict[str, Any]], end: str, metrics: Any, keys: list[str],
+                     power_runners: list[str]) -> dict[str, Any]:
+    """PER-79b: flat easy runs, this week vs the 3 weeks before."""
+    e = dt.date.fromisoformat(end)
+    wk_from, base_from = (e - dt.timedelta(days=6)).isoformat(), (e - dt.timedelta(days=27)).isoformat()
+    cands = [w for w in ws if w.get("sport") == "Run" and ext.is_easy_run(w.get("title"))
+             and str(w.get("date"))[:10] >= base_from and (w.get("duration_actual") or 0) * 60 >= 20]
+    rows = []
+    for w in cands:
+        r = dict(await metrics(w))
+        title = str(w.get("title") or "")
+        if any(k in title for k in ext.TREADMILL_WORDS):
+            r["excluded"] = "跑步機"
+        elif r.get("gain_m") and r.get("distance_km") and r["gain_m"] / r["distance_km"] > ext.FLAT_GAIN_M_PER_KM:
+            r["excluded"] = f"非平路（爬升 {r['gain_m'] / r['distance_km']:.0f} m/km）"
+        rows.append(r)
+    wx = await easy_run_weather(keys, [r for r in rows if not r.get("excluded")])
+    for r in rows:
+        if r.get("workout_id") in wx:
+            r["excluded"] = wx[r["workout_id"]]
+    use_power = any(k and k in power_runners for k in keys)
+    out = ext.easy_run_index([r for r in rows if r["date"] >= wk_from], [r for r in rows if r["date"] < wk_from],
+                             use_power=use_power)
+    if not wx and rows:
+        out["weather_note"] = "天氣以 training-locations.json 座標＋跑步中點時間判；查不到座標或時間的課未排除"
+    return out
 
 
 def _compact(row: dict[str, Any]) -> dict[str, Any]:
@@ -457,6 +708,16 @@ def _compact(row: dict[str, Any]) -> dict[str, Any]:
                 "latest": {k2: lt.get(k2) for k2 in ("workout_id", "date", "title", "duration_min",
                                                      "decoupling_pct", "ef")} if lt else None,
                 "decoupling_verdict": a.get("decoupling_verdict"),
+                "decoupling_used": a.get("decoupling_used"),
+                "decoupling_basis": a.get("decoupling_basis"),
+                "segments": {k2: v2 for k2, v2 in {
+                    "front_pct": ((lt.get("seg") or {}).get("front") or {}).get("decoupling_pct"),
+                    "back": (lt.get("seg") or {}).get("back"),
+                    "note": (lt.get("seg") or {}).get("note"),
+                }.items() if v2 is not None} or None,
+                "durability": a.get("durability"),
+                "drift_into_heavy": a.get("drift_into_heavy"),
+                "ef_gates": a.get("ef_gates"),
                 "ef_change_pct": a.get("ef_change_pct"),
                 "note": a.get("note") or a.get("ef_note"),
                 "excluded": len(a.get("excluded") or []) or None,
@@ -466,6 +727,9 @@ def _compact(row: dict[str, Any]) -> dict[str, Any]:
         out["grey_zone"] = {"hits": gz.get("hits"), "flag": gz.get("flag")}
     if row.get("peaks"):
         out["peaks"] = row["peaks"]
+    for k in ("easy_run", "wellness"):
+        if row.get(k):
+            out[k] = row[k]
     pr = row.get("progress") or {}
     if pr:
         out["progress"] = {k: v for k, v in {
@@ -484,8 +748,9 @@ def _table(rows: list[dict[str, Any]]) -> str:
     lines = ["燈|選手|騎 Pw:Hr|跑 Pa:Hr|EF Δ騎/跑|灰區|旗標"]
     for r in rows:
         def dec(s, r=r):
-            lt = (r.get(s) or {}).get("latest") or {}
-            return f"{lt['decoupling_pct']:g}%" if lt.get("decoupling_pct") is not None else "-"
+            a = r.get(s) or {}
+            v = a.get("decoupling_used", (a.get("latest") or {}).get("decoupling_pct"))
+            return f"{v:g}%" if v is not None else "-"
 
         def ef(s, r=r):
             v = (r.get(s) or {}).get("ef_change_pct")
@@ -514,6 +779,11 @@ async def lo_capability_scan(
     swim: bool = True,
     weather: str = "auto",
     max_swims: int = 6,
+    segments: bool = True,
+    gates: bool = True,
+    easy_index: bool = True,
+    wellness: bool = True,
+    power_runners: list[str] | None = None,
 ) -> dict[str, Any]:
     if not athletes:
         return {"isError": True, "error_code": "INVALID_ARGS", "message": "athletes is empty"}
@@ -534,7 +804,8 @@ async def lo_capability_scan(
             return await _one(str(a).strip(), end=end, window_days=window_days, history_days=history_days,
                               max_per_sport=max_per_sport, heat_c=heat_c, bike_if_max=bike_if_max,
                               ef_up_pct=ef_up_pct, peaks=peaks, save_dir=sd, ledger=ledger, swim=swim,
-                              weather=weather, max_swims=max_swims)
+                              weather=weather, max_swims=max_swims, segments=segments, gates=gates,
+                              easy_index=easy_index, wellness=wellness, power_runners=power_runners)
 
     rows = await asyncio.gather(*(run(a) for a in athletes))
     order = {"error": 0, "red": 1, "yellow": 2, "green": 3}
@@ -550,7 +821,10 @@ async def lo_capability_scan(
                  "燈號只分流，裁決由教練做。"
                  "progress＝PROC-84d 帳本（learning/capability_log.jsonl）：本週新記的穩態課（含天氣）、"
                  "游泳（SWIM-91：配速／划頻／划距／SWOLF，同課型比較）、基準測驗（PROC-37b：同輸出比心率）。"
-                 "6–8 週趨勢表＝專案 tools/progress_trend.py。"),
+                 "6–8 週趨勢表＝專案 tools/progress_trend.py。"
+                 "11/02：漂移改用逐秒資料（PROC-84h：剔前 10 分與停頓、>2 h 分前 2 h／後段，加長判準看前段，"
+                 "後段＝耐久性；失水與補給工具看不到，人工排除）；EF 升先過兩關（PROC-84g）；FTP 三級（PROC-85g）；"
+                 "輕鬆跑同配速心率（PER-79b）；靜止心率／HRV（PER-79c）。"),
     }
 
 
@@ -565,7 +839,10 @@ def register_lo_capability(tools: list[Any], handlers: dict[str, Any]) -> None:
             "decoupling and the 5/8% verdict (≤5% twice in a row = may extend), EF vs the earlier "
             "same-kind sessions (>+3% = threshold may be low), grey-zone sweep of easy sessions "
             "(bike IF > 0.78, run avg speed above the Z2 ceiling; ≥2 hits = flag), and power-20min "
-            "peaks vs FTP when EF jumps (peaks=auto) or always. Reads only TP's analysis summary "
+            "peaks vs FTP in three tiers (<3% noise / 3–8% needs a 2nd source / ≥8%, PROC-85g) when EF jumps "
+            "and passes the PROC-84g peak-HR/RPE gates (peaks=auto) or always. 11/02: decoupling from the 1 s "
+            "series (PROC-84h), easy-run HR at the same pace (PER-79b), resting HR / HRV (PER-79c). "
+            "Reads TP's analysis summary "
             "(full-file numbers, no 12 s samples). Read-only. One compact row per athlete + text "
             "table; full JSON per athlete in save_dir. PROC-84d/98, SWIM-91: also logs every newly analysed "
             "steady session (with weather), swim (pace/stroke rate/DPS/SWOLF) and 基準測驗 baseline (HR at the "
@@ -594,6 +871,17 @@ def register_lo_capability(tools: list[Any], handlers: dict[str, Any]) -> None:
                             "description": "PROC-93 weather for steady sessions in the window; "
                                            "hot/humid ones leave the trend."},
                 "max_swims": {"type": "integer", "default": 6},
+                "segments": {"type": "boolean", "default": True,
+                             "description": "PROC-84h: decoupling from the 1 s series (first 10 min out, stops out, "
+                                            ">2 h split into first 2 h / after; durability + drift flags)."},
+                "gates": {"type": "boolean", "default": True,
+                          "description": "PROC-84g: EF rise must pass interval peak-HR and RPE gates."},
+                "easy_index": {"type": "boolean", "default": True,
+                               "description": "PER-79b: flat easy-run HR÷speed this week vs 3-week mean ± SD."},
+                "wellness": {"type": "boolean", "default": True,
+                             "description": "PER-79c: resting HR 7-day +3 bpm, HRV saturation pattern."},
+                "power_runners": {"type": "array", "items": {"type": "string"},
+                                  "description": "Athletes whose PER-79b index uses NP instead of speed."},
             },
             "required": ["athletes"],
         },
@@ -609,6 +897,9 @@ def register_lo_capability(tools: list[Any], handlers: dict[str, Any]) -> None:
             concurrency=int(args.get("concurrency", 3)),
             ledger=bool(args.get("ledger", True)), swim=bool(args.get("swim", True)),
             weather=str(args.get("weather", "auto")), max_swims=int(args.get("max_swims", 6)),
+            segments=bool(args.get("segments", True)), gates=bool(args.get("gates", True)),
+            easy_index=bool(args.get("easy_index", True)), wellness=bool(args.get("wellness", True)),
+            power_runners=list(args.get("power_runners") or []) or None,
         )
 
     handlers["lo_capability_scan"] = _h

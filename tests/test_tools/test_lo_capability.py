@@ -94,16 +94,24 @@ async def test_scan_end_to_end(tmp_path):
          patch.object(workouts, "tp_get_workouts", AsyncMock(return_value=listed)), \
          patch.object(settings, "tp_get_athlete_settings", AsyncMock(return_value=st)), \
          patch.object(cap, "summary_totals", AsyncMock(side_effect=lambda wid: totals[str(wid)])), \
-         patch.object(peaks, "tp_get_peaks", pk):
+         patch.object(peaks, "tp_get_peaks", pk), \
+         patch.object(cap, "mean_temp_c", AsyncMock(return_value=None)), \
+         patch.object(cap, "session_max_hr", AsyncMock(return_value=None)), \
+         patch.object(cap, "workout_rpe", AsyncMock(return_value=None)), \
+         patch.object(cap, "wellness_daily", AsyncMock(return_value=[])), \
+         patch.object(cap, "easy_run_weather", AsyncMock(return_value={})):
         r = await cap.lo_capability_scan(["Mark"], end="2026-10-03", save_dir=str(tmp_path),
-                                         weather="never", swim=False, ledger=False)
+                                         weather="never", swim=False, ledger=False, segments=False)
     row = r["athletes"][0]
     assert row["level"] == "red"
     assert row["bike"]["latest"]["workout_id"] == "11"
     assert "不加長" in row["bike"]["decoupling_verdict"]
     assert any("漂移 9.4%" in f for f in row["flags"])
     assert any("EF" in f for f in row["flags"])        # 1.45 vs ~1.30 baseline
-    assert row["peaks"]["ftp_maybe_low"] is True       # 275*0.95=261 >= 250*1.03=257.5
+    # PROC-85g (11/02): 275*0.95=261 is +4.5% over 250 → 3–8% tier, one source only → not reported
+    assert row["peaks"]["ftp_maybe_low"] is False
+    assert "3–8%" in row["peaks"]["ftp_tier"]["tier"]
+    assert row["bike"]["ef_gates"]["pass"] is None          # no peak HR / RPE → manual
     assert row["grey_zone"]["hits"][0]["sport"] == "Run"  # 8.4km/2520s = 3.33 m/s > 3.0
     assert "閾值間歇" not in str(row)
     assert (tmp_path / "Mark_Huang.json").exists()

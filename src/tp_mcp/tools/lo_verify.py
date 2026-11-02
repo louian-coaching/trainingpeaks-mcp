@@ -59,6 +59,8 @@ _DRIFT_WARN = 0.05  # |actual/planned - 1| above this ⇒ boundaries unreliable
 
 _ALIGN_MODES = ("auto", "laps", "shift", "elapsed", "scale")
 
+_BRICK_TITLES = ("轉換跑", "換項跑")   # RUN-21c (2026/11/02)
+
 
 def _round_half_up(x: float) -> int:
     """Round .5 away from zero, not to even.
@@ -644,6 +646,7 @@ async def lo_verify_intervals(
     align: str = "auto",
     ftp: float | None = None,
     include_rest: bool = False,
+    brick: bool | None = None,
 ) -> dict[str, Any]:
     """Reconstruct per-segment averages from the time series, without laps.
 
@@ -659,6 +662,10 @@ async def lo_verify_intervals(
             the prescription onto actual elapsed time).
         ftp: FTP/threshold used for the in-range percentage. Omit to skip it.
         include_rest: also report warm-up/rest/cool-down segments.
+        brick: RUN-21c (2026/11/02) — a 轉換跑／換項跑's first km is the post-bike
+            incoordination stretch (~680 m, Weich 2022): it is left out of the
+            segment it falls in and reported on its own (only "faster than the
+            upper bound" counts there). ``None`` = decide from the title.
     """
     from tp_mcp.tools.analyze import tp_analyze_workout
     from tp_mcp.tools.workouts import tp_get_workout
@@ -686,6 +693,7 @@ async def lo_verify_intervals(
 
     axis = "time"
     planned_total: float | None = None
+    title = ""
     if segments:
         norm = _normalize_manual(segments)
         if isinstance(norm, str):
@@ -696,6 +704,7 @@ async def lo_verify_intervals(
         detail = await tp_get_workout(workout_id)
         if isinstance(detail, dict) and detail.get("isError"):
             return detail
+        title = str((detail or {}).get("title") or "")
         sw = (detail or {}).get("structured_workout") or {}
         structure = sw.get("structure") or []
         if not structure:
@@ -761,6 +770,25 @@ async def lo_verify_intervals(
         factor = actual_total / planned_total
         segs = [{**s, "start": s["start"] * factor, "end": s["end"] * factor} for s in segs]
 
+    # RUN-21c: where the first km of a brick run ends, on the alignment axis
+    if brick is None:
+        if source == "manual" and not title:
+            try:
+                d = await tp_get_workout(workout_id)
+                title = str((d or {}).get("title") or "") if isinstance(d, dict) else ""
+            except Exception:  # noqa: BLE001 — the title only switches the brick rule on
+                title = ""
+        brick = any(k in title for k in _BRICK_TITLES)
+    fk_end: float | None = None
+    if brick:
+        dists = [(p.get("time"), p.get("Distance")) for p in points
+                 if isinstance(p.get("Distance"), (int, float)) and isinstance(p.get("time"), (int, float))]
+        if dists:
+            d0 = dists[0][1]
+            hit = next(((t, d) for t, d in dists if d >= d0 + 1.0), None)   # charts Distance = km
+            if hit:
+                fk_end = float(hit[0]) if axis == "time" else float(hit[1]) * 1000.0
+
     rows = []
     for seg in segs:
         if not include_rest and seg.get("intensity_class") in ("warmUp", "rest", "coolDown"):
@@ -788,6 +816,18 @@ async def lo_verify_intervals(
             if (v := _axis_value(p, axis)) is not None and v >= seg["end"]
         ]
         closing = min(after, key=lambda vp: vp[0])[1] if after else None
+        if fk_end is not None and seg["start"] < fk_end:
+            fk = [p for p in in_seg if (v := _axis_value(p, axis)) is not None and v < fk_end]
+            rest = [p for p in in_seg if (v := _axis_value(p, axis)) is not None and v >= fk_end]
+            if fk and len(rest) >= 4:
+                fk_stats = _segment_stats(fk, rest[0])
+                first = {k: fk_stats[k] for k in ("avg_power", "avg_speed", "avg_heartrate", "samples")
+                         if k in fk_stats}
+                if ftp and seg.get("target_max") is not None and first.get("avg_power") is not None:
+                    first["faster_than_upper"] = first["avg_power"] > ftp * float(seg["target_max"]) / 100.0
+                row["first_km"] = first
+                row["first_km_excluded"] = True
+                in_seg = rest
         row.update(_segment_stats(in_seg, closing))
         pct = _in_range_pct(in_seg, seg.get("target_min"), seg.get("target_max"), ftp)
         if pct is not None:
@@ -805,6 +845,13 @@ async def lo_verify_intervals(
     out: dict[str, Any] = {
         "success": True,
         "workout_id": workout_id,
+        **({"brick_first_km": {
+            "rule": "RUN-21c",
+            "applied": fk_end is not None,
+            "note": ("轉換跑第 1 公里不計入所在段的平均與在區間比例，另列 first_km；只看它有沒有快於上緣"
+                     "（功率跑看 faster_than_upper，配速跑用 avg_speed 對處方上緣人工比）"
+                     if fk_end is not None else "轉換跑但跑不到 1 公里或沒有距離資料，未排除"),
+        }} if brick else {}),
         "segment_source": source,
         "align": used,
         "align_requested": align,
@@ -907,6 +954,11 @@ def register_lo_verify(tools: list[Any], handlers: dict[str, Any]) -> None:
                     "default": False,
                     "description": "Also report warm-up / rest / cool-down segments.",
                 },
+                "brick": {
+                    "type": "boolean",
+                    "description": "RUN-21c: leave a brick run's first km out of its segment and report it "
+                                   "separately. Omit = on when the title has 轉換跑／換項跑.",
+                },
             },
             "required": ["workout_id"],
         },
@@ -923,6 +975,7 @@ def register_lo_verify(tools: list[Any], handlers: dict[str, Any]) -> None:
             align=a.get("align", "auto"),
             ftp=a.get("ftp"),
             include_rest=bool(a.get("include_rest", False)),
+            brick=a.get("brick"),
         )
 
     handlers["lo_verify_intervals"] = _h_verify

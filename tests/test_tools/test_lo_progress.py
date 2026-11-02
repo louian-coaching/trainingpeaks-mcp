@@ -69,6 +69,19 @@ def test_baseline_run_uses_distance_trims():
     assert m["avg_speed_ms"] == pytest.approx(3.0, abs=0.1) and m["pace_s_km"] == pytest.approx(333, abs=12)
 
 
+def test_baseline_run_tp_units_km_and_kmh():
+    """TP charts: Distance in km, Speed in km/h (11/02 fix — the metre trims used to empty the run)."""
+    pts = []
+    d = 0.0
+    for i in range(0, 3600, 10):
+        kmh = 10.8 if 700 <= i <= 3200 else 9.0
+        d += kmh / 3600 * 10
+        pts.append({"time": i, "Distance": d, "Speed": kmh, "HeartRate": 150 if kmh == 10.8 else 135})
+    m = lp.baseline_metrics("Run", {}, points=pts)
+    assert m is not None
+    assert m["avg_speed_ms"] == pytest.approx(3.0, abs=0.1) and m["pace_s_km"] == pytest.approx(333, abs=12)
+
+
 def test_compare_baseline():
     prev = {"avg_w": 180, "avg_hr": 134, "decoupling_pct": 4.0}
     assert lp.compare_baseline("Bike", {"avg_w": 181, "avg_hr": 129, "decoupling_pct": 2.0}, prev)["verdict"] == "進步"

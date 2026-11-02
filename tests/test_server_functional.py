@@ -67,6 +67,7 @@ class TestListTools:
             "lo_capability_scan",
             "lo_weather_history",
             "lo_weather_forecast",
+            "lo_race_metrics",
             "lo_sth_call",
             "lo_sth_calc_loads",
             "lo_sth_create_week",

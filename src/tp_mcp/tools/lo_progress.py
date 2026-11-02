@@ -164,14 +164,19 @@ def baseline_metrics(sport: str, analysis: dict[str, Any],
     if not pts:
         return None
     t0, t1 = pts[0]["time"], pts[-1]["time"]
+    spd_scale = 1.0
     if sport == "Bike":
         main = [p for p in pts if t0 + BIKE_WARM_S <= p["time"] <= t1 - BIKE_COOL_S]
     else:
         dist = [p for p in pts if isinstance(p.get("Distance"), (int, float))]
         if not dist:
             return None
-        d0, d1 = dist[0]["Distance"], dist[-1]["Distance"]
-        main = [p for p in dist if d0 + RUN_WARM_M <= p["Distance"] <= d1 - RUN_COOL_M]
+        # FORK 11/02: TP charts carry Distance in km and Speed in km/h; the trims are metres.
+        # (Fixtures in metres / m·s⁻¹ still work: a run file spans far more than 300 of them.)
+        scale = 1000.0 if (dist[-1]["Distance"] - dist[0]["Distance"]) < 300 else 1.0
+        spd_scale = 1 / 3.6 if scale == 1000.0 else 1.0
+        d0, d1 = dist[0]["Distance"] * scale, dist[-1]["Distance"] * scale
+        main = [p for p in dist if d0 + RUN_WARM_M <= p["Distance"] * scale <= d1 - RUN_COOL_M]
     main = [p for p in main if isinstance(p.get("HeartRate"), (int, float)) and p["HeartRate"] > 0]
     if len(main) < 10:
         return None
@@ -192,7 +197,7 @@ def baseline_metrics(sport: str, analysis: dict[str, Any],
         out["avg_w"] = round(_mean([p["Power"] for p in vals]), 1)
         out["ef"] = round(out["avg_w"] / out["avg_hr"], 3)
     else:
-        sp = _mean([p["Speed"] for p in vals])
+        sp = _mean([p["Speed"] * spd_scale for p in vals])
         out["avg_speed_ms"] = round(sp, 3)
         out["pace_s_km"] = round(1000 / sp, 1) if sp else None
         out["ef"] = round(sp * 60 / out["avg_hr"], 3)        # m/min per bpm

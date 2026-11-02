@@ -637,3 +637,32 @@ def test_detected_pace_interval_laps_are_ignored():
     pts = [{"time": t} for t in range(0, 401)]
     laps = device_laps(raw, pts, "time")
     assert [(lp["n"], lp["start"], lp["end"]) for lp in laps] == [(1, 0, 200), (2, 200, 400)]
+
+
+# ---------------------------------------------------------------------------
+# RUN-21c (2026/11/02): a brick run's first km is reported apart
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_brick_first_km_left_out(tmp_path):
+    structure = [{"begin": 0, "end": 4000, "length": {"value": 1, "unit": "repetition"},
+                  "steps": [{"name": "轉換跑", "length": {"value": 4000, "unit": "meter"},
+                             "targets": [{"minValue": 80, "maxValue": 85}],
+                             "intensityClass": "active"}]}]
+    # 1 m/s for the fixture; first km at 300 W (over 255), the rest at 250 W (inside 240~255)
+    series = [{"time": t, "Distance": t / 1000.0, "Power": 300 if t < 1000 else 250, "HeartRate": 150}
+              for t in range(0, 4000, 5)]
+    data_file = tmp_path / "analysis.json"
+    data_file.write_text(json.dumps({"data": series}))
+    analysis = {"workoutId": 1, "data_file": str(data_file), "lapData": [{"Name": "Lap 1"}]}
+    detail = {"id": "1", "title": "轉換跑", "structured_workout": _sw(structure, metric="distance")}
+    with patch("tp_mcp.tools.analyze.tp_analyze_workout", AsyncMock(return_value=analysis)), \
+         patch("tp_mcp.tools.workouts.tp_get_workout", AsyncMock(return_value=detail)):
+        res = await lo_verify_intervals("1", ftp=300)
+        off = await lo_verify_intervals("1", ftp=300, brick=False)
+    seg = res["segments"][0]
+    assert res["brick_first_km"]["applied"] is True
+    assert seg["first_km_excluded"] is True and seg["first_km"]["faster_than_upper"] is True
+    assert seg["avg_power"] == 250.0 and seg["in_range_pct"] == 100.0
+    assert "brick_first_km" not in off and off["segments"][0]["in_range_pct"] < 100
