@@ -254,6 +254,61 @@ async def lo_weekly_check(
     }
 
 
+async def lo_sweep_readbacks(athletes: list[str], start_date: str, end_date: str, save_dir: str,
+                             concurrency: int = 3) -> dict[str, Any]:
+    """FORK 2026-11-06 (coach menu): read a planned window back for many athletes at once,
+    each in validate_week.py shape, plus ``manifest.json`` (athlete → file, TP id, name).
+
+    Built for the rule sweep (tp-ai-layer/tools/rule_sweep.py): after a new rule enters
+    method/, one call reads every athlete's future weeks, the script runs validate_week
+    on each and keeps only the new rule's hits. Read-only; the lo_diff_week snapshot is
+    NOT refreshed (a sweep must not absorb coach edits — TECH-56).
+    """
+    from tp_mcp.tools.lo_review import athlete_identity
+    from tp_mcp.tools.lo_tools import lo_get_week_for_validate
+
+    if not athletes:
+        return {"isError": True, "error_code": "INVALID_ARGS", "message": "athletes is empty"}
+    try:
+        dt.date.fromisoformat(start_date), dt.date.fromisoformat(end_date)
+    except ValueError as e:
+        return {"isError": True, "error_code": "INVALID_ARGS", "message": str(e)}
+    sd = Path(save_dir).expanduser()
+    sd.mkdir(parents=True, exist_ok=True)
+    sem = asyncio.Semaphore(max(1, int(concurrency)))
+
+    async def one(requested: str) -> dict[str, Any]:
+        async with sem:
+            token = athlete_override.set(requested)
+            try:
+                ident = await athlete_identity()
+                if not ident.get("athlete_id"):
+                    return {"athlete": requested, "error": "身分解析失敗"}
+                f = sd / f"{ident['athlete_id']}.json"
+                res = await lo_get_week_for_validate(start_date=start_date, end_date=end_date,
+                                                     save_to=str(f), _snapshot=False)
+                if res.get("isError"):
+                    return {"athlete": requested, **ident, "error": f"{res.get('error_code')} {res.get('message')}"}
+                row = {"athlete": requested, **ident, "file": str(f), "count": res.get("count"),
+                       "detail_failures": res.get("detail_failures")}
+                if not _name_matches(requested, ident.get("athlete_name")):
+                    row["identity_warning"] = f"解析到 {ident.get('athlete_name')}"
+                return row
+            except Exception as e:  # noqa: BLE001 — one athlete never sinks the sweep
+                return {"athlete": requested, "error": str(e)}
+            finally:
+                athlete_override.reset(token)
+
+    rows = await asyncio.gather(*(one(str(a).strip()) for a in athletes))
+    manifest = {"window": [start_date, end_date], "athletes": rows}
+    (sd / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
+    return {"success": True, "save_dir": str(sd), "window": [start_date, end_date],
+            "ok": sum(1 for r in rows if not r.get("error")), "errors": [r for r in rows if r.get("error")],
+            "identity_warnings": [r for r in rows if r.get("identity_warning")],
+            "next": ("python3 tp-ai-layer/tools/rule_sweep.py <save_dir> --rules R108,… "
+                     "（讀速查卡旗標、只列指定規則的命中）")}
+
+
 def register_lo_weekly(tools: list[Any], handlers: dict[str, Any]) -> None:
     from mcp.types import Tool
 
@@ -306,3 +361,32 @@ def register_lo_weekly(tools: list[Any], handlers: dict[str, Any]) -> None:
         )
 
     handlers["lo_weekly_check"] = _h
+
+    tools.append(Tool(
+        name="lo_sweep_readbacks",
+        description=(
+            "Rule sweep read: for many athletes, read the planned window back in validate_week.py "
+            "shape (one JSON per TP id) plus manifest.json in save_dir. Read-only; does NOT refresh "
+            "the lo_diff_week snapshot. Then run tp-ai-layer/tools/rule_sweep.py on save_dir with "
+            "--rules to list only the new rule's hits across the roster."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "athletes": {"type": "array", "items": {"type": "string"},
+                             "description": "Athlete names or IDs (coach roster)."},
+                "start_date": {"type": "string", "description": "YYYY-MM-DD"},
+                "end_date": {"type": "string", "description": "YYYY-MM-DD"},
+                "save_dir": {"type": "string", "description": "Directory ON THE MACHINE RUNNING THIS SERVER."},
+                "concurrency": {"type": "integer", "default": 3},
+            },
+            "required": ["athletes", "start_date", "end_date", "save_dir"],
+        },
+    ))
+
+    async def _hs(args: dict[str, Any]) -> dict[str, Any]:
+        return await lo_sweep_readbacks(athletes=list(args.get("athletes") or []),
+                                        start_date=args["start_date"], end_date=args["end_date"],
+                                        save_dir=args["save_dir"], concurrency=int(args.get("concurrency", 3)))
+
+    handlers["lo_sweep_readbacks"] = _hs

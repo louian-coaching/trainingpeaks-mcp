@@ -316,6 +316,45 @@ def diff_rows(before: dict[str, dict[str, Any]], after: list[dict[str, Any]], st
     return out
 
 
+def explanation_drafts(before: dict[str, dict[str, Any]], rows: list[dict[str, Any]],
+                       diff: dict[str, Any], stale: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """FORK 2026-11-06: one draft per changed workout whose explanation likely needs an
+    update (body numbers changed, graph changed so the body is stale, or the date moved)."""
+    from tp_mcp.tools.lo_expl_sync import compose_description, draft_explanation
+
+    now = {str(w.get("id")): w for w in rows}
+    out = []
+    for c in diff.get("changed") or []:
+        wid, ch = c["id"], c["changes"]
+        old, new = before.get(wid) or {}, now.get(wid) or {}
+        ob, _ = split_description(old.get("description"))
+        nb, ne = split_description(new.get("description"))
+        if not ne.strip():
+            continue
+        st = stale.get(wid)
+        body_changed = "body" in ch
+        target_body = nb if body_changed or not st else st["suggested_body"]
+        if not (body_changed or st or "date" in ch):
+            continue
+        d = draft_explanation(ob, target_body, ne,
+                              date_from=(ch.get("date") or {}).get("from"),
+                              date_to=(ch.get("date") or {}).get("to"),
+                              stale_numbers=ch.get("stale_explanation_numbers"))
+        body_needs_write = bool(st) and not body_changed
+        if not (d["changed"] or d["unresolved"] or d["check_phrases"] or body_needs_write):
+            continue
+        out.append({
+            "id": wid, "date": c["date"], "title": c["title"],
+            "replacements": d["replacements"], "unresolved": d["unresolved"],
+            "check_phrases": d["check_phrases"],
+            "body_source": "coach_body" if body_changed or not st else "rendered_from_graph",
+            "draft_description": compose_description(target_body, d["draft"], nb),
+            "note": ("草稿：數字替換＋日期位移推算，人工審過再用 lo_update_workout_verified 寫入；"
+                     "unresolved＝說明段仍引用、但配不到新值的舊數字；check_phrases＝日期動過要確認的星期用詞"),
+        })
+    return out
+
+
 def _human_change(old: dict[str, Any], new: dict[str, Any]) -> bool:
     """A difference a person made (not TP recomputing load for a pace run)."""
     d = diff_rows({"x": {**old, "id": "x"}}, [{**new, "id": "x"}], "0000-00-00", "9999-99-99")
@@ -481,6 +520,13 @@ async def lo_diff_week(start_date: str, end_date: str, save_snapshot_after: bool
                 "Body text and graph disagree on these, but nothing changed since the baseline: "
                 "either an older edit nobody synced, or a body we built wrong. Ask the coach "
                 "which before rewriting, and log the reason if it was his edit.")
+    # FORK 2026-11-06: draft the explanation update for each coach edit (PROC-80). Never writes.
+    try:
+        drafts = explanation_drafts(before, rows, out, {s["id"]: s for s in out.get("stale_bodies") or []})
+    except Exception as e:  # noqa: BLE001 — drafts are a convenience; never fail the diff
+        drafts, out["explanation_drafts_warning"] = [], str(e)
+    if drafts:
+        out["explanation_drafts"] = drafts
     # swims have no graph: check the body's metres against TP's distance field
     from tp_mcp.tools.lo_review import planned_distance_m
     from tp_mcp.tools.lo_swim import estimate_swim
@@ -512,8 +558,10 @@ async def lo_diff_week(start_date: str, end_date: str, save_snapshot_after: bool
     out["readback_json_path"] = str(Path(tmp).expanduser())
     out["week_load"] = week.get("week_load")
     out["next"] = ("stale_bodies[].suggested_body is the graph rendered as text (your own labels kept "
-                   "where the numbers match). Explanations are never rewritten — update them yourself, "
-                   "then validate (R80 checks explanation numbers against the body).")
+                   "where the numbers match). explanation_drafts[] are review-only drafts of the full "
+                   "description (body + explanation with numbers / race-day counts updated) — nothing is "
+                   "written; review, fix `unresolved`, write with lo_update_workout_verified, then validate "
+                   "(R80 checks explanation numbers against the body).")
     return out
 
 

@@ -62,6 +62,7 @@ class TestListTools:
             "lo_delete_workouts_batch",
             "lo_get_workouts_summary",
             "lo_weekly_check",
+            "lo_sweep_readbacks",
             "lo_version",
             "lo_update_threshold_verified",
             "lo_capability_scan",
@@ -147,6 +148,8 @@ class TestListTools:
             "tp_get_strength_summary",
             "tp_get_strength_workouts",
             "tp_get_strength_workout",
+            "tp_get_strength_library_templates",
+            "tp_get_strength_library_template",
             "tp_update_strength_workout",
             "tp_delete_strength_workout",
             "tp_list_training_plans",
@@ -303,8 +306,8 @@ class TestGetWorkoutDispatch:
 
         assert result["id"] == "1001"
         # Verify the URL used the validated integer, not the raw string
-        call_args = mock_instance.get.call_args[0][0]
-        assert "/workouts/1001" in call_args
+        urls = [c[0][0] for c in mock_instance.get.call_args_list]
+        assert any("/workouts/1001" in u for u in urls)
 
 
 # ---------------------------------------------------------------------------

@@ -185,6 +185,43 @@ def scan_stale_text(kind: str, old: float, new: float, workouts: list[dict[str, 
     return rows
 
 
+def _scaled_groups(kind: str, old: float, new: float, m: re.Match[str]) -> list[tuple[int, str]] | None:
+    """(group index, replacement) for every numeric group of one match, or None to skip."""
+    out = []
+    for gi in range(1, (m.lastindex or 0) + 1):
+        v = m.group(gi)
+        if not v:
+            continue
+        if kind.startswith("ftp"):
+            out.append((gi, str(round(int(v) * new / old))))
+        elif kind in ("run_pace", "swim_pace"):
+            out.append((gi, _fmt_pace(_to_sec(v) * old / new)))
+        else:
+            n = int(v)
+            if n < 80 or n > 220:
+                return None
+            out.append((gi, str(round(n * new / old))))
+    return out or None
+
+
+def rewrite_text(kind: str, old: float, new: float, text: str) -> tuple[str, int]:
+    """FORK 2026-11-06: apply the proportional suggestion in place — only the numeric
+    groups are replaced, so units, range separators (~ ～ -) and wording stay as written."""
+    if not old or not new or old == new or not text:
+        return text, 0
+    rx = {"ftp_bike": _W_RE, "ftp_run": _W_RE, "run_pace": _KM_RE, "swim_pace": _100_RE}.get(kind, _HR_RE)
+    spans: list[tuple[int, int, str]] = []
+    hits = 0
+    for m in rx.finditer(text):
+        groups = _scaled_groups(kind, old, new, m)
+        if groups:
+            hits += 1
+            spans.extend((m.start(g), m.end(g), rep) for g, rep in groups)
+    for a, b, rep in sorted(spans, reverse=True):
+        text = text[:a] + rep + text[b:]
+    return text, hits
+
+
 async def _settings() -> dict[str, Any]:
     from tp_mcp.tools.settings import tp_get_athlete_settings
 
@@ -192,6 +229,49 @@ async def _settings() -> dict[str, Any]:
     if not isinstance(res, dict) or res.get("isError"):
         raise RuntimeError(f"settings read failed: {(res or {}).get('message')}")
     return res.get("settings") or {}
+
+
+async def _apply_text(kind: str, old: float, new: float, stale: list[dict[str, Any]],
+                      by_id: dict[str, dict[str, Any]], mode: str) -> dict[str, Any]:
+    """FORK 2026-11-06 (coach menu, 11/06 CP 270→278 = 15 sessions re-typed by hand).
+
+    preview: new description per session, nothing written.
+    write: lo_update_workout_verified(description=…) per session, then the body is
+    checked against the graph (lo_render_body) and re-rendered when they disagree —
+    the structure is %-based and already follows the new threshold, so the graph wins.
+    """
+    from tp_mcp.tools.lo_sync import lo_render_body
+    from tp_mcp.tools.lo_tools import lo_update_workout_verified
+
+    rows, written, failed = [], 0, 0
+    for s in stale:
+        wid = s["workout_id"]
+        text = (by_id.get(wid) or {}).get("description") or ""
+        new_text, n = rewrite_text(kind, old, new, text)
+        row: dict[str, Any] = {"workout_id": wid, "date": s["date"], "title": s["title"], "replaced": n}
+        if mode == "preview" or new_text == text:
+            row["new_description"] = new_text
+            rows.append(row)
+            continue
+        res = await lo_update_workout_verified(wid, description=new_text)
+        row["written"] = bool(res.get("success"))
+        if not row["written"]:
+            failed += 1
+            row["error"] = res.get("error_code") or res.get("message")
+            rows.append(row)
+            continue
+        written += 1
+        try:
+            r = await lo_render_body(wid, apply=True)
+            row["body_vs_graph"] = ("re-rendered" if r.get("applied") else
+                                    "in_sync" if r.get("in_sync") else
+                                    r.get("error_code") or "not_checked")
+        except Exception as e:  # noqa: BLE001 — the text write already landed
+            row["body_vs_graph"] = f"check_failed: {e}"
+        rows.append(row)
+    return {"mode": mode, "sessions": rows, "written": written, "failed": failed,
+            "note": ("比例換算、四捨五入；教練處方取整（如 4:51→4:50）或 CP／FTP 數值本身的敘述句"
+                     "（「CP 270」）不會自動改，寫入後仍要人工看一遍並跑 validate R80。")}
 
 
 async def lo_update_threshold_verified(
@@ -203,11 +283,15 @@ async def lo_update_threshold_verified(
     scan_days: int = 28,
     dry_run: bool = False,
     today: str | None = None,
+    apply_text: str = "none",
 ) -> dict[str, Any]:
     from tp_mcp.tools.lo_review import athlete_identity
     from tp_mcp.tools.settings import tp_update_ftp, tp_update_hr_zones, tp_update_speed_zones
     from tp_mcp.tools.workouts import tp_get_workouts
 
+    if apply_text not in ("none", "preview", "write"):
+        return {"isError": True, "error_code": "INVALID_ARGS",
+                "message": "apply_text must be none|preview|write"}
     if kind not in _KINDS:
         return {"isError": True, "error_code": "INVALID_ARGS",
                 "message": f"kind must be one of {sorted(_KINDS)}"}
@@ -295,6 +379,10 @@ async def lo_update_threshold_verified(
         workouts = (listed or {}).get("workouts") or [] if not (listed or {}).get("isError") else []
         stale = scan_stale_text(kind, float(old or 0), float(new_thr or 0), workouts, sports)
         out["stale_text"] = {"window": [start, end], "scanned": len(workouts), "workouts": stale}
+        if stale and apply_text != "none":
+            by_id = {str(w.get("id")): w for w in workouts}
+            mode = "preview" if dry_run or out.get("isError") else apply_text
+            out["stale_text"]["apply"] = await _apply_text(kind, float(old), float(new_thr), stale, by_id, mode)
         if stale:
             out["next_steps"] = (
                 f"{len(stale)} planned session(s) still quote the old {spec['unit']} numbers. Structures are "
@@ -318,7 +406,8 @@ def register_lo_threshold(tools: list[Any], handlers: dict[str, Any]) -> None:
             "settings back: success only if the target set holds the sent value AND no other zone "
             "set changed (COLLATERAL_CHANGE). Then scans the next scan_days of planned sessions for "
             "absolute numbers tied to the old threshold (W / pace / heart rate) and lists each with "
-            "a proportional suggestion — read-only, nothing is edited. dry_run=true: read + scan "
+            "a proportional suggestion; apply_text=preview|write rewrites those numbers in place "
+            "(write = verified, then bodies re-rendered from the graph). dry_run=true: read + scan "
             "with the proposed value, write nothing. Ask the coach before writing (權限邊界)."
         ),
         input_schema={
@@ -333,6 +422,12 @@ def register_lo_threshold(tools: list[Any], handlers: dict[str, Any]) -> None:
                 "scan_days": {"type": "integer", "default": 28},
                 "dry_run": {"type": "boolean", "default": False},
                 "today": {"type": "string", "description": "YYYY-MM-DD scan start; default today."},
+                "apply_text": {"type": "string", "enum": ["none", "preview", "write"], "default": "none",
+                               "description": "none: list only. preview: return each session's new "
+                                              "description (proportional numbers swapped in place). "
+                                              "write: write them verified, then re-render bodies that "
+                                              "disagree with the graph. dry_run or a failed threshold "
+                                              "write downgrades write→preview."},
             },
             "required": ["kind", "value"],
         },
@@ -344,7 +439,7 @@ def register_lo_threshold(tools: list[Any], handlers: dict[str, Any]) -> None:
             hr_workout_type=str(args.get("hr_workout_type", "general")),
             max_hr=args.get("max_hr"), resting_hr=args.get("resting_hr"),
             scan_days=int(args.get("scan_days", 28)), dry_run=bool(args.get("dry_run", False)),
-            today=args.get("today"),
+            today=args.get("today"), apply_text=str(args.get("apply_text", "none")),
         )
 
     handlers["lo_update_threshold_verified"] = _h
