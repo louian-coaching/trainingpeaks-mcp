@@ -1912,7 +1912,9 @@ for _tool in TOOLS:
 _HIDE_EQUIPMENT = ("tp_get_equipment", "tp_create_equipment", "tp_update_equipment", "tp_delete_equipment")
 _HIDE_GROUPS = ("tp_list_groups", "tp_list_athletes_in_group", "tp_create_group", "tp_rename_group",
                 "tp_delete_group", "tp_add_athletes_to_group", "tp_remove_athletes_from_group")
-_HIDE_LIBRARY = ("tp_get_libraries", "tp_get_library_items", "tp_get_library_item", "tp_create_library",
+# FORK 2026-11-07: tp_get_libraries stays visible (read-only) — PR #196's strength-template
+# tools need a library_id, and the strength templates are not in 3818233.
+_HIDE_LIBRARY = ("tp_get_library_items", "tp_get_library_item", "tp_create_library",
                  "tp_delete_library", "tp_create_library_item", "tp_update_library_item",
                  "tp_schedule_library_workout")
 _HIDE_PLANS = ("tp_list_training_plans", "tp_get_training_plan", "tp_get_training_plan_workouts",
