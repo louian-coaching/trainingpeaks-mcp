@@ -1709,6 +1709,7 @@ from tp_mcp.tools.lo_weather import register_lo_weather  # noqa: E402
 from tp_mcp.tools.lo_forecast import register_lo_forecast  # noqa: E402
 from tp_mcp.tools.lo_race import register_lo_race  # noqa: E402
 from tp_mcp.tools.lo_weekly import register_lo_weekly  # noqa: E402
+from tp_mcp.tools.lo_plans import register_lo_plans  # noqa: E402
 
 _LO_HANDLERS: dict[str, Any] = {}
 register_lo_tools(TOOLS, _LO_HANDLERS)
@@ -1725,10 +1726,17 @@ register_lo_capability(TOOLS, _LO_HANDLERS)  # FORK 2026-10-03: 能力層 PROC-8
 register_lo_weather(TOOLS, _LO_HANDLERS)  # FORK 2026-10-17: 歷史天氣 PROC-93
 register_lo_forecast(TOOLS, _LO_HANDLERS)  # FORK 2026-10-21: 預報 PROC-85b
 register_lo_race(TOOLS, _LO_HANDLERS)  # FORK 2026-11-02: 鐵人複盤 PROC-41g
+register_lo_plans(TOOLS, _LO_HANDLERS)  # FORK 2026-11-12: 訓練計劃建立／寫課／改課
 _ATHLETE_EXEMPT_TOOLS |= set(LO_STH_TOOLS) | set(LO_STH_EXT_TOOLS)  # STH 用 tri_user_id，不吃 TP athlete
 _ATHLETE_EXEMPT_TOOLS.add("lo_weekly_check")  # takes its own `athletes` list
 _ATHLETE_EXEMPT_TOOLS.add("lo_version")  # local, not athlete-scoped
 _ATHLETE_EXEMPT_TOOLS.add("lo_capability_scan")  # takes its own `athletes` list
+# FORK 2026-11-12: training plans belong to the coach, not to a targeted athlete.
+_ATHLETE_EXEMPT_TOOLS |= {
+    "tp_list_training_plans", "tp_get_training_plan", "tp_get_training_plan_workouts",
+    "lo_plan_get_workouts", "lo_plan_create", "lo_plan_update_meta", "lo_plan_add_workouts",
+    "lo_plan_update_workout", "lo_plan_delete_workouts",
+}
 
 for _tool in TOOLS:
     if _tool.name not in _ATHLETE_EXEMPT_TOOLS:
@@ -1833,6 +1841,7 @@ _READ_ONLY_PREFIXES = ("tp_get_", "tp_list_", "tp_download_", "tp_search_", "tp_
 _READ_ONLY_EXTRA = {  # FORK: lo_ read tools
     "tp_auth_status", "lo_get_week_for_validate", "lo_diff_week", "lo_weekly_check",
     "lo_version", "lo_capability_scan", "lo_weather_history", "lo_weather_forecast",
+    "lo_plan_get_workouts",
 }
 
 # Irrecoverable data removal. Everything else that writes is recoverable by a
@@ -1848,6 +1857,7 @@ _DESTRUCTIVE_TOOLS = {
     "tp_delete_workout",
     "tp_delete_workout_file",
     "tp_remove_athletes_from_group",
+    "lo_plan_delete_workouts",  # FORK 2026-11-12
 }
 
 # Writes that append or create: repeating the call duplicates data. Updates,
@@ -1875,6 +1885,9 @@ _NON_IDEMPOTENT_WRITES = {
     "tp_schedule_library_workout",
     "tp_upload_workout_file",
     "lo_sth_create_week",  # FORK: creates STH sessions (duplicates if repeated)
+    # FORK 2026-11-12: lo_plan_create refuses a duplicate title and lo_plan_add_workouts
+    # skips same day + sport + title by default, but both append when told not to.
+    "lo_plan_create", "lo_plan_add_workouts",
 }
 
 _TITLE_ACRONYMS = {"atp": "ATP", "ftp": "FTP", "hr": "HR", "prs": "PRs"}
@@ -1917,8 +1930,9 @@ _HIDE_GROUPS = ("tp_list_groups", "tp_list_athletes_in_group", "tp_create_group"
 _HIDE_LIBRARY = ("tp_get_library_items", "tp_get_library_item", "tp_create_library",
                  "tp_delete_library", "tp_create_library_item", "tp_update_library_item",
                  "tp_schedule_library_workout")
-_HIDE_PLANS = ("tp_list_training_plans", "tp_get_training_plan", "tp_get_training_plan_workouts",
-               "tp_apply_training_plan")
+# FORK 2026-11-12: list / summary are visible again (plan authoring, lo_plans.py).
+# tp_get_training_plan_workouts is replaced by lo_plan_get_workouts (ids + week/day);
+# apply stays hidden. Both are listed in _COACH_HIDDEN below.
 _HIDE_FILES = ("tp_upload_workout_file", "tp_download_workout_file", "tp_delete_workout_file",
                "tp_pair_workout", "tp_unpair_workout")
 _COACH_HIDDEN: dict[str, str] = {
@@ -1926,7 +1940,9 @@ _COACH_HIDDEN: dict[str, str] = {
     **dict.fromkeys(_HIDE_GROUPS, "athlete groups are managed in the TP web UI"),
     **dict.fromkeys(_HIDE_LIBRARY, "the TP library (3818233) is for the coach's manual scheduling; "
                                    "the model builds with tp_create_workouts_batch (sop-weekly Step 4)"),
-    **dict.fromkeys(_HIDE_PLANS, "training-plan store tools are not used (apply has a destructive history)"),
+    "tp_get_training_plan_workouts": "use lo_plan_get_workouts (returns workout ids and week/day)",
+    "tp_apply_training_plan": "applying a plan to an athlete is not used here (the native apply has "
+                              "a destructive history); athletes get individually built weeks",
     **dict.fromkeys(("tp_get_nutrition", "tp_update_nutrition"), "nutrition is not tracked here"),
     **dict.fromkeys(_HIDE_FILES, "file upload/pairing is done by the athlete's devices"),
     "tp_create_zones": "zone changes go through lo_update_threshold_verified / sop-threshold-update",

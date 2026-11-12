@@ -69,6 +69,13 @@ class TestListTools:
             "lo_weather_history",
             "lo_weather_forecast",
             "lo_race_metrics",
+            # FORK 2026-11-12: training-plan authoring
+            "lo_plan_get_workouts",
+            "lo_plan_create",
+            "lo_plan_update_meta",
+            "lo_plan_add_workouts",
+            "lo_plan_update_workout",
+            "lo_plan_delete_workouts",
             "lo_sth_call",
             "lo_sth_calc_loads",
             "lo_sth_create_week",
