@@ -36,14 +36,22 @@ Guards:
   * /plans/v1/commands/applyplan stays blocked in the HTTP client.
   * No automatic retry: a write with no answer is reported, then looked up in the
     read-back, never sent twice.
+
+File hand-off (FORK 2026-11-12, TECH-62): long Chinese descriptions passed as tool
+arguments had to be re-typed by the model and came back with wrong characters.
+``payload_file`` (add / update) reads the workouts from a JSON file on this machine and
+``save_to`` (get) writes the full read-back to one, so text goes file → TP → file and
+is compared by a script, never by eye.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import date as date_type
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -75,6 +83,16 @@ _LOCK_MESSAGE = (
 
 def _err(code: str, message: str, **extra: Any) -> dict[str, Any]:
     return {"isError": True, "error_code": code, "message": message, **extra}
+
+
+def _read_json_file(path: str) -> tuple[Any, dict[str, Any] | None]:
+    """Load a JSON hand-off file; (data, None) or (None, error)."""
+    try:
+        return json.loads(Path(os.path.expanduser(path)).read_text(encoding="utf-8")), None
+    except FileNotFoundError:
+        return None, _err("VALIDATION_ERROR", f"payload_file not found: {path}")
+    except (OSError, ValueError) as e:
+        return None, _err("VALIDATION_ERROR", f"payload_file could not be read as JSON: {e}")
 
 
 def _api_err(response: Any, what: str) -> dict[str, Any]:
@@ -158,6 +176,13 @@ def _row(w: dict[str, Any], anchor: date_type | None, full: bool) -> dict[str, A
     else:
         row["description_head"] = (desc or "")[:_HEAD_CHARS] or None
     return row
+
+
+def _slim(row: dict[str, Any]) -> dict[str, Any]:
+    """A full row cut back to the brief shape (after it was saved to a file)."""
+    out = {k: v for k, v in row.items() if k not in ("description", "structured_workout")}
+    out["description_head"] = (row.get("description") or "")[:_HEAD_CHARS] or None
+    return out
 
 
 async def _load(
@@ -318,8 +343,13 @@ def _anchor_warning(before: date_type | None, plan_after: dict[str, Any]) -> str
 
 async def lo_plan_get_workouts(
     plan_id: int | str, weeks: list[int] | None = None, full: bool = False,
+    save_to: str | None = None,
 ) -> dict[str, Any]:
-    """Plan workouts with ids, laid out by week (1..) and day (1 = Monday)."""
+    """Plan workouts with ids, laid out by week (1..) and day (1 = Monday).
+
+    ``save_to`` writes the FULL rows (description + structured_workout) to a JSON file
+    and keeps the reply brief unless ``full`` is also set.
+    """
     pid = _plan_id(plan_id)
     if pid is None:
         return _err("VALIDATION_ERROR", "plan_id must be a positive integer.")
@@ -329,12 +359,24 @@ async def lo_plan_get_workouts(
         if error or plan is None:
             return error or _err("API_ERROR", "Could not read the plan.")
         anchor = _anchor(plan)
-        rows = [_row(w, anchor, full) for w in workouts]
+        rows = [_row(w, anchor, full or bool(save_to)) for w in workouts]
         rows.sort(key=lambda r: (r["week"] or 0, r["day"] or 0, r["workout_id"] or 0))
         if wanted is not None:
             rows = [r for r in rows if r["week"] in wanted]
         out: dict[str, Any] = {"plan": _brief(plan), "count": len(rows),
-                               "total_in_plan": len(workouts), "workouts": rows}
+                               "total_in_plan": len(workouts)}
+        if save_to:
+            target = Path(os.path.expanduser(save_to))
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(json.dumps({**out, "workouts": rows}, ensure_ascii=False, indent=1),
+                                  encoding="utf-8")
+            except OSError as e:
+                return _err("VALIDATION_ERROR", f"save_to could not be written: {e}")
+            out["saved_to"] = str(target)
+            if not full:
+                rows = [_slim(r) for r in rows]
+        out["workouts"] = rows
         warning = _count_warning(plan, workouts)
         if warning:
             out["warnings"] = [warning]
@@ -442,13 +484,23 @@ async def lo_plan_update_meta(
 
 
 async def lo_plan_add_workouts(
-    plan_id: int | str, workouts: list[dict[str, Any]], allow_public: bool = False,
-    skip_if_exists: bool = True, dry_run: bool = False,
+    plan_id: int | str, workouts: list[dict[str, Any]] | None = None, allow_public: bool = False,
+    skip_if_exists: bool = True, dry_run: bool = False, payload_file: str | None = None,
 ) -> dict[str, Any]:
-    """Create workouts inside a plan; every created workout is read back and compared."""
+    """Create workouts inside a plan; every created workout is read back and compared.
+
+    ``payload_file`` is a JSON file holding the workouts list (or ``{"workouts": [...]}``).
+    """
     pid = _plan_id(plan_id)
     if pid is None:
         return _err("VALIDATION_ERROR", "plan_id must be a positive integer.")
+    if payload_file:
+        if workouts:
+            return _err("VALIDATION_ERROR", "Give workouts or payload_file, not both.")
+        data, file_error = _read_json_file(payload_file)
+        if file_error:
+            return file_error
+        workouts = data.get("workouts") if isinstance(data, dict) else data
     if not isinstance(workouts, list) or not workouts:
         return _err("VALIDATION_ERROR", "workouts must be a non-empty list.")
     if len(workouts) > MAX_BATCH:
@@ -771,12 +823,16 @@ def register_lo_plans(tools: list[Any], handlers: dict[str, Any]) -> None:
             "Workouts of a training plan with their workout_id, week (1..) and day (1 = Monday), "
             "sport, title, duration, TSS, has_structure and the first characters of the description. "
             "weeks=[1,2] limits the output; full=true adds the whole description and the "
-            "structured_workout (use weeks or save_to for long plans). Read-only."
+            "structured_workout. save_to writes those full rows to a JSON file on this machine "
+            "and keeps the reply brief: use it to compare what TP stored with the payload file "
+            "by script instead of pasting text back. Read-only."
         ),
         input_schema={"type": "object", "properties": {
             "plan_id": plan_id,
             "weeks": {"type": "array", "items": {"type": "integer"}},
             "full": {"type": "boolean", "default": False},
+            "save_to": {"type": "string", "description": "Absolute path (on the machine running "
+                        "this server) for the full read-back as JSON."},
         }, "required": ["plan_id"]},
     ))
     tools.append(Tool(
@@ -812,7 +868,9 @@ def register_lo_plans(tools: list[Any], handlers: dict[str, Any]) -> None:
             "date. Every created workout is read back and compared; rows report created / "
             "skipped_exists / failed / uncertain. An empty plan must receive week 1 in its first "
             "batch. Not retried automatically. dry_run lists what would be created. Published "
-            "plans need allow_public."
+            "plans need allow_public. payload_file reads the workouts from a JSON file (a list, or "
+            "{\"workouts\": [...]}) instead of the workouts argument: prefer it for anything with "
+            "long text, so nothing is re-typed."
         ),
         input_schema={"type": "object", "properties": {
             "plan_id": plan_id,
@@ -823,7 +881,10 @@ def register_lo_plans(tools: list[Any], handlers: dict[str, Any]) -> None:
                                "description": "Skip an item when the same day + sport + title is already there."},
             "dry_run": {"type": "boolean", "default": False},
             "allow_public": allow_public,
-        }, "required": ["plan_id", "workouts"]},
+            "payload_file": {"type": "string", "description": "Absolute path (on the machine "
+                             "running this server) of a JSON file with the workouts. Use instead "
+                             "of workouts."},
+        }, "required": ["plan_id"]},
     ))
     tools.append(Tool(
         name="lo_plan_update_workout",
@@ -831,12 +892,15 @@ def register_lo_plans(tools: list[Any], handlers: dict[str, Any]) -> None:
             "Change one workout of a training plan: only the given fields change, the rest is "
             "re-sent as read (a partial write would blank them). week+day move it; description=\"\" "
             "clears the description; a new structure needs tss_planned. Read back and compared. "
-            "Published plans need allow_public."
+            "Published plans need allow_public. payload_file reads the fields from a JSON object "
+            "in a file (same keys as the arguments; arguments given directly win)."
         ),
         input_schema={"type": "object", "properties": {
             "plan_id": plan_id, "workout_id": {"type": "integer"}, "week": week, "day": day,
             **workout_fields, "clear_structure": {"type": "boolean", "default": False},
             "allow_public": allow_public,
+            "payload_file": {"type": "string", "description": "Absolute path of a JSON object "
+                             "with the fields to change."},
         }, "required": ["plan_id", "workout_id"]},
     ))
     tools.append(Tool(
@@ -856,7 +920,8 @@ def register_lo_plans(tools: list[Any], handlers: dict[str, Any]) -> None:
 
     async def _h_get(args: dict[str, Any]) -> dict[str, Any]:
         return await lo_plan_get_workouts(plan_id=args["plan_id"], weeks=args.get("weeks"),
-                                          full=bool(args.get("full", False)))
+                                          full=bool(args.get("full", False)),
+                                          save_to=args.get("save_to"))
 
     async def _h_create(args: dict[str, Any]) -> dict[str, Any]:
         return await lo_plan_create(title=args["title"], description=args.get("description"),
@@ -869,19 +934,31 @@ def register_lo_plans(tools: list[Any], handlers: dict[str, Any]) -> None:
                                          allow_public=bool(args.get("allow_public", False)))
 
     async def _h_add(args: dict[str, Any]) -> dict[str, Any]:
-        return await lo_plan_add_workouts(plan_id=args["plan_id"], workouts=args.get("workouts") or [],
+        return await lo_plan_add_workouts(plan_id=args["plan_id"], workouts=args.get("workouts") or None,
                                           allow_public=bool(args.get("allow_public", False)),
                                           skip_if_exists=bool(args.get("skip_if_exists", True)),
-                                          dry_run=bool(args.get("dry_run", False)))
+                                          dry_run=bool(args.get("dry_run", False)),
+                                          payload_file=args.get("payload_file"))
 
     async def _h_update(args: dict[str, Any]) -> dict[str, Any]:
         keys = ("title", "description", "sport", "week", "day", "duration_minutes", "distance_km",
                 "tss_planned", "if_planned", "structure", "structured_workout")
+        fields: dict[str, Any] = {}
+        if args.get("payload_file"):
+            data, file_error = _read_json_file(args["payload_file"])
+            if file_error:
+                return file_error
+            if not isinstance(data, dict):
+                return _err("VALIDATION_ERROR", "payload_file must hold one JSON object.")
+            unknown = sorted(set(data) - set(keys))
+            if unknown:
+                return _err("VALIDATION_ERROR", f"payload_file has unknown keys: {unknown}")
+            fields.update({k: v for k, v in data.items() if v is not None})
+        fields.update({k: args[k] for k in keys if args.get(k) is not None})
         return await lo_plan_update_workout(
             plan_id=args["plan_id"], workout_id=args["workout_id"],
             clear_structure=bool(args.get("clear_structure", False)),
-            allow_public=bool(args.get("allow_public", False)),
-            **{k: args[k] for k in keys if args.get(k) is not None})
+            allow_public=bool(args.get("allow_public", False)), **fields)
 
     async def _h_delete(args: dict[str, Any]) -> dict[str, Any]:
         return await lo_plan_delete_workouts(plan_id=args["plan_id"], workout_ids=args.get("workout_ids") or [],

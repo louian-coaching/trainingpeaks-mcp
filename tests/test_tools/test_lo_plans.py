@@ -23,6 +23,7 @@ from tp_mcp.tools.lo_plans import (
     lo_plan_get_workouts,
     lo_plan_update_meta,
     lo_plan_update_workout,
+    register_lo_plans,
 )
 
 _NATIVE = {
@@ -305,6 +306,63 @@ async def test_get_workouts_filters_weeks_and_full_adds_structure(tp):
     assert row["has_structure"] and len(row["description_head"]) == 60 and "structured_workout" not in row
     full = await lo_plan_get_workouts(pid, full=True)
     assert full["workouts"][0]["structured_workout"] == _NATIVE and len(full["workouts"][0]["description"]) == 200
+
+
+async def test_save_to_writes_full_rows_and_keeps_the_reply_brief(tp, tmp_path):
+    pid = tp.add_plan(workouts=[
+        _w("2026-11-16", 2, "騎", description="划手" * 100, structure=dict(_NATIVE), totalTimePlanned=1.0),
+        _w("2026-11-24", 3, "跑", description="接著"),
+    ])
+    target = tmp_path / "sub" / "readback.json"
+    r = await lo_plan_get_workouts(pid, weeks=[1], save_to=str(target))
+    assert r["saved_to"] == str(target) and r["count"] == 1
+    assert "description" not in r["workouts"][0] and len(r["workouts"][0]["description_head"]) == 60
+    saved = json.loads(target.read_text(encoding="utf-8"))
+    assert saved["count"] == 1 and saved["workouts"][0]["description"] == "划手" * 100
+    assert saved["workouts"][0]["structured_workout"] == _NATIVE
+    assert "划手" in target.read_text(encoding="utf-8")  # stored as characters, not \\u escapes
+    both = await lo_plan_get_workouts(pid, full=True, save_to=str(target))
+    assert both["workouts"][0]["description"] == "划手" * 100 and both["count"] == 2
+
+
+async def test_add_reads_the_workouts_from_a_payload_file(tp, tmp_path):
+    pid = tp.add_plan(workouts=[_w("2026-11-16", title="輕鬆跑")])
+    items = [{"week": 1, "day": 2, "sport": "Run", "title": "有氧耐力", "description": "跑到中途試著吸三步、吐三步"}]
+    as_list = tmp_path / "list.json"
+    as_list.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+    r = await lo_plan_add_workouts(pid, payload_file=str(as_list))
+    assert r["created"] == 1 and tp.writes[0][2]["description"] == "跑到中途試著吸三步、吐三步"
+    wrapped = tmp_path / "wrapped.json"
+    wrapped.write_text(json.dumps({"workouts": [dict(items[0], day=3)]}, ensure_ascii=False), encoding="utf-8")
+    assert (await lo_plan_add_workouts(pid, payload_file=str(wrapped)))["created"] == 1
+    both = await lo_plan_add_workouts(pid, items, payload_file=str(as_list))
+    assert both["error_code"] == "VALIDATION_ERROR"
+    missing = await lo_plan_add_workouts(pid, payload_file=str(tmp_path / "nope.json"))
+    assert missing["error_code"] == "VALIDATION_ERROR" and len(tp.writes) == 2
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json", encoding="utf-8")
+    assert (await lo_plan_add_workouts(pid, payload_file=str(broken)))["error_code"] == "VALIDATION_ERROR"
+
+
+async def test_update_handler_merges_a_payload_file(tp, tmp_path):
+    pid = tp.add_plan(workouts=[_w("2026-11-18", 3, "有氧耐力", description="舊", totalTimePlanned=0.5,
+                                   tssPlanned=30)])
+    wid = next(iter(tp.workouts[pid]))
+    tools, handlers = [], {}
+    register_lo_plans(tools, handlers)
+    f = tmp_path / "one.json"
+    f.write_text(json.dumps({"description": "接著70分鐘", "title": "檔案標題"}, ensure_ascii=False), encoding="utf-8")
+    r = await handlers["lo_plan_update_workout"]({"plan_id": pid, "workout_id": wid, "payload_file": str(f),
+                                                  "title": "參數標題"})
+    assert r["success"] and r["after"]["title"] == "參數標題"
+    assert tp.workouts[pid][wid]["description"] == "接著70分鐘" and tp.workouts[pid][wid]["tssPlanned"] == 30
+    f.write_text(json.dumps({"nope": 1}), encoding="utf-8")
+    bad = await handlers["lo_plan_update_workout"]({"plan_id": pid, "workout_id": wid, "payload_file": str(f)})
+    assert bad["error_code"] == "VALIDATION_ERROR"
+    schema = {t.name: t.input_schema for t in tools}
+    assert "payload_file" in schema["lo_plan_add_workouts"]["properties"]
+    assert schema["lo_plan_add_workouts"]["required"] == ["plan_id"]
+    assert "save_to" in schema["lo_plan_get_workouts"]["properties"]
 
 
 async def test_coach_toolset_and_metadata(monkeypatch):
