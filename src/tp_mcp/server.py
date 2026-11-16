@@ -1741,7 +1741,7 @@ _ATHLETE_EXEMPT_TOOLS.add("lo_settings_audit")  # FORK 2026-11-16: takes its own
 _ATHLETE_EXEMPT_TOOLS |= {
     "tp_list_training_plans", "tp_get_training_plan", "tp_get_training_plan_workouts",
     "lo_plan_get_workouts", "lo_plan_create", "lo_plan_update_meta", "lo_plan_add_workouts",
-    "lo_plan_update_workout", "lo_plan_delete_workouts",
+    "lo_plan_update_workout", "lo_plan_delete_workouts", "lo_plan_replace_workouts",
 }
 
 for _tool in TOOLS:
@@ -1864,6 +1864,7 @@ _DESTRUCTIVE_TOOLS = {
     "tp_delete_workout_file",
     "tp_remove_athletes_from_group",
     "lo_plan_delete_workouts",  # FORK 2026-11-12
+    "lo_plan_replace_workouts",  # FORK 2026-11-16: deletes the old set after the new one lands
 }
 
 # Writes that append or create: repeating the call duplicates data. Updates,
@@ -1893,7 +1894,7 @@ _NON_IDEMPOTENT_WRITES = {
     "lo_sth_create_week",  # FORK: creates STH sessions (duplicates if repeated)
     # FORK 2026-11-12: lo_plan_create refuses a duplicate title and lo_plan_add_workouts
     # skips same day + sport + title by default, but both append when told not to.
-    "lo_plan_create", "lo_plan_add_workouts",
+    "lo_plan_create", "lo_plan_add_workouts", "lo_plan_replace_workouts",
 }
 
 _TITLE_ACRONYMS = {"atp": "ATP", "ftp": "FTP", "hr": "HR", "prs": "PRs"}

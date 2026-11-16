@@ -178,6 +178,14 @@ def _row(w: dict[str, Any], anchor: date_type | None, full: bool) -> dict[str, A
     return row
 
 
+def _per_week(rows: list[dict[str, Any]]) -> dict[str, int]:
+    per: dict[str, int] = {}
+    for r in rows:
+        k = str(r.get("week"))
+        per[k] = per.get(k, 0) + 1
+    return per
+
+
 def _slim(row: dict[str, Any]) -> dict[str, Any]:
     """A full row cut back to the brief shape (after it was saved to a file)."""
     out = {k: v for k, v in row.items() if k not in ("description", "structured_workout")}
@@ -348,7 +356,8 @@ async def lo_plan_get_workouts(
     """Plan workouts with ids, laid out by week (1..) and day (1 = Monday).
 
     ``save_to`` writes the FULL rows (description + structured_workout) to a JSON file
-    and keeps the reply brief unless ``full`` is also set.
+    and keeps the reply brief (slim rows, or only per-week counts past MAX_BATCH rows),
+    whatever ``full`` says.
     """
     pid = _plan_id(plan_id)
     if pid is None:
@@ -374,7 +383,14 @@ async def lo_plan_get_workouts(
             except OSError as e:
                 return _err("VALIDATION_ERROR", f"save_to could not be written: {e}")
             out["saved_to"] = str(target)
-            if not full:
+            # FORK 2026-11-16: with save_to the reply never carries the full text (a
+            # 131-workout read-back came back as 540 KB). Up to MAX_BATCH rows come back
+            # slim; past that only the per-week counts — read the file for the rest.
+            if len(rows) > MAX_BATCH:
+                out["per_week"] = _per_week(rows)
+                rows = []
+                out["rows_omitted"] = f"more than {MAX_BATCH} rows: see saved_to"
+            else:
                 rows = [_slim(r) for r in rows]
         out["workouts"] = rows
         warning = _count_warning(plan, workouts)
@@ -490,7 +506,86 @@ async def lo_plan_add_workouts(
     """Create workouts inside a plan; every created workout is read back and compared.
 
     ``payload_file`` is a JSON file holding the workouts list (or ``{"workouts": [...]}``).
+    FORK 2026-11-16: more than MAX_BATCH items are written in batches of MAX_BATCH,
+    in week/day order; a batch with problems stops the rest.
     """
+    if payload_file:
+        if workouts:
+            return _err("VALIDATION_ERROR", "Give workouts or payload_file, not both.")
+        data, file_error = _read_json_file(payload_file)
+        if file_error:
+            return file_error
+        workouts = data.get("workouts") if isinstance(data, dict) else data
+    if not isinstance(workouts, list) or not workouts:
+        return _err("VALIDATION_ERROR", "workouts must be a non-empty list.")
+    if dry_run or len(workouts) <= MAX_BATCH:
+        return await _add_batch(plan_id, workouts, allow_public, skip_if_exists, dry_run)
+
+    # validate everything before the first write
+    bad: list[dict[str, Any]] = []
+    for index, raw in enumerate(workouts):
+        try:
+            _Item(**raw)
+        except (ValidationError, TypeError) as e:
+            msg = format_validation_error(e) if isinstance(e, ValidationError) else str(e)
+            bad.append({"index": index, "error": msg})
+    if bad:
+        return _err("VALIDATION_ERROR", "Nothing was written: fix these items first.", errors=bad)
+    order = sorted(range(len(workouts)), key=lambda i: (workouts[i]["week"], workouts[i]["day"], i))
+    chunks = [order[i:i + MAX_BATCH] for i in range(0, len(order), MAX_BATCH)]
+    rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    last: dict[str, Any] = {}
+    stopped_at: int | None = None
+    for n, chunk in enumerate(chunks):
+        res = await _add_batch(plan_id, [workouts[i] for i in chunk], allow_public, skip_if_exists, False)
+        if "rows" not in res:  # refused before writing (lock, read error, ...)
+            if n == 0:
+                return res
+            warnings.append(f"Batch {n + 1} was refused: {res.get('message')}")
+            stopped_at = n
+            break
+        last = res
+        for row in res["rows"]:
+            rows.append({**row, "index": chunk[row["index"]]})
+        warnings.extend(res.get("warnings") or [])
+        if not res.get("success"):
+            stopped_at = n + 1
+            break
+    if stopped_at is not None:
+        done = {r["index"] for r in rows}
+        for i in order:
+            if i not in done:
+                w = workouts[i]
+                rows.append({"index": i, "week": w["week"], "day": w["day"], "sport": w["sport"],
+                             "title": w["title"], "status": "not_attempted"})
+        warnings.append("Stopped after a batch with problems; later batches were not sent.")
+    rows.sort(key=lambda r: r["index"])
+    created = [r for r in rows if r["status"] == "created"]
+    problems = [r for r in rows if r["status"] in ("failed", "uncertain", "not_attempted", "missing_after_create")]
+    ok = not problems and all(r.get("verified") for r in created)
+    out: dict[str, Any] = {
+        "success": ok,
+        "plan": last.get("plan"),
+        "batches": len(chunks),
+        "created": len(created),
+        "skipped": sum(1 for r in rows if r["status"] == "skipped_exists"),
+        "problems": len(problems),
+        # more than MAX_BATCH rows: only what needs attention comes back
+        "rows": [r for r in rows if not (r["status"] == "created" and r.get("verified"))],
+        "created_ids": [r["workout_id"] for r in created],
+    }
+    if warnings:
+        out["warnings"] = list(dict.fromkeys(warnings))
+    return out
+
+
+async def _add_batch(
+    plan_id: int | str, workouts: list[dict[str, Any]], allow_public: bool,
+    skip_if_exists: bool, dry_run: bool,
+) -> dict[str, Any]:
+    """One call's worth of creates (≤ MAX_BATCH unless dry_run)."""
+    payload_file = None
     pid = _plan_id(plan_id)
     if pid is None:
         return _err("VALIDATION_ERROR", "plan_id must be a positive integer.")
@@ -503,8 +598,8 @@ async def lo_plan_add_workouts(
         workouts = data.get("workouts") if isinstance(data, dict) else data
     if not isinstance(workouts, list) or not workouts:
         return _err("VALIDATION_ERROR", "workouts must be a non-empty list.")
-    if len(workouts) > MAX_BATCH:
-        return _err("VALIDATION_ERROR", f"At most {MAX_BATCH} workouts per call (got {len(workouts)}).")
+    if len(workouts) > MAX_BATCH and not dry_run:
+        return _err("VALIDATION_ERROR", f"At most {MAX_BATCH} workouts per batch (got {len(workouts)}).")
 
     items: list[_Item] = []
     bad: list[dict[str, Any]] = []
@@ -731,15 +826,55 @@ async def lo_plan_update_workout(
 async def lo_plan_delete_workouts(
     plan_id: int | str, workout_ids: list[Any], allow_public: bool = False, dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Delete workouts from a plan; each is read first and confirmed gone afterwards."""
+    """Delete workouts from a plan; each is read first and confirmed gone afterwards.
+
+    FORK 2026-11-16: more than MAX_BATCH ids are deleted in batches; the reply then lists
+    only the rows that did not end as deleted.
+    """
+    ids = list(dict.fromkeys(workout_ids or []))
+    if dry_run or len(ids) <= MAX_BATCH:
+        return await _delete_batch(plan_id, ids, allow_public, dry_run)
+    rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    last: dict[str, Any] = {}
+    for n in range(0, len(ids), MAX_BATCH):
+        res = await _delete_batch(plan_id, ids[n:n + MAX_BATCH], allow_public, False)
+        if "rows" not in res:
+            if n == 0:
+                return res
+            warnings.append(f"A later batch was refused: {res.get('message')}")
+            break
+        last = res
+        rows.extend(res["rows"])
+        warnings.extend(res.get("warnings") or [])
+        if not res.get("success"):
+            warnings.append("Stopped after a batch with problems; later batches were not sent.")
+            break
+    done = {r["workout_id"] for r in rows}
+    rows.extend({"workout_id": i, "status": "not_attempted"} for i in ids if i not in done)
+    deleted = sum(1 for r in rows if r["status"] == "deleted")
+    out: dict[str, Any] = {
+        "success": all(r["status"] in ("deleted", "not_found") for r in rows),
+        "plan": last.get("plan"),
+        "deleted": deleted,
+        "rows": [r for r in rows if r["status"] != "deleted"],
+    }
+    if warnings:
+        out["warnings"] = list(dict.fromkeys(warnings))
+    return out
+
+
+async def _delete_batch(
+    plan_id: int | str, workout_ids: list[Any], allow_public: bool, dry_run: bool,
+) -> dict[str, Any]:
     pid = _plan_id(plan_id)
     if pid is None:
         return _err("VALIDATION_ERROR", "plan_id must be a positive integer.")
     ids = [_plan_id(x) for x in (workout_ids or [])]
     if not ids or any(i is None for i in ids):
         return _err("VALIDATION_ERROR", "workout_ids must be a non-empty list of workout ids.")
-    if len(ids) > MAX_BATCH:
-        return _err("VALIDATION_ERROR", f"At most {MAX_BATCH} workouts per call.")
+    if len(ids) > MAX_BATCH and not dry_run:
+        return _err("VALIDATION_ERROR", f"At most {MAX_BATCH} workouts per batch.")
 
     async with TPClient() as client:
         plan, workouts, error = await _load(client, pid)
@@ -794,6 +929,89 @@ async def lo_plan_delete_workouts(
         return out
 
 
+async def lo_plan_replace_workouts(
+    plan_id: int | str, payload_file: str, backup_to: str | None = None,
+    allow_public: bool = False, dry_run: bool = False,
+) -> dict[str, Any]:
+    """Swap a plan's whole content for the payload file (FORK 2026-11-16).
+
+    Order: back up every current workout to a file → add the new set (same-title checks
+    off, so an old workout with the same day/sport/title does not block its new version)
+    → only when every new workout was created and read back equal, delete the old set.
+    If the add step has any problem nothing old is deleted.
+    """
+    pid = _plan_id(plan_id)
+    if pid is None:
+        return _err("VALIDATION_ERROR", "plan_id must be a positive integer.")
+    data, file_error = _read_json_file(payload_file)
+    if file_error:
+        return file_error
+    workouts = data.get("workouts") if isinstance(data, dict) else data
+    if not isinstance(workouts, list) or not workouts:
+        return _err("VALIDATION_ERROR", "payload_file must hold a non-empty workouts list.")
+
+    async with TPClient() as client:
+        plan, existing, error = await _load(client, pid)
+        if error or plan is None:
+            return error or _err("API_ERROR", "Could not read the plan.")
+        locked = _lock(plan, allow_public)
+        if locked:
+            return locked
+    anchor = _anchor(plan)
+    old_rows = [_row(w, anchor, True) for w in existing]
+    old_ids = [r["workout_id"] for r in old_rows]
+    target = Path(os.path.expanduser(backup_to or f"{payload_file}.backup-{pid}.json"))
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({"plan": _brief(plan), "workouts": old_rows}, ensure_ascii=False,
+                                     indent=1), encoding="utf-8")
+    except OSError as e:
+        return _err("VALIDATION_ERROR", f"backup_to could not be written, nothing was changed: {e}")
+    base: dict[str, Any] = {"plan_before": _brief(plan), "old_count": len(old_ids),
+                            "new_count": len(workouts), "backup_to": str(target)}
+    if dry_run:
+        check = await lo_plan_add_workouts(pid, workouts, allow_public=allow_public,
+                                           skip_if_exists=False, dry_run=True)
+        if "rows" not in check:
+            return {**check, **base}
+        return {"success": True, "dry_run": True, **base,
+                "would_create": check.get("would_create"), "would_delete": len(old_ids)}
+
+    added = await lo_plan_add_workouts(pid, workouts, allow_public=allow_public, skip_if_exists=False)
+    if not added.get("success"):
+        return {"success": False, "phase": "add", **base,
+                "message": "The new set did not land cleanly, so the old workouts were NOT deleted. "
+                           "Fix the rows below, then delete the new ids (created_ids) or retry.",
+                "created_ids": added.get("created_ids") or [r.get("workout_id") for r in added.get("rows", [])
+                                                           if r.get("status") == "created"],
+                "add": {k: v for k, v in added.items() if k != "plan"}}
+
+    removed = await lo_plan_delete_workouts(pid, old_ids, allow_public=allow_public) if old_ids else \
+        {"success": True, "deleted": 0, "rows": []}
+    async with TPClient() as client:
+        after_plan, after, error = await _load(client, pid)
+    out: dict[str, Any] = {
+        "success": bool(removed.get("success")) and not error and len(after) == len(workouts),
+        **base,
+        "created": added.get("created"),
+        "deleted": removed.get("deleted"),
+        "plan": _brief(after_plan) if after_plan else None,
+        "count_after": len(after),
+    }
+    warnings = list(added.get("warnings") or []) + list(removed.get("warnings") or [])
+    if not removed.get("success"):
+        out["delete_problems"] = [r for r in removed.get("rows", []) if r.get("status") != "deleted"]
+    if after_plan is not None:
+        w = _anchor_warning(anchor, after_plan)
+        if w:
+            warnings.append(w)
+    if len(after) != len(workouts):
+        warnings.append(f"The plan now holds {len(after)} workouts; the payload had {len(workouts)}.")
+    if warnings:
+        out["warnings"] = list(dict.fromkeys(warnings))
+    return out
+
+
 def register_lo_plans(tools: list[Any], handlers: dict[str, Any]) -> None:
     from mcp.types import Tool
 
@@ -824,8 +1042,9 @@ def register_lo_plans(tools: list[Any], handlers: dict[str, Any]) -> None:
             "sport, title, duration, TSS, has_structure and the first characters of the description. "
             "weeks=[1,2] limits the output; full=true adds the whole description and the "
             "structured_workout. save_to writes those full rows to a JSON file on this machine "
-            "and keeps the reply brief: use it to compare what TP stored with the payload file "
-            "by script instead of pasting text back. Read-only."
+            f"and keeps the reply brief whatever full says (slim rows; past {MAX_BATCH} rows only "
+            "per-week counts): use it to compare what TP stored with the payload file by script "
+            "instead of pasting text back. Read-only."
         ),
         input_schema={"type": "object", "properties": {
             "plan_id": plan_id,
@@ -863,7 +1082,9 @@ def register_lo_plans(tools: list[Any], handlers: dict[str, Any]) -> None:
     tools.append(Tool(
         name="lo_plan_add_workouts",
         description=(
-            f"Create up to {MAX_BATCH} workouts inside a training plan, addressed by week and day "
+            f"Create workouts inside a training plan (more than {MAX_BATCH} are sent in batches "
+            f"of {MAX_BATCH}, in week/day order; a batch with problems stops the rest), addressed "
+            "by week and day "
             "(1 = Monday). Same fields as tp_create_workouts_batch items, with week/day instead of "
             "date. Every created workout is read back and compared; rows report created / "
             "skipped_exists / failed / uncertain. An empty plan must receive week 1 in its first "
@@ -907,7 +1128,8 @@ def register_lo_plans(tools: list[Any], handlers: dict[str, Any]) -> None:
         name="lo_plan_delete_workouts",
         description=(
             "Delete workouts from a training plan. Each is read first (week/day/sport/title are "
-            "reported), deleted, then confirmed gone. dry_run lists what would be deleted. "
+            f"reported), deleted, then confirmed gone. More than {MAX_BATCH} ids go in batches and "
+            "the reply then lists only rows that did not end deleted. dry_run lists what would be deleted. "
             "Irreversible — only after the coach approved it. Published plans need allow_public."
         ),
         input_schema={"type": "object", "properties": {
@@ -917,6 +1139,29 @@ def register_lo_plans(tools: list[Any], handlers: dict[str, Any]) -> None:
             "allow_public": allow_public,
         }, "required": ["plan_id", "workout_ids"]},
     ))
+
+    tools.append(Tool(
+        name="lo_plan_replace_workouts",
+        description=(
+            "Replace ALL workouts of a training plan with the workouts in payload_file (same "
+            "item shape as lo_plan_add_workouts). Backs the current workouts up to backup_to "
+            "(default: next to the payload file), adds the new set in batches with the "
+            "same-title skip turned off, and deletes the old set only when every new workout "
+            "was created and read back equal; otherwise nothing old is deleted and the reply "
+            "lists created_ids. dry_run only counts. Irreversible delete step — only after the "
+            "coach approved this replacement. Published plans need allow_public."
+        ),
+        input_schema={"type": "object", "properties": {
+            "plan_id": plan_id,
+            "payload_file": {"type": "string", "description": "Absolute path (on the machine "
+                             "running this server) of the new workouts JSON (list or {\"workouts\": [...]})."},
+            "backup_to": {"type": "string", "description": "Absolute path for the backup of the "
+                          "current workouts (full rows). Default: <payload_file>.backup-<plan_id>.json"},
+            "dry_run": {"type": "boolean", "default": False},
+            "allow_public": allow_public,
+        }, "required": ["plan_id", "payload_file"]},
+    ))
+
 
     async def _h_get(args: dict[str, Any]) -> dict[str, Any]:
         return await lo_plan_get_workouts(plan_id=args["plan_id"], weeks=args.get("weeks"),
@@ -971,3 +1216,11 @@ def register_lo_plans(tools: list[Any], handlers: dict[str, Any]) -> None:
     handlers["lo_plan_add_workouts"] = _h_add
     handlers["lo_plan_update_workout"] = _h_update
     handlers["lo_plan_delete_workouts"] = _h_delete
+
+    async def _h_replace(args: dict[str, Any]) -> dict[str, Any]:
+        return await lo_plan_replace_workouts(plan_id=args["plan_id"], payload_file=args["payload_file"],
+                                              backup_to=args.get("backup_to"),
+                                              allow_public=bool(args.get("allow_public", False)),
+                                              dry_run=bool(args.get("dry_run", False)))
+
+    handlers["lo_plan_replace_workouts"] = _h_replace

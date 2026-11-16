@@ -76,6 +76,7 @@ class TestListTools:
             "lo_plan_add_workouts",
             "lo_plan_update_workout",
             "lo_plan_delete_workouts",
+            "lo_plan_replace_workouts",  # FORK 2026-11-16
             "lo_sth_call",
             "lo_sth_calc_loads",
             "lo_sth_create_week",

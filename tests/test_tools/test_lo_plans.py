@@ -10,6 +10,7 @@ import json
 import re
 from datetime import date, timedelta
 from json import loads as _loads
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -21,6 +22,7 @@ from tp_mcp.tools.lo_plans import (
     lo_plan_create,
     lo_plan_delete_workouts,
     lo_plan_get_workouts,
+    lo_plan_replace_workouts,
     lo_plan_update_meta,
     lo_plan_update_workout,
     register_lo_plans,
@@ -322,7 +324,8 @@ async def test_save_to_writes_full_rows_and_keeps_the_reply_brief(tp, tmp_path):
     assert saved["workouts"][0]["structured_workout"] == _NATIVE
     assert "划手" in target.read_text(encoding="utf-8")  # stored as characters, not \\u escapes
     both = await lo_plan_get_workouts(pid, full=True, save_to=str(target))
-    assert both["workouts"][0]["description"] == "划手" * 100 and both["count"] == 2
+    # FORK 2026-11-16: save_to keeps the reply brief even with full=true
+    assert "description" not in both["workouts"][0] and both["count"] == 2
 
 
 async def test_add_reads_the_workouts_from_a_payload_file(tp, tmp_path):
@@ -380,3 +383,75 @@ async def test_coach_toolset_and_metadata(monkeypatch):
     hidden = await server.call_tool("tp_apply_training_plan", {"plan_id": 1, "start_date": "2026-01-01"})
     out = json.loads(hidden[0].text)
     assert out["error_code"] == "HIDDEN_TOOL"
+
+
+# --- FORK 2026-11-16: batching, slim save_to, whole-plan replace ------------------------
+
+def _items(n, title="課", start_week=1):
+    return [{"week": start_week + i // 7, "day": i % 7 + 1, "sport": "Run", "title": f"{title}{i}",
+             "description": f"說明{i}"} for i in range(n)]
+
+
+async def test_add_more_than_forty_goes_in_batches(tp):
+    pid = tp.add_plan()
+    items = _items(95)
+    items.reverse()  # out of order on purpose: week 1 must still land first
+    r = await lo_plan_add_workouts(pid, items)
+    assert r["success"] and r["created"] == 95 and r["batches"] == 3 and r["rows"] == []
+    assert len(r["created_ids"]) == 95 and len(tp.workouts[pid]) == 95
+    assert (await lo_plan_get_workouts(pid))["plan"]["weeks"] == 14
+
+
+async def test_batch_with_problem_stops_the_rest(tp):
+    pid = tp.add_plan()
+    items = _items(60)
+    tp.reject = {"課3", "課4", "課5"}  # three failures in a row inside batch 1
+    r = await lo_plan_add_workouts(pid, items)
+    assert not r["success"] and len(tp.workouts[pid]) < 40
+    assert sum(1 for x in r["rows"] if x["status"] == "not_attempted") >= 20
+
+
+async def test_delete_more_than_forty_goes_in_batches(tp):
+    pid = tp.add_plan()
+    await lo_plan_add_workouts(pid, _items(50))
+    ids = list(tp.workouts[pid])
+    r = await lo_plan_delete_workouts(pid, ids)
+    assert r["success"] and r["deleted"] == 50 and r["rows"] == [] and tp.workouts[pid] == {}
+
+
+async def test_save_to_past_forty_rows_returns_only_week_counts(tp, tmp_path):
+    pid = tp.add_plan()
+    await lo_plan_add_workouts(pid, _items(45))
+    target = tmp_path / "rb.json"
+    r = await lo_plan_get_workouts(pid, full=True, save_to=str(target))
+    assert r["workouts"] == [] and r["count"] == 45 and sum(r["per_week"].values()) == 45
+    assert len(json.loads(target.read_text(encoding="utf-8"))["workouts"]) == 45
+
+
+async def test_replace_swaps_everything_and_keeps_a_backup(tp, tmp_path):
+    old = [_w("2026-11-16", title="舊0", description="舊"), _w("2026-11-20", title="增加碳水化合物的比例")]
+    pid = tp.add_plan(title="12周 51.5", is_public=True, workouts=old)
+    new = _items(41) + [{"week": 1, "day": 5, "sport": "Run", "title": "增加碳水化合物的比例"}]
+    f = tmp_path / "new.json"
+    f.write_text(json.dumps(new, ensure_ascii=False), encoding="utf-8")
+    locked = await lo_plan_replace_workouts(pid, str(f))
+    assert locked["error_code"] == "PUBLIC_PLAN_LOCKED" and tp.writes == []
+    dry = await lo_plan_replace_workouts(pid, str(f), allow_public=True, dry_run=True)
+    assert dry["would_create"] == 42 and dry["would_delete"] == 2 and tp.writes == []
+    r = await lo_plan_replace_workouts(pid, str(f), allow_public=True)
+    assert r["success"] and r["created"] == 42 and r["deleted"] == 2 and r["count_after"] == 42
+    titles = {w["title"] for w in tp.workouts[pid].values()}
+    assert "舊0" not in titles and "增加碳水化合物的比例" in titles  # same-title old did not block the new one
+    backup = json.loads(Path(r["backup_to"]).read_text(encoding="utf-8"))
+    assert {w["title"] for w in backup["workouts"]} == {"舊0", "增加碳水化合物的比例"}
+
+
+async def test_replace_keeps_the_old_set_when_the_add_fails(tp, tmp_path):
+    pid = tp.add_plan(workouts=[_w("2026-11-16", title="舊0")])
+    old_ids = set(tp.workouts[pid])
+    f = tmp_path / "new.json"
+    f.write_text(json.dumps(_items(5), ensure_ascii=False), encoding="utf-8")
+    tp.reject = {"課2"}
+    r = await lo_plan_replace_workouts(pid, str(f))
+    assert not r["success"] and r["phase"] == "add" and old_ids <= set(tp.workouts[pid])
+    assert not any(m == "DELETE" for m, _, _ in tp.writes) and len(r["created_ids"]) == 4
