@@ -274,6 +274,44 @@ async def _apply_text(kind: str, old: float, new: float, stale: list[dict[str, A
                      "（「CP 270」）不會自動改，寫入後仍要人工看一遍並跑 validate R80。")}
 
 
+async def _rewrite_method(key: str, wtid: int, method: int, threshold: float,
+                          anchors: dict[str, Any] | None) -> dict[str, Any]:
+    """FORK 2026-11-16：換既有專項區間的計算方法（Nathan 騎車心率 method 24→3）。
+    同一組設定照新方法用 TP 計算器重算區間、整個陣列 PUT 回去（TP 只收整陣列）；其他欄位原封不動。"""
+    from tp_mcp.client import TPClient
+    from tp_mcp.tools.settings import _CALC_METRIC, _calculated_zones, _put_zone_array
+
+    put_path = {"powerZones": "powerzones", "heartRateZones": "heartratezones", "speedZones": "speedzones"}[key]
+    async with TPClient() as client:
+        aid = await client.ensure_athlete_id()
+        sr = await client.get(f"/fitness/v1/athletes/{aid}/settings")
+        if sr.is_error or not isinstance(sr.data, dict):
+            return {"isError": True, "error_code": "API_ERROR", "message": sr.message or "settings read failed"}
+        groups = list(sr.data.get(key) or [])
+        idx = next((i for i, g in enumerate(groups) if isinstance(g, dict) and g.get("workoutTypeId") == wtid), None)
+        if idx is None:
+            return {"isError": True, "error_code": "NO_SPORT_ZONE_SET", "message": "set disappeared"}
+        g = copy.deepcopy(groups[idx])
+        g["calculationMethod"] = method
+        extra = {k: v for k, v in (anchors or {}).items() if v is not None}
+        zones, derived = await _calculated_zones(client, _CALC_METRIC[put_path], g, threshold, extra)
+        if zones is None:
+            return {"isError": True, "error_code": "API_ERROR",
+                    "message": f"TP calculator returned no zones for method {method}"}
+        if derived is not None and abs(derived - threshold) > 0.02 * max(abs(threshold), 1.0):
+            return {"isError": True, "error_code": "TEST_BASED_METHOD",
+                    "message": "this method derives its threshold from a test; pick a threshold-anchored method"}
+        g["zones"] = zones
+        g["threshold"] = round(threshold) if key != "speedZones" else threshold
+        for k, v in extra.items():
+            g[k] = v
+        groups[idx] = g
+        err = await _put_zone_array(client, aid, put_path, groups)
+        if err:
+            return err
+        return {"success": True, "calculation_method": method, "method_changed": True}
+
+
 async def lo_update_threshold_verified(
     kind: str,
     value: Any,
@@ -367,8 +405,16 @@ async def lo_update_threshold_verified(
                        message=out["warnings"][0] + " Nothing written.")
             return out
 
+    change_method = (group is not None and calculation_method is not None
+                     and group.get("calculationMethod") != int(calculation_method))
+    if change_method:
+        out["method_change"] = {"from": group.get("calculationMethod"), "to": int(calculation_method)}
     if not dry_run:
-        if create:
+        if change_method:
+            res = await _rewrite_method(key, wtid, int(calculation_method), float(expected),
+                                        {"maximumHeartRate": max_hr, "restingHeartRate": resting_hr}
+                                        if kind == "lthr" else None)
+        elif create:
             metric = {"powerZones": "power", "heartRateZones": "heartrate", "speedZones": "speed"}[key]
             wt_name = spec["wt"] if kind != "lthr" else hr_workout_type.lower()
             res = await tp_create_zones(
@@ -406,6 +452,10 @@ async def lo_update_threshold_verified(
                     anchor_miss.append({"field": k_, "sent": int(sent_v), "landed": g_after.get(k_)})
         if anchor_miss:
             out["anchor_mismatch"] = anchor_miss
+            ok = False
+        if change_method and (g_after or {}).get("calculationMethod") != int(calculation_method):
+            out["method_mismatch"] = {"sent": int(calculation_method),
+                                      "landed": (g_after or {}).get("calculationMethod")}
             ok = False
         if create:
             out["created"] = g_after is not None and ok
@@ -476,7 +526,7 @@ def register_lo_threshold(tools: list[Any], handlers: dict[str, Any]) -> None:
                                "description": "lthr: also set+verify resting HR (value may be omitted)."},
                 "create_if_missing": {"type": "boolean", "default": False,
                                       "description": "no sport set → create it (general set's method)"},
-                "calculation_method": {"type": "integer"},
+                "calculation_method": {"type": "integer", "description": "method int (create, or switch an existing set)"},
                 "scan_days": {"type": "integer", "default": 28},
                 "dry_run": {"type": "boolean", "default": False},
                 "today": {"type": "string", "description": "YYYY-MM-DD scan start; default today."},
