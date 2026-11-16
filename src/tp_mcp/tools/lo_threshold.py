@@ -284,9 +284,11 @@ async def lo_update_threshold_verified(
     dry_run: bool = False,
     today: str | None = None,
     apply_text: str = "none",
+    create_if_missing: bool = False,
+    calculation_method: int | None = None,
 ) -> dict[str, Any]:
     from tp_mcp.tools.lo_review import athlete_identity
-    from tp_mcp.tools.settings import tp_update_ftp, tp_update_hr_zones, tp_update_speed_zones
+    from tp_mcp.tools.settings import tp_create_zones, tp_update_ftp, tp_update_hr_zones, tp_update_speed_zones
     from tp_mcp.tools.workouts import tp_get_workouts
 
     if apply_text not in ("none", "preview", "write"):
@@ -298,8 +300,17 @@ async def lo_update_threshold_verified(
     if kind == "lthr" and hr_workout_type.lower() not in _LTHR_SPORTS:
         return {"isError": True, "error_code": "INVALID_ARGS",
                 "message": f"hr_workout_type must be one of {sorted(_LTHR_SPORTS)}"}
+    anchors_only = kind == "lthr" and value is None and (max_hr is not None or resting_hr is not None)
+    if value is None and not anchors_only:
+        return {"isError": True, "error_code": "INVALID_ARGS",
+                "message": "value is required (lthr may omit it only when changing max_hr / resting_hr)"}
+    for nm, hv in (("max_hr", max_hr), ("resting_hr", resting_hr)):
+        if hv is not None and not (25 <= int(hv) <= 230):
+            return {"isError": True, "error_code": "INVALID_ARGS", "message": f"{nm}={hv} out of range"}
+    if max_hr is not None and resting_hr is not None and int(resting_hr) >= int(max_hr):
+        return {"isError": True, "error_code": "INVALID_ARGS", "message": "resting_hr must be below max_hr"}
     try:
-        expected = _expected(kind, value)
+        expected = 0.0 if anchors_only else _expected(kind, value)
     except (ValueError, TypeError) as e:
         return {"isError": True, "error_code": "INVALID_ARGS", "message": str(e)}
 
@@ -313,22 +324,51 @@ async def lo_update_threshold_verified(
         return {"isError": True, "error_code": "API_ERROR", "message": str(e)}
     idx, group = _find_group(before.get(key), wtid)
     old = (group or {}).get("threshold")
+    if anchors_only:
+        # FORK 2026-11-16: anchors-only change (resting / max HR) keeps the stored LTHR
+        if group is None:
+            return {**ident, "isError": True, "error_code": "NO_SPORT_ZONE_SET",
+                    "message": f"no heartRateZones set for workoutTypeId={wtid}"}
+        expected = float(old)
+        value = old
     out: dict[str, Any] = {
         **ident, "kind": kind, "dry_run": dry_run,
         "zone_set": {"array": key, "workoutTypeId": wtid, "exists": group is not None},
         "before": {"threshold": old, "display": _display(kind, old)},
         "sent": {"value": value, "threshold": expected, "display": _display(kind, expected)},
     }
+    create = group is None and create_if_missing
+    method = calculation_method
+    if create and method is None:
+        _, g0 = _find_group(before.get(key), 0)
+        method = (g0 or {}).get("calculationMethod")
     if group is None:
         out["warnings"] = [f"athlete has no {key} set for workoutTypeId={wtid}; the upstream tool would "
-                           "fall back to the Default set (TECH-24) — create the sport set in TP first."]
-        if not dry_run:
+                           "fall back to the Default set (TECH-24)"
+                           + (" — will CREATE it (create_if_missing)." if create else
+                              " — pass create_if_missing=true to create it.")]
+        if create:
+            out["create"] = {"calculation_method": method,
+                             "method_source": "argument" if calculation_method is not None else "general set"}
+            if not isinstance(method, int):
+                out.update(isError=True, error_code="NO_CALCULATION_METHOD",
+                           message="general set has no calculationMethod; pass calculation_method "
+                                   "(tp_get_zone_methods). Nothing written.")
+                return out
+        elif not dry_run:
             out.update(isError=True, error_code="NO_SPORT_ZONE_SET",
                        message=out["warnings"][0] + " Nothing written.")
             return out
 
     if not dry_run:
-        if kind == "ftp_bike":
+        if create:
+            metric = {"powerZones": "power", "heartRateZones": "heartrate", "speedZones": "speed"}[key]
+            wt_name = spec["wt"] if kind != "lthr" else hr_workout_type.lower()
+            res = await tp_create_zones(
+                metric=metric, workout_type=wt_name, calculation_method=int(method),
+                threshold=None if metric == "speed" else float(expected),
+                pace=str(value) if metric == "speed" else None, max_hr=max_hr, resting_hr=resting_hr)
+        elif kind == "ftp_bike":
             res = await tp_update_ftp(ftp=int(round(expected)), workout_type="bike")
         elif kind == "ftp_run":
             res = await tp_update_ftp(ftp=int(round(expected)), workout_type="run")
@@ -345,12 +385,23 @@ async def lo_update_threshold_verified(
         except RuntimeError as e:
             out.update(isError=True, error_code="READBACK_FAILED", message=str(e))
             return out
-        _, g_after = _find_group(after.get(key), wtid)
+        idx_after, g_after = _find_group(after.get(key), wtid)
         landed = (g_after or {}).get("threshold")
         out["after"] = {"threshold": landed, "display": _display(kind, landed)}
         out["zones"] = {"before": _bands(group), "after": _bands(g_after)}
-        collateral = _collateral(before, after, key, idx)
+        collateral = _collateral(before, after, key, idx if idx is not None else idx_after)
         ok = _landed_ok(kind, expected, landed)
+        # FORK 2026-11-16: HR anchors are part of what was sent — verify them too
+        anchor_miss = []
+        if kind == "lthr" and g_after:
+            for k_, sent_v in (("restingHeartRate", resting_hr), ("maximumHeartRate", max_hr)):
+                if sent_v is not None and g_after.get(k_) != int(sent_v):
+                    anchor_miss.append({"field": k_, "sent": int(sent_v), "landed": g_after.get(k_)})
+        if anchor_miss:
+            out["anchor_mismatch"] = anchor_miss
+            ok = False
+        if create:
+            out["created"] = g_after is not None and ok
         out["landed"] = ok
         if collateral:
             out["collateral"] = collateral
@@ -400,15 +451,11 @@ def register_lo_threshold(tools: list[Any], handlers: dict[str, Any]) -> None:
     tools.append(Tool(
         name="lo_update_threshold_verified",
         description=(
-            "Change ONE threshold with proof (seals TECH-22/24): kind=ftp_bike|ftp_run (W), "
-            "run_pace ('4:36/km'), swim_pace ('1:38/100m'), lthr (bpm; hr_workout_type "
-            "general|bike|run|swim). Snapshots all zone sets, writes via the upstream tool, reads "
-            "settings back: success only if the target set holds the sent value AND no other zone "
-            "set changed (COLLATERAL_CHANGE). Then scans the next scan_days of planned sessions for "
-            "absolute numbers tied to the old threshold (W / pace / heart rate) and lists each with "
-            "a proportional suggestion; apply_text=preview|write rewrites those numbers in place "
-            "(write = verified, then bodies re-rendered from the graph). dry_run=true: read + scan "
-            "with the proposed value, write nothing. Ask the coach before writing (權限邊界)."
+            "Change ONE threshold with proof (TECH-22/24): kind=ftp_bike|ftp_run (W), run_pace ('4:36/km'), "
+            "swim_pace ('1:38/100m'), lthr (bpm; hr_workout_type general|bike|run|swim; resting_hr/max_hr "
+            "anchors). Writes, reads settings back: success only if the target set holds the sent values AND "
+            "no other set changed. Then lists planned sessions quoting the old numbers; apply_text=preview|write "
+            "rewrites them (write = verified + bodies re-rendered). dry_run: read + scan only."
         ),
         input_schema={
             "type": "object",
@@ -417,29 +464,32 @@ def register_lo_threshold(tools: list[Any], handlers: dict[str, Any]) -> None:
                 "value": {"type": ["number", "string"],
                           "description": "W or bpm as a number; pace as 'M:SS/km' or 'M:SS/100m'."},
                 "hr_workout_type": {"type": "string", "enum": sorted(_LTHR_SPORTS), "default": "general"},
-                "max_hr": {"type": "integer", "description": "lthr only: also store max HR anchor."},
-                "resting_hr": {"type": "integer", "description": "lthr only: also store resting HR anchor."},
+                "max_hr": {"type": "integer", "description": "lthr: also set+verify max HR."},
+                "resting_hr": {"type": "integer",
+                               "description": "lthr: also set+verify resting HR (value may be omitted)."},
+                "create_if_missing": {"type": "boolean", "default": False,
+                                      "description": "no sport set → create it (general set's method)"},
+                "calculation_method": {"type": "integer"},
                 "scan_days": {"type": "integer", "default": 28},
                 "dry_run": {"type": "boolean", "default": False},
                 "today": {"type": "string", "description": "YYYY-MM-DD scan start; default today."},
                 "apply_text": {"type": "string", "enum": ["none", "preview", "write"], "default": "none",
-                               "description": "none: list only. preview: return each session's new "
-                                              "description (proportional numbers swapped in place). "
-                                              "write: write them verified, then re-render bodies that "
-                                              "disagree with the graph. dry_run or a failed threshold "
-                                              "write downgrades write→preview."},
+                               "description": "none=list; preview=new descriptions; write=write verified "
+                                              "(dry_run or a failed write → preview)."},
             },
-            "required": ["kind", "value"],
+            "required": ["kind"],
         },
     ))
 
     async def _h(args: dict[str, Any]) -> dict[str, Any]:
         return await lo_update_threshold_verified(
-            kind=args["kind"], value=args["value"],
+            kind=args["kind"], value=args.get("value"),
             hr_workout_type=str(args.get("hr_workout_type", "general")),
             max_hr=args.get("max_hr"), resting_hr=args.get("resting_hr"),
             scan_days=int(args.get("scan_days", 28)), dry_run=bool(args.get("dry_run", False)),
             today=args.get("today"), apply_text=str(args.get("apply_text", "none")),
+            create_if_missing=bool(args.get("create_if_missing", False)),
+            calculation_method=args.get("calculation_method"),
         )
 
     handlers["lo_update_threshold_verified"] = _h

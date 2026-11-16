@@ -786,7 +786,8 @@ TOOLS = [
         name="tp_get_athlete_settings",
         description=(
             "Get athlete account settings and profile fields (athlete type, linked coach, preferences, units). To "
-            "change training values use tp_update_ftp / tp_update_hr_zones / tp_update_speed_zones."
+            "change training values use lo_update_threshold_verified (FTP / pace / LTHR / resting & max HR, "
+            "verified); pool length: lo_set_pool_length; roster-wide sanity check: lo_settings_audit."
         ),
         input_schema={"type": "object", "properties": {}, "required": []},
     ),
@@ -1700,6 +1701,7 @@ from tp_mcp.tools.lo_review import register_lo_review  # noqa: E402
 from tp_mcp.tools.lo_sth import LO_STH_TOOLS, register_lo_sth  # noqa: E402
 from tp_mcp.tools.lo_sth_ext import LO_STH_EXT_TOOLS, register_lo_sth_ext  # noqa: E402
 from tp_mcp.tools.lo_sth_more import LO_STH_MORE_TOOLS, register_lo_sth_more  # noqa: E402
+from tp_mcp.tools.lo_settings import register_lo_settings  # noqa: E402
 from tp_mcp.tools.lo_strength import register_lo_strength  # noqa: E402
 from tp_mcp.tools.lo_sync import register_lo_sync  # noqa: E402
 from tp_mcp.tools.lo_threshold import register_lo_threshold  # noqa: E402
@@ -1722,6 +1724,7 @@ register_lo_sync(TOOLS, _LO_HANDLERS)
 register_lo_sth(TOOLS, _LO_HANDLERS)  # FORK 2026-09-27: StrongTri proxy
 register_lo_sth_ext(TOOLS, _LO_HANDLERS)  # FORK 2026-10-02: STH 提速 A/B/D
 register_lo_sth_more(TOOLS, _LO_HANDLERS)  # FORK 2026-11-16: STH 優化七項（validate 轉接／閾值／待辦）
+register_lo_settings(TOOLS, _LO_HANDLERS)  # FORK 2026-11-16: 設定健檢＋池長寫入
 register_lo_version(TOOLS, _LO_HANDLERS)  # FORK 2026-10-03: 重啟偵測
 register_lo_threshold(TOOLS, _LO_HANDLERS)  # FORK 2026-10-03: 閾值驗證寫入（TECH-22/24）
 register_lo_capability(TOOLS, _LO_HANDLERS)  # FORK 2026-10-03: 能力層 PROC-84/85
@@ -1733,6 +1736,7 @@ _ATHLETE_EXEMPT_TOOLS |= set(LO_STH_TOOLS) | set(LO_STH_EXT_TOOLS) | set(LO_STH_
 _ATHLETE_EXEMPT_TOOLS.add("lo_weekly_check")  # takes its own `athletes` list
 _ATHLETE_EXEMPT_TOOLS.add("lo_version")  # local, not athlete-scoped
 _ATHLETE_EXEMPT_TOOLS.add("lo_capability_scan")  # takes its own `athletes` list
+_ATHLETE_EXEMPT_TOOLS.add("lo_settings_audit")  # FORK 2026-11-16: takes its own `athletes` list
 # FORK 2026-11-12: training plans belong to the coach, not to a targeted athlete.
 _ATHLETE_EXEMPT_TOOLS |= {
     "tp_list_training_plans", "tp_get_training_plan", "tp_get_training_plan_workouts",
@@ -1947,7 +1951,7 @@ _COACH_HIDDEN: dict[str, str] = {
                               "a destructive history); athletes get individually built weeks",
     **dict.fromkeys(("tp_get_nutrition", "tp_update_nutrition"), "nutrition is not tracked here"),
     **dict.fromkeys(_HIDE_FILES, "file upload/pairing is done by the athlete's devices"),
-    "tp_create_zones": "zone changes go through lo_update_threshold_verified / sop-threshold-update",
+    "tp_create_zones": "use lo_update_threshold_verified(create_if_missing=true) — creates the set, then verifies",
     "tp_update_workout": "use lo_update_workout_verified (TECH-40: tp_update_workout can return "
                          "success without landing)",
     # FORK 2026-11-06 (coach menu): CLAUDE.md forbids workout comments; threshold writes
@@ -1958,6 +1962,11 @@ _COACH_HIDDEN: dict[str, str] = {
     **dict.fromkeys(("tp_update_ftp", "tp_update_hr_zones", "tp_update_speed_zones"),
                     "use lo_update_threshold_verified (TECH-22/24: snapshot, write, read back, "
                     "collateral-change check)"),
+    # FORK 2026-11-16: athlete-visible text outside the description is the same channel the
+    # coach forbade for comments; zone creation now goes through lo_update_threshold_verified.
+    **dict.fromkeys(("tp_add_note_comment", "tp_set_workout_note"),
+                    "athlete-visible notes/comments are not written by the model (CLAUDE.md); "
+                    "put text in the workout description via lo_update_workout_verified"),
 }
 
 

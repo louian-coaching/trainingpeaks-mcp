@@ -89,6 +89,8 @@ class TestListTools:
             "lo_sth_get_week_for_validate",  # FORK 2026-11-16: STH 優化七項
             "lo_sth_update_threshold_verified",
             "lo_sth_pending",
+            "lo_settings_audit",  # FORK 2026-11-16: 設定健檢＋池長
+            "lo_set_pool_length",
             "tp_update_workout",
             "tp_delete_workout",
             "tp_copy_workout",

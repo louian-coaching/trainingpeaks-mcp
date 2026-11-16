@@ -128,3 +128,68 @@ def test_hr_scan_only_heart_rate_numbers():
 
 def test_scan_ignores_equal_threshold():
     assert scan_stale_text("ftp_bike", 250, 250, PLANNED, ("Bike",)) == []
+
+
+# ---------- FORK 2026-11-16：靜息／最大心率錨點＋補建專項區間 ----------
+def _hr_state():
+    st = _settings()
+    st["heartRateZones"][0].update({"restingHeartRate": 185, "maximumHeartRate": 185, "calculationMethod": 3})
+    return st
+
+
+@pytest.mark.asyncio
+async def test_anchors_only_keeps_lthr_and_verifies_resting():
+    def mutate(st, kw):
+        g = st["heartRateZones"][0]
+        g["restingHeartRate"] = kw["resting_hr"]
+        if kw.get("max_hr"):
+            g["maximumHeartRate"] = kw["max_hr"]
+    fs = FakeSettings(_hr_state(), mutate)
+    r = await _run(fs, write_name="tp_update_hr_zones", kind="lthr", value=None, resting_hr=45, max_hr=190)
+    assert r["success"] is True and r["landed"] is True and r["sent"]["threshold"] == 165
+    assert fs.state["heartRateZones"][0]["restingHeartRate"] == 45
+
+
+@pytest.mark.asyncio
+async def test_anchor_not_landed_fails():
+    fs = FakeSettings(_hr_state(), lambda st, kw: None)
+    r = await _run(fs, write_name="tp_update_hr_zones", kind="lthr", value=None, resting_hr=45)
+    assert r["isError"] and r["error_code"] == "WRITE_NOT_LANDED"
+    assert r["anchor_mismatch"][0]["field"] == "restingHeartRate"
+
+
+@pytest.mark.asyncio
+async def test_value_required_unless_anchors_and_rest_below_max():
+    fs = FakeSettings(_hr_state(), lambda st, kw: None)
+    r = await _run(fs, kind="ftp_bike", value=None)
+    assert r["error_code"] == "INVALID_ARGS"
+    r = await _run(fs, kind="lthr", value=None, resting_hr=190, max_hr=185)
+    assert r["error_code"] == "INVALID_ARGS"
+
+
+@pytest.mark.asyncio
+async def test_create_missing_bike_hr_set_with_general_method():
+    st = _hr_state()
+    created = {}
+
+    async def fake_create(**kw):
+        created.update(kw)
+        st["heartRateZones"].append({"workoutTypeId": 2, "threshold": kw["threshold"], "calculationMethod":
+                                     kw["calculation_method"], "zones": [{"minimum": 0, "maximum": 150}],
+                                     "restingHeartRate": kw.get("resting_hr"), "maximumHeartRate": kw.get("max_hr")})
+        return {"success": True, "created": True}
+    fs = FakeSettings(st, lambda s, k: None)
+    p1, p2 = _common()
+    with p1, p2, patch.multiple(settings, tp_get_athlete_settings=AsyncMock(side_effect=fs.get),
+                                tp_create_zones=AsyncMock(side_effect=fake_create)):
+        r = await lo_update_threshold_verified(today="2026-10-04", kind="lthr", value=158,
+                                               hr_workout_type="bike", create_if_missing=True)
+    assert r["success"] is True and r["created"] is True and "collateral" not in r
+    assert created["metric"] == "heartrate" and created["workout_type"] == "bike" and created["calculation_method"] == 3
+
+
+@pytest.mark.asyncio
+async def test_missing_set_without_create_still_refuses():
+    fs = FakeSettings(_hr_state(), lambda s, k: None)
+    r = await _run(fs, write_name="tp_update_hr_zones", kind="lthr", value=158, hr_workout_type="bike")
+    assert r["error_code"] == "NO_SPORT_ZONE_SET" and "create_if_missing" in r["message"]
