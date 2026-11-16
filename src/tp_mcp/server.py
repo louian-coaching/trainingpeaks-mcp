@@ -1699,6 +1699,7 @@ from tp_mcp.tools.lo_capability import register_lo_capability  # noqa: E402
 from tp_mcp.tools.lo_review import register_lo_review  # noqa: E402
 from tp_mcp.tools.lo_sth import LO_STH_TOOLS, register_lo_sth  # noqa: E402
 from tp_mcp.tools.lo_sth_ext import LO_STH_EXT_TOOLS, register_lo_sth_ext  # noqa: E402
+from tp_mcp.tools.lo_sth_more import LO_STH_MORE_TOOLS, register_lo_sth_more  # noqa: E402
 from tp_mcp.tools.lo_strength import register_lo_strength  # noqa: E402
 from tp_mcp.tools.lo_sync import register_lo_sync  # noqa: E402
 from tp_mcp.tools.lo_threshold import register_lo_threshold  # noqa: E402
@@ -1720,6 +1721,7 @@ register_lo_verify(TOOLS, _LO_HANDLERS)
 register_lo_sync(TOOLS, _LO_HANDLERS)
 register_lo_sth(TOOLS, _LO_HANDLERS)  # FORK 2026-09-27: StrongTri proxy
 register_lo_sth_ext(TOOLS, _LO_HANDLERS)  # FORK 2026-10-02: STH 提速 A/B/D
+register_lo_sth_more(TOOLS, _LO_HANDLERS)  # FORK 2026-11-16: STH 優化七項（validate 轉接／閾值／待辦）
 register_lo_version(TOOLS, _LO_HANDLERS)  # FORK 2026-10-03: 重啟偵測
 register_lo_threshold(TOOLS, _LO_HANDLERS)  # FORK 2026-10-03: 閾值驗證寫入（TECH-22/24）
 register_lo_capability(TOOLS, _LO_HANDLERS)  # FORK 2026-10-03: 能力層 PROC-84/85
@@ -1727,7 +1729,7 @@ register_lo_weather(TOOLS, _LO_HANDLERS)  # FORK 2026-10-17: 歷史天氣 PROC-9
 register_lo_forecast(TOOLS, _LO_HANDLERS)  # FORK 2026-10-21: 預報 PROC-85b
 register_lo_race(TOOLS, _LO_HANDLERS)  # FORK 2026-11-02: 鐵人複盤 PROC-41g
 register_lo_plans(TOOLS, _LO_HANDLERS)  # FORK 2026-11-12: 訓練計劃建立／寫課／改課
-_ATHLETE_EXEMPT_TOOLS |= set(LO_STH_TOOLS) | set(LO_STH_EXT_TOOLS)  # STH 用 tri_user_id，不吃 TP athlete
+_ATHLETE_EXEMPT_TOOLS |= set(LO_STH_TOOLS) | set(LO_STH_EXT_TOOLS) | set(LO_STH_MORE_TOOLS)  # STH 用 tri_user_id，不吃 TP athlete
 _ATHLETE_EXEMPT_TOOLS.add("lo_weekly_check")  # takes its own `athletes` list
 _ATHLETE_EXEMPT_TOOLS.add("lo_version")  # local, not athlete-scoped
 _ATHLETE_EXEMPT_TOOLS.add("lo_capability_scan")  # takes its own `athletes` list

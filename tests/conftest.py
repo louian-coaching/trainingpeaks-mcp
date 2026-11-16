@@ -173,3 +173,4 @@ def mock_api_responses():
 def _isolated_snapshot_dir(tmp_path, monkeypatch):
     """FORK: lo_ write tools now refresh the diff snapshot; never touch the real one in tests."""
     monkeypatch.setenv("TP_LO_SNAPSHOT_DIR", str(tmp_path / "_snapshots"))
+    monkeypatch.setenv("LO_STH_PENDING_DIR", str(tmp_path / "_sth_pending"))  # FORK 2026-11-16

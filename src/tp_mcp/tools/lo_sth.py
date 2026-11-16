@@ -566,9 +566,15 @@ async def lo_sth_finish_week(payload_file: str, band: list[int] | None = None, b
     ro = await lo_sth_reorder_week(payload_file, retry_wait_s=retry_wait_s, retries=99, client_factory=client_factory,
                                    sleep=sleep, include_existing=True, time_budget_s=time_budget_s)
     out: dict[str, Any] = {"reorder": ro.get("rows", [])}
+    from tp_mcp.tools.lo_sth_more import add_pending, clear_pending
     if any(r.get("status") == "pending_sync" for r in out["reorder"]):
-        return {**out, "status": "pending_device_sync",
-                "next": "裝置還在同步：等 30 秒再呼叫一次 lo_sth_finish_week（已排好的日子會略過不動）"}
+        # 2026/11/16 優化④：記進待辦，下次 lo_sth_prep_week／lo_sth_pending 自動補排，不會掛著被忘掉
+        add_pending(p["tri_user_id"], payload_file,
+                    [r["date"] for r in out["reorder"] if r.get("status") == "pending_sync"])
+        return {**out, "status": "pending_device_sync", "queued": True,
+                "next": "裝置還在同步：等 30 秒再呼叫一次 lo_sth_finish_week（已排好的日子會略過不動）；"
+                        "這輪沒空等也沒關係——已記進待辦，下次 lo_sth_prep_week 或 lo_sth_pending 會自動補排"}
+    clear_pending(p["tri_user_id"], payload_file)
     async with client_factory() as cli:
         v = await cli.call("validate_schedule_week", {"tri_user_id": p["tri_user_id"], "date": dates[0]})
         wk2 = await cli.call("get_week_schedule", {"date_from": dates[0], "date_to": dates[-1],
@@ -810,7 +816,7 @@ def register_lo_sth(tools: list[Any], handlers: dict[str, Any]) -> None:
     tools.append(Tool(name="lo_sth_finish_week", description=(
         "建完整週後收尾（10/02 優化 2）：同日排序（含當天教練既有課，既有在前；已排好的日子略過）→ validate_schedule_week → "
         "排序之後才讀回整週 → 各項 STL（帶 band 就比帶）＋每天的課順序。排序撞 409001 會在 time_budget_s（預設 45）內等；"
-        "等不到回 status=pending_device_sync，過 30 秒再叫一次即可（可重複呼叫）。"),
+        "等不到回 status=pending_device_sync，過 30 秒再叫一次即可（可重複呼叫）；同時記進待辦（lo_sth_pending）。"),
         input_schema={"type": "object", "properties": {
             "payload_file": _PF, "readback_save_to": {"type": "string", "description": "Mac 上的整週讀回輸出路徑（排序之後）"},
             "band": {"type": "array", "items": {"type": "integer"}},

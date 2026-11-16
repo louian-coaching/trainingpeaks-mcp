@@ -86,6 +86,9 @@ class TestListTools:
             "lo_sth_verify_intervals",
             "lo_sth_finish_week",
             "lo_sth_delete_verified",
+            "lo_sth_get_week_for_validate",  # FORK 2026-11-16: STH 優化七項
+            "lo_sth_update_threshold_verified",
+            "lo_sth_pending",
             "tp_update_workout",
             "tp_delete_workout",
             "tp_copy_workout",

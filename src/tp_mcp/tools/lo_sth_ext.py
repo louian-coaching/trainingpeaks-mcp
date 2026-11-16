@@ -328,6 +328,11 @@ async def lo_sth_prep_week(tri_user_id: str, week_start: str, save_dir: str, his
     sd = Path(os.path.expanduser(save_dir))
     sd.mkdir(parents=True, exist_ok=True)
     out: dict[str, Any] = {"tri_user_id": tri_user_id, "week": [str(ws), str(we)], "history_from": str(h0)}
+    # 2026/11/16 優化④：上一輪卡在裝置同步的同日排序，先順手補排（不等；還在同步就留在待辦）
+    from tp_mcp.tools.lo_sth_more import list_pending, run_pending
+    pending_rows = []
+    if list_pending(tri_user_id):
+        pending_rows = await run_pending(tri_user_id, client_factory=client_factory, time_budget_s=0)
     async with client_factory() as cli:
         out["identity"] = await _ensure_coach(cli)
         wk = await cli.call("get_week_schedule", {"tri_user_id": tri_user_id, "date_from": str(h0), "date_to": str(we)})
@@ -451,7 +456,8 @@ async def lo_sth_prep_week(tri_user_id: str, week_start: str, save_dir: str, his
                     "quality_detail_count": len(details), "templates": len(templates),
                     "red_flags": unplanned_flags(extra, plan_rows, week_start),
                     "intervals": [x for x in (_iv_line(v) for v in details.values()) if x],
-                    "next_week_existing": [f"{u['date']} {u['title']}" for u in upcoming]},
+                    "next_week_existing": [f"{u['date']} {u['title']}" for u in upcoming],
+                    **({"pending_reorder": pending_rows} if pending_rows else {})},
         "next": "讀 digest_file 的 plan_vs_actual／quality_details 寫前週回顧；建課直接抄 templates 的檔"})
     return out
 
@@ -469,6 +475,18 @@ def _stages_sig(cj: dict[str, Any] | None) -> list:
         sig.append([st.get("times"), [(s.get("stageMode"), s.get("capacity"), s.get("targetDistance") if s.get("capacity") == "distance" else s.get("targetSeconds"),
                                        s.get("thresholdFtpRange") or s.get("thresholdSpeedRange")) for s in st.get("sections") or []]])
     return sig
+
+
+def _flag_mismatch(out: dict[str, Any], res: dict[str, Any]) -> None:
+    """平台回失敗旗標時：讀回相符＝假陰性（只警告）；讀回不符＝真的失敗。"""
+    raw = json.dumps(res, ensure_ascii=False)[:400]
+    if out.get("ok"):
+        out.setdefault("warnings", []).append({
+            "code": "PLATFORM_FLAG_FALSE_NEGATIVE",
+            "message": "平台旗標回失敗，但獨立讀回逐字相符、結構未動＝已寫入（PLAT-23）；不要重送",
+            "raw_head": raw})
+    else:
+        out.update({"isError": True, "error_code": "WRITE_FAILED", "raw_head": raw})
 
 
 async def _refs_for(cli, tri: str, cid: Any, date: str) -> tuple[Any, Any]:
@@ -504,13 +522,16 @@ async def lo_sth_update_verified(tri_user_id: str, class_schedule_id: Any, text:
                 "patch_json": json.dumps(text, ensure_ascii=False), "device_resync_policy": "never",
                 "preview_token": pv["token"], "expected_version": pv["version"], "dry_run": False,
                 "confirm_write": True, "confirm_token": CONFIRM_PATCH, "idempotency_key": key})
-            if not is_ok(res):
-                return {**out, "isError": True, "error_code": "WRITE_FAILED", "raw_head": json.dumps(res, ensure_ascii=False)[:400]}
+            # 2026/11/16 優化⑤：平台旗標會說謊（PLAT-23；10/30 胡逸凡 REMARK 回 WRITE_FAILED 但 raw SUCCESS、
+            # 讀回逐字一致）——不論旗標，一律讀回；讀回相符＝成功，只附警告。
+            flag_ok = is_ok(res)
             after = await fetch_cj(cli, tri_user_id, cid)
             mism = [k for k, v in text.items() if _norm((after["cj"] or {}).get(k)) != _norm(v)]
             same_struct = _stages_sig(after["cj"]) == _stages_sig(pv["cj"])
             out.update({"ok": not mism and same_struct, "fields_verified": sorted(set(text) - set(mism)),
                         "mismatch": mism, "structure_untouched": same_struct, "version": after["version"]})
+            if not flag_ok:
+                _flag_mismatch(out, res)
         else:
             cj = json.loads(Path(os.path.expanduser(classes_json_file)).read_text(encoding="utf-8"))
             before = await fetch_cj(cli, tri_user_id, cid)
@@ -568,7 +589,7 @@ async def lo_sth_update_verified(tri_user_id: str, class_schedule_id: Any, text:
                         "week_view": {"durationMin": wk_min, "plannedSTL": wk_stl, "ok": week_ok},
                         **({"warnings": warnings} if warnings else {})})
             if not is_ok(res):
-                out.update({"isError": True, "error_code": "WRITE_FAILED", "raw_head": json.dumps(res, ensure_ascii=False)[:400]})
+                _flag_mismatch(out, res)
         if out.get("ok") and after.get("cj"):
             save_snapshot(tri_user_id, cid, after["cj"], str(after["target"].get("classesDate") or ""),
                           after["version"], after["cj"].get("title"), "update_verified")
@@ -747,6 +768,17 @@ async def lo_sth_diff_week(tri_user_id: str, date_from: str, date_to: str, accep
             row = {"id": cid, "date": date, "title": w.get("title"), "status": "changed",
                    "changes": changes, "stale_text": stale,
                    "text_only": "structure" not in changes and not moved}
+            # 2026/11/16 優化②：文字同步草稿（比照 TP lo_diff_week 的 explanation_drafts；只出草稿不寫）
+            if "structure" in changes or "summary" in changes or moved:
+                from tp_mcp.tools.lo_sth_more import sth_text_drafts
+                drafts = sth_text_drafts(old, new, stale, snap.get("date"), date)
+                if drafts:
+                    row["explanation_drafts"] = drafts
+                    if fix_dir and drafts["text_patch"]:
+                        f = fix_dir / f"draft_{cid}.json"
+                        f.parent.mkdir(parents=True, exist_ok=True)
+                        f.write_text(json.dumps(drafts["text_patch"], ensure_ascii=False, indent=1), encoding="utf-8")
+                        row["draft_file"] = str(f)
             # 優化 4：教練介面改完留下的矛盾（距離段秒數、時長欄位）；有 save_to 就順手寫出修好的檔
             integ = integrity(new, w.get("durationMin"))
             if integ:
@@ -773,10 +805,13 @@ async def lo_sth_diff_week(tri_user_id: str, date_from: str, date_to: str, accep
            "no_snapshot": [r["id"] for r in rows if r["status"] == "no_snapshot"],
            "stale_total": sum(len([x for x in r.get("stale_text", []) if x.get("old_value_still_in_text")]) for r in rows),
            "integrity_total": sum(len(r.get("integrity") or []) for r in rows),
+           "drafts_total": sum(1 for r in rows if r.get("explanation_drafts")),
            "week_stl": by,
            **({"band": band_check({k: v for k, v in by.items() if k != "three_sport"}, band, band_sports)} if band else {}),
            "accepted": accept,
-           "next": ("stale_text 裡 old_value_still_in_text=true＝文字還留著舊值：照 PROC-80b 以圖形為準，用 "
+           "next": ("explanation_drafts＝summary／trainingAdvice 整份草稿（text_patch 可直接當 lo_sth_update_verified 的 text；"
+                    "unresolved／check_phrases 要人工補，PROC-80c 同週其他課也要對）；"
+                    "stale_text 裡 old_value_still_in_text=true＝文字還留著舊值：照 PROC-80b 以圖形為準，用 "
                     "lo_sth_update_verified(text=…) 改；integrity 有 fix_file＝平台欄位自相矛盾（多半是時長顯示錯），"
                     "用 lo_sth_update_verified(classes_json_file=fix_file, duration_min=fix_duration_min) 修（屬改教練的課，先問）；"
                     "都處理完 accept=true 收快照")}
@@ -829,7 +864,8 @@ def register_lo_sth_ext(tools: list[Any], handlers: dict[str, Any]) -> None:
         "StrongTri 改課一步（10/02 提速 B）：`text`（summary／trainingAdvice／title）走 preview→token→patch→讀回逐字比對、確認結構沒動；"
         "`classes_json_file` 走整份替換：自動找 scheduleRef／athleteRef→dry-run 取版本→寫→classesJsonMatches＋獨立讀回比對結構與文字。"
         "`recalc_load=true` 寫前先算官方負荷（PLAT-10／17），結構改了官方 STL 卻沒變會警告並給建議值（load_fallback=\"scale\" 直接採用）。"
-        "整份替換時 durationSeconds／duration／timeline 一律由各段回填，驗收改看週課表顯示的時長與 STL（week_view）。成功後更新快照。兩者擇一。"),
+        "整份替換時 durationSeconds／duration／timeline 一律由各段回填，驗收改看週課表顯示的時長與 STL（week_view）。成功後更新快照。兩者擇一。"
+        "旗標回失敗但讀回相符＝成功＋PLATFORM_FLAG_FALSE_NEGATIVE。"),
         input_schema={"type": "object", "properties": {
             "tri_user_id": tri, "class_schedule_id": {"type": "integer"},
             "text": {"type": "object", "description": "{summary?, trainingAdvice?, title?}"},
@@ -842,6 +878,7 @@ def register_lo_sth_ext(tools: list[Any], handlers: dict[str, Any]) -> None:
         "StrongTri 教練改課後比對（10/02 提速 D，STH 版 PROC-80）：拿快照對平台現況，列出移動／刪除／改動的課、"
         "只列有變的段、文字欄位直接給 +／- 差異行、stale_text（文字還留著舊的瓦數／配速／時間）、integrity（教練介面改完留下的矛盾："
         "距離段秒數離譜、週課表時長沒跟著變；有 save_to 會寫出修好的 fix_<id>.json）、新加的課附內容、整週各項 STL（帶 band 就比帶）。"
+        "explanation_drafts＝文字草稿（text_patch 可直接給 lo_sth_update_verified；unresolved 人工補），只出草稿不寫。"
         "accept=true 把現況收成新快照。"),
         input_schema={"type": "object", "properties": {
             "tri_user_id": tri, "date_from": {"type": "string"}, "date_to": {"type": "string"},
