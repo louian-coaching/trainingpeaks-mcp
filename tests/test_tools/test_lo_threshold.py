@@ -133,7 +133,7 @@ def test_scan_ignores_equal_threshold():
 # ---------- FORK 2026-11-16：靜息／最大心率錨點＋補建專項區間 ----------
 def _hr_state():
     st = _settings()
-    st["heartRateZones"][0].update({"restingHeartRate": 185, "maximumHeartRate": 185, "calculationMethod": 3})
+    st["heartRateZones"][0].update({"restingHeartRate": 185, "maximumHeartRate": 185, "calculationMethod": 24})
     return st
 
 
@@ -186,6 +186,7 @@ async def test_create_missing_bike_hr_set_with_general_method():
                                                hr_workout_type="bike", create_if_missing=True)
     assert r["success"] is True and r["created"] is True and "collateral" not in r
     assert created["metric"] == "heartrate" and created["workout_type"] == "bike" and created["calculation_method"] == 3
+    assert r["create"]["method_source"] == "friel default"
 
 
 @pytest.mark.asyncio

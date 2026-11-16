@@ -46,6 +46,7 @@ def audit_settings(settings: dict[str, Any], pool: dict[str, Any] | None = None,
     """Pure: one athlete's settings → {sets, flags}. Flags are things a coach would want to fix."""
     names = _wt_names()
     flags: list[dict[str, Any]] = []
+    info: list[dict[str, Any]] = []
     sets: dict[str, list[str]] = {}
     for arr in _ARRAYS:
         groups = [g for g in (settings.get(arr) or []) if isinstance(g, dict)]
@@ -66,11 +67,12 @@ def audit_settings(settings: dict[str, Any], pool: dict[str, Any] | None = None,
                     flags.append({"code": "HR_MAX_IMPLAUSIBLE", "set": wt, "max": mx})
                 if thr and mx and thr > mx:
                     flags.append({"code": "HR_LTHR_ABOVE_MAX", "set": wt, "lthr": thr, "max": mx})
-            if general is not None and g is not general and thr:
+            # 通用軌 vs 專項：只記成 info（11/16 全名單實跑 328 筆、多半無害）；游泳速度跟通用軌本來就不同單位尺度，不比
+            if general is not None and g is not general and thr and not (arr == "speedZones" and wt == "swim"):
                 gthr = _num(general.get("threshold"))
                 if gthr and abs(gthr - thr) / thr > tol:
-                    flags.append({"code": "GENERAL_DIFFERS", "array": arr, "set": wt,
-                                  "general": general.get("threshold"), "sport": g.get("threshold")})
+                    info.append({"code": "GENERAL_DIFFERS", "array": arr, "set": wt,
+                                 "general": general.get("threshold"), "sport": g.get("threshold")})
     if pool:
         did = pool.get("defaultId")
         opt = next((o for o in pool.get("options") or [] if o.get("id") == did), None)
@@ -79,7 +81,7 @@ def audit_settings(settings: dict[str, Any], pool: dict[str, Any] | None = None,
                           "note": "游泳距離會被當碼算（25 碼＝22.86 公尺，低估 8.6%）"})
     if account and account.get("tier") == "basic":
         flags.append({"code": "ACCOUNT_BASIC", "tier": "basic"})
-    return {"sets": sets, "flags": flags}
+    return {"sets": sets, "flags": flags, "info": info}
 
 
 async def _read_one(requested: str) -> dict[str, Any]:
@@ -130,7 +132,10 @@ async def lo_settings_audit(athletes: list[str] | None = None, save_to: str | No
             counts[f["code"]] = counts.get(f["code"], 0) + 1
     out: dict[str, Any] = {"scanned": len(rows), "flagged": len(flagged), "by_code": counts,
                            "rows": flagged, "errors": [r for r in rows if r.get("error")],
-                           "note": ("只列不改。修心率錨點／建區間＝lo_update_threshold_verified"
+                           "note": ("只列不改；flags＝該修的、rows[].info＝通用軌與專項不同（多半無害）。"
+                                    "靜息＝最大（185／185 這類）在 Friel LTHR 法（method 1／2／3）"
+                                    "不影響區間，只是錨點錯值。"
+                                    "修心率錨點／建區間＝lo_update_threshold_verified"
                                     "（kind=lthr、resting_hr／max_hr、create_if_missing）；"
                                     "池長＝lo_set_pool_length；改數值前先問教練（權限邊界）。"
                                     "GENERAL_DIFFERS＝通用軌（workoutTypeId 0）與專項不同，"

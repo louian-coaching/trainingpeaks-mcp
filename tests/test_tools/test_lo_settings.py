@@ -21,7 +21,8 @@ POOL_25Y = {"options": [{"id": "DEFAULT-25Y", "length": 25.0, "units": "Yards"},
 def test_audit_flags_resting_hr_general_drift_pool_and_basic():
     r = audit_settings(ZHAO, POOL_25Y, {"tier": "basic"})
     codes = {f["code"] for f in r["flags"]}
-    assert {"HR_RESTING_GE_MAX", "GENERAL_DIFFERS", "POOL_DEFAULT_YARDS", "ACCOUNT_BASIC"} <= codes
+    assert {"HR_RESTING_GE_MAX", "POOL_DEFAULT_YARDS", "ACCOUNT_BASIC"} <= codes
+    assert [i["code"] for i in r["info"]] == ["GENERAL_DIFFERS"]   # run speed only; swim not compared
     assert "general" in r["sets"]["heartRateZones"] and "run" in r["sets"]["heartRateZones"]
 
 
@@ -29,7 +30,8 @@ def test_audit_clean_settings_no_flags():
     ok = {"heartRateZones": [{"workoutTypeId": 0, "threshold": 170, "restingHeartRate": 45, "maximumHeartRate": 190}],
           "powerZones": [{"workoutTypeId": 0, "threshold": 250}, {"workoutTypeId": 2, "threshold": 252}]}
     pool = {**POOL_25Y, "defaultId": "DEFAULT-25M"}
-    assert audit_settings(ok, pool, {"tier": "premium_coach"})["flags"] == []
+    r = audit_settings(ok, pool, {"tier": "premium_coach"})
+    assert r["flags"] == [] and r["info"] == []
 
 
 class FakeClient:

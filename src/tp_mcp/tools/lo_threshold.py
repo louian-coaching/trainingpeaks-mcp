@@ -340,16 +340,23 @@ async def lo_update_threshold_verified(
     create = group is None and create_if_missing
     method = calculation_method
     if create and method is None:
-        _, g0 = _find_group(before.get(key), 0)
-        method = (g0 or {}).get("calculationMethod")
+        # FORK 2026-11-16：心率專項區間預設用 Joe Friel 該項目的方法（全名單慣例：騎車 3、跑步 2），
+        # 不抄通用軌——Nathan 的通用軌是跑步專用 5 區（method 24），抄過去騎車區間會叫「Recovery Run」
+        hr_default = {"bike": 3, "run": 2}
+        if kind == "lthr" and hr_workout_type.lower() in hr_default:
+            method = hr_default[hr_workout_type.lower()]
+        else:
+            _, g0 = _find_group(before.get(key), 0)
+            method = (g0 or {}).get("calculationMethod")
     if group is None:
         out["warnings"] = [f"athlete has no {key} set for workoutTypeId={wtid}; the upstream tool would "
                            "fall back to the Default set (TECH-24)"
                            + (" — will CREATE it (create_if_missing)." if create else
                               " — pass create_if_missing=true to create it.")]
         if create:
-            out["create"] = {"calculation_method": method,
-                             "method_source": "argument" if calculation_method is not None else "general set"}
+            friel = kind == "lthr" and hr_workout_type.lower() in ("bike", "run")
+            src = "argument" if calculation_method is not None else ("friel default" if friel else "general set")
+            out["create"] = {"calculation_method": method, "method_source": src}
             if not isinstance(method, int):
                 out.update(isError=True, error_code="NO_CALCULATION_METHOD",
                            message="general set has no calculationMethod; pass calculation_method "
