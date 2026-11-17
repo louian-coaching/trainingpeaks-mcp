@@ -70,6 +70,102 @@ def _session_counts(summary: dict[str, Any]) -> tuple[int, int]:
     return done, total
 
 
+_TRI = {"Swim", "Bike", "Run"}
+_TRAIN = _TRI | {"Strength"}
+# 週型（2026/11/17 週檢優化）：呼叫端從速查卡判好傳進來，燈號才認得分期。
+WEEK_TYPES = {"normal": "", "off_season": "休賽", "post_race": "賽後", "race_week": "賽週",
+              "data_gap": "缺資料"}
+
+
+def _est_min(value: Any, unit: str | None) -> float:
+    """Rough minutes, for WEIGHTING only (run 5.5 min/km, swim 2 min/100 m)."""
+    if not isinstance(value, (int, float)):
+        return 0.0
+    return float(value) * {"min": 1.0, "km": 5.5, "m": 0.02}.get(unit or "", 0.0)
+
+
+_EASY_WORDS = ("輕鬆", "恢復", "休息", "活動度", "伸展", "放鬆")
+
+
+def _is_key(m: dict[str, Any]) -> bool:
+    """Swim/bike/run session that is not an easy/recovery one (by title)."""
+    return m.get("sport") in _TRI and not any(w in str(m.get("title") or "") for w in _EASY_WORDS)
+
+
+def _day_gap(a: str, b: str) -> int:
+    try:
+        return abs((dt.date.fromisoformat(a) - dt.date.fromisoformat(b)).days)
+    except ValueError:
+        return 99
+
+
+def _tag(m: dict[str, Any]) -> str:
+    return f"{str(m.get('date') or '')[5:10]} {m.get('sport')} {m.get('title') or ''}".strip()
+
+
+def _match_unplanned(
+    missed: list[dict[str, Any]], unplanned: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[tuple[dict[str, Any], dict[str, Any]]]]:
+    """Same sport on the same day — then on an adjacent day — = the planned session
+    was done, just never paired (or moved by a day).
+
+    2026/11/17: an athlete who rode 6 h read as "0/8 done, 4 added" because none of
+    his files were paired to the plan.
+    """
+    left = list(unplanned)
+    todo = list(missed)
+    matched: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for gap in (0, 1):
+        rest: list[dict[str, Any]] = []
+        for m in todo:
+            day = str(m.get("date") or "")[:10]
+            hit = next((u for u in left if u.get("sport") == m.get("sport")
+                        and _day_gap(str(u.get("date") or "")[:10], day) == gap), None)
+            if hit is None:
+                rest.append(m)
+            else:
+                left.remove(hit)
+                matched.append((m, hit))
+        todo = rest
+    return todo, left, matched
+
+
+def _volume_pct(review: dict[str, Any], matched: list[tuple[dict[str, Any], dict[str, Any]]]) -> int | None:
+    """Tri completion by VOLUME (原則五), each session capped at 100% and weighted by
+    its estimated planned minutes. Never TSS."""
+    plan = done = 0.0
+    today = str(review.get("today") or "")
+    for w in review.get("workouts") or []:
+        if w.get("sport") not in _TRI or not w.get("planned"):
+            continue
+        if today and w.get("type") != "completed" and str(w.get("date") or "")[:10] >= today:
+            continue                      # today's / future sessions are not misses yet
+        pm = _est_min(w.get("planned"), w.get("unit"))
+        plan += pm
+        if isinstance(w.get("done_pct"), (int, float)):
+            done += pm * min(float(w["done_pct"]), 100.0) / 100.0
+    for m, u in matched:
+        if m.get("sport") in _TRI:
+            done += min(_est_min(u.get("actual"), u.get("unit")), _est_min(m.get("planned"), m.get("unit")))
+    return round(100.0 * done / plan) if plan else None
+
+
+def _duplicates(review: dict[str, Any]) -> list[str]:
+    """Same day, same sport, identical actual TSS = the same file uploaded twice
+    (it double-counts ATL, so TSB reads lower than it is)."""
+    seen: set[tuple[str, Any, float]] = set()
+    dups: list[str] = []
+    for w in review.get("workouts") or []:
+        t = w.get("tss_actual")
+        if w.get("type") != "completed" or not isinstance(t, (int, float)) or t <= 0:
+            continue
+        key = (str(w.get("date") or "")[:10], w.get("sport"), round(float(t), 2))
+        if key in seen:
+            dups.append(_tag(w))
+        seen.add(key)
+    return dups
+
+
 def assess(
     review: dict[str, Any],
     prev: dict[str, Any],
@@ -78,22 +174,49 @@ def assess(
     *,
     ramp_warn_pct: float = 15.0,
     tsb_warn: float = -20.0,
+    week_type: str = "normal",
 ) -> dict[str, Any]:
-    """Pure: turn the four reads into one compact row with flags + level."""
+    """Pure: turn the four reads into one compact row with flags + level.
+
+    ``flags`` drive the level; ``notes`` are information only. ``week_type`` keeps the
+    lamp honest about periodisation: off_season = optional sessions (skipping them is
+    not a miss), post_race / race_week = the load change is not a signal, data_gap =
+    no device data, so nothing can be called missed.
+    """
+    wt = week_type if week_type in WEEK_TYPES else "normal"
     done, total = _session_counts(review)
     prev_tri = (prev.get("totals") or {}).get("tss_planned_tri", 0.0)
     tgt_tri = (target.get("totals") or {}).get("tss_planned_tri", 0.0)
     change = _pct(tgt_tri, prev_tri)
+    missed, extra, matched = _match_unplanned(review.get("missed", []), review.get("unplanned", []))
+    added_all = [u for u in extra if u.get("sport") in _TRAIN]
+    added = [u for u in added_all if _est_min(u.get("actual"), u.get("unit")) >= 15]
+    short = len(added_all) - len(added)          # warm-up / cool-down fragments
+    other = [u for u in extra if u.get("sport") not in _TRAIN]
+    dups = _duplicates(review)
     row: dict[str, Any] = {
+        "week_type": wt,
         "review": {
-            "done": done, "scheduled": total,
-            "missed": [f"{m['date'][5:]} {m['sport']} {m['title']}" for m in review.get("missed", [])],
+            "done": done + len(matched), "scheduled": total,
+            "volume_pct": _volume_pct(review, matched),
+            "missed": [_tag(m) for m in missed],
+            "matched_unplanned": [
+                f"{_tag(m)} ← {u.get('title') or u.get('sport')} {u.get('actual')}{u.get('unit') or ''}"
+                for m, u in matched],
             "incomplete": [f"{m['date'][5:]} {m['sport']} {m['title']} {m['done_pct']}%"
                            for m in review.get("incomplete", [])],
-            "unplanned": [f"{m['date'][5:]} {m['sport']} {m.get('title') or ''}".strip()
-                          for m in review.get("unplanned", [])],
+            "unplanned": [_tag(u) for u in added],
+            "other_activities": len(other),
+            "duplicates": dups,
             "pending_today": [f"{m['sport']} {m['title']}" for m in review.get("pending_today", [])],
             "tss_actual_tri": (review.get("totals") or {}).get("tss_actual_tri"),
+        },
+        "target_so_far": {
+            "done": [_tag(w) + (f" {w['done_pct']:.0f}%" if isinstance(w.get("done_pct"), (int, float)) else "")
+                     for w in target.get("workouts") or []
+                     if w.get("type") == "completed" and w.get("sport") in _TRAIN],
+            "missed": [_tag(m) for m in target.get("missed", [])],
+            "pending_today": [f"{m['sport']} {m['title']}" for m in target.get("pending_today", [])],
         },
         "load": {
             "prev_week_planned_tri": prev_tri,
@@ -104,7 +227,9 @@ def assess(
         },
     }
     flags: list[str] = []
+    notes: list[str] = []
     red = False
+    tsb: Any = None
     if fitness:
         daily = fitness.get("daily_data") or []
         cur = fitness.get("current") or {}
@@ -113,23 +238,57 @@ def assess(
             f["ctl_change_7d"] = round(f["ctl"] - daily[0]["ctl"], 1)
         row["fitness"] = f
         tsb = f.get("tsb")
-        if isinstance(tsb, (int, float)) and tsb < tsb_warn:
-            flags.append(f"TSB {tsb}")
-            red = red or tsb < tsb_warn - 10
-    n_missed = len(row["review"]["missed"])
-    if n_missed:
-        flags.append(f"漏課{n_missed}堂")
-        red = red or n_missed >= 2
-    if row["review"]["incomplete"]:
-        flags.append(f"未完成{len(row['review']['incomplete'])}堂")
-    if row["review"]["unplanned"]:
-        flags.append(f"自加{len(row['review']['unplanned'])}堂")
+    tired = isinstance(tsb, (int, float)) and tsb < tsb_warn
+    if tired:
+        flags.append(f"TSB {tsb}")
+        red = red or tsb < tsb_warn - 10
+    vol = row["review"]["volume_pct"]
+    n_missed = len(missed)
+    key_missed = [m for m in missed if _is_key(m)]
+    incomplete = review.get("incomplete", [])
+    key_incomplete = [m for m in incomplete if _is_key(m)]
+    if wt == "data_gap":
+        flags.append("資料缺口")
+    elif wt == "off_season":
+        if n_missed:
+            notes.append(f"可選課未做{n_missed}堂")
+    else:
+        # Red = the skill's own thresholds: tri volume under 70%, or two key sessions
+        # (not easy runs / strength) missed. A missed easy run is yellow, not red.
+        if n_missed:
+            flags.append(f"漏課{n_missed}堂")
+            if key_missed:
+                notes.append(f"其中關鍵課{len(key_missed)}堂")
+        # Race / post-race weeks are light by design and the race is not a planned
+        # session, so the 70% line only applies to a normal week.
+        red = red or len(key_missed) >= 2 or (wt == "normal" and vol is not None and vol < 70)
+        if key_incomplete:
+            flags.append(f"未完成{len(key_incomplete)}堂")
+        if len(incomplete) > len(key_incomplete):
+            notes.append(f"輕鬆／肌力課未滿{len(incomplete) - len(key_incomplete)}堂")
+    if added:
+        flags.append(f"自加{len(added)}堂")
+    if dups:
+        flags.append(f"疑似重複檔{len(dups)}筆")
+    if matched:
+        notes.append(f"未配對或挪日{len(matched)}堂")
+    if short:
+        notes.append(f"短活動{short}筆")
+    if other:
+        notes.append(f"其他活動{len(other)}筆")
     if change is not None and abs(change) > ramp_warn_pct:
-        flags.append(f"下週tri {change:+.0f}%")
-        red = red or change > 2 * ramp_warn_pct
+        # A bigger week is a signal only when the last one was not absorbed (volume
+        # under 85%) or the athlete is already tired; a smaller week never is.
+        strained = (vol is not None and vol < 85) or tired
+        if wt == "normal" and change > 0 and strained:
+            flags.append(f"下週tri {change:+.0f}%")
+            red = red or change > 2 * ramp_warn_pct
+        else:
+            notes.append(f"下週tri {change:+.0f}%")
     if not tgt_tri:
         flags.append("下週未排課")
     row["flags"] = flags
+    row["notes"] = notes
     row["level"] = "red" if red else ("yellow" if flags else "green")
     return row
 
@@ -137,7 +296,7 @@ def assess(
 async def _one(
     requested: str, *, review_start: str, review_end: str, prev_start: str, prev_end: str,
     target_start: str, target_end: str, today: str, incomplete_below: float,
-    ramp_warn_pct: float, tsb_warn: float, save_dir: Path | None,
+    ramp_warn_pct: float, tsb_warn: float, save_dir: Path | None, week_type: str = "normal",
 ) -> dict[str, Any]:
     from tp_mcp.tools.fitness import tp_get_fitness
     from tp_mcp.tools.lo_review import athlete_identity, summarize_workouts
@@ -169,7 +328,8 @@ async def _one(
         athlete_override.reset(token)
 
     row = {"athlete": requested, **ident,
-           **assess(review, prev, target, fitness, ramp_warn_pct=ramp_warn_pct, tsb_warn=tsb_warn)}
+           **assess(review, prev, target, fitness, ramp_warn_pct=ramp_warn_pct, tsb_warn=tsb_warn,
+                    week_type=week_type)}
     if not _name_matches(requested, ident.get("athlete_name")):
         row["flags"].insert(0, f"身分待確認：解析到 {ident.get('athlete_name')}")
         row["level"] = "red"
@@ -189,16 +349,24 @@ async def _one(
 
 def _table(rows: list[dict[str, Any]]) -> str:
     mark = {"red": "R", "yellow": "Y", "green": "G", "error": "!"}
-    lines = ["燈|選手|完成|TSB|CTLΔ7d|上週→下週 tri|旗標"]
+    lines = ["燈|選手|週型|完成|量%|TSB|CTLΔ7d|上週→下週 tri|旗標（括號＝僅供參考）|目標段已做/漏"]
     for r in rows:
         rv, ld, ft = r.get("review") or {}, r.get("load") or {}, r.get("fitness") or {}
         done = f"{rv.get('done')}/{rv.get('scheduled')}" if rv else "-"
         load = (f"{ld.get('prev_week_planned_tri'):g}→{ld.get('target_planned_tri'):g}"
                 + (f" ({ld['change_pct']:+.0f}%)" if ld.get("change_pct") is not None else "")) if ld else "-"
+        ts = r.get("target_so_far") or {}
+        notes = r.get("notes") or []
+        flag_txt = "、".join(r.get("flags") or []) or "-"
+        if notes:
+            flag_txt += "（" + "、".join(notes) + "）"
+        vol = rv.get("volume_pct") if rv else None
         lines.append("|".join([
-            mark.get(r.get("level"), "?"), str(r.get("athlete_name") or r.get("athlete")), done,
-            str(ft.get("tsb", "-")), str(ft.get("ctl_change_7d", "-")), load,
-            "、".join(r.get("flags") or []) or "-",
+            mark.get(r.get("level"), "?"), str(r.get("athlete_name") or r.get("athlete")),
+            WEEK_TYPES.get(r.get("week_type") or "normal", "") or "-", done,
+            "-" if vol is None else str(vol),
+            str(ft.get("tsb", "-")), str(ft.get("ctl_change_7d", "-")), load, flag_txt,
+            f"{len(ts.get('done') or [])}/{len(ts.get('missed') or [])}" if ts else "-",
         ]))
     return "\n".join(lines)
 
@@ -217,6 +385,8 @@ async def lo_weekly_check(
     ramp_warn_pct: float = 15.0,
     tsb_warn: float = -20.0,
     concurrency: int = 3,
+    week_types: dict[str, str] | None = None,
+    detail: str = "auto",
 ) -> dict[str, Any]:
     if not athletes:
         return {"isError": True, "error_code": "INVALID_ARGS", "message": "athletes is empty"}
@@ -230,18 +400,24 @@ async def lo_weekly_check(
     today = today or dt.date.today().isoformat()
     sd = Path(save_dir).expanduser() if save_dir else None
     sem = asyncio.Semaphore(max(1, int(concurrency)))
+    wts = {str(k).strip(): str(v) for k, v in (week_types or {}).items()}
+    bad = sorted({v for v in wts.values() if v not in WEEK_TYPES})
+    if bad:
+        return {"isError": True, "error_code": "INVALID_ARGS",
+                "message": f"week_types 只能是 {sorted(WEEK_TYPES)}，收到 {bad}"}
 
     async def run(name: str) -> dict[str, Any]:
         async with sem:
             return await _one(str(name).strip(), review_start=review_start, review_end=review_end,
                               prev_start=prev_start, prev_end=prev_end, target_start=target_start,
                               target_end=target_end, today=today, incomplete_below=incomplete_below,
-                              ramp_warn_pct=ramp_warn_pct, tsb_warn=tsb_warn, save_dir=sd)
+                              ramp_warn_pct=ramp_warn_pct, tsb_warn=tsb_warn, save_dir=sd,
+                              week_type=wts.get(str(name).strip(), "normal"))
 
     rows = await asyncio.gather(*(run(a) for a in athletes))
     order = {"error": 0, "red": 1, "yellow": 2, "green": 3}
     rows = sorted(rows, key=lambda r: order.get(r.get("level"), 9))
-    return {
+    out: dict[str, Any] = {
         "windows": {"review": [review_start, review_end], "prev_full_week": [prev_start, prev_end],
                     "target": [target_start, target_end], "today": today},
         "count": len(rows),
@@ -252,6 +428,17 @@ async def lo_weekly_check(
                  "負荷比較固定為「下週 vs 上一個完整週」、只計 tri（游騎跑），肌力/其他另列。"
                  "燈號只是分流，裁決仍由教練做。"),
     }
+    # 2026/11/17: 35 athletes' full rows were ~16k tokens of context on top of the files
+    # already written to save_dir. With save_dir the table is the response.
+    mode = detail if detail in ("table", "rows") else ("table" if sd else "rows")
+    if mode == "table":
+        out.pop("athletes")
+        out["errors"] = [r for r in rows if r.get("level") == "error"]
+        out["detail"] = ("table — 每人完整列在 save_dir/<姓名>.json 的 check 欄"
+                         if sd else "table — 沒給 save_dir，整列未落檔；要整列回傳請傳 detail='rows'")
+        if sd:
+            out["save_dir"] = str(sd)
+    return out
 
 
 async def lo_sweep_readbacks(athletes: list[str], start_date: str, end_date: str, save_dir: str,
@@ -319,9 +506,11 @@ def register_lo_weekly(tools: list[Any], handlers: dict[str, Any]) -> None:
             "(method/0 原則五 — swim metres, bike time, run distance; never TSS), missed / "
             "incomplete / unplanned sessions, TSB + 7-day CTL change, and the target week's "
             "planned tri TSS vs the PREVIOUS FULL WEEK (default target−7 days; strength/other "
-            "listed separately). Returns one compact row per athlete with flags and a "
-            "red/yellow/green level, plus a text table; full per-athlete JSON goes to "
-            "save_dir. Read-only. Athletes are resolved by name or ID like `athlete`."
+            "listed separately). Same-day same-sport unpaired files count as done; tri completion "
+            "by volume (`volume_pct`); identical-TSS duplicates flagged; sessions already done in "
+            "the target week listed (`target_so_far`). Pass `week_types` so the lamp knows the "
+            "phase. With save_dir the response is the table only (full rows in the per-athlete "
+            "JSON). Read-only. Athletes are resolved by name or ID like `athlete`."
         ),
         input_schema={
             "type": "object",
@@ -342,6 +531,14 @@ def register_lo_weekly(tools: list[Any], handlers: dict[str, Any]) -> None:
                                   "description": "Flag |target vs prev tri TSS| above this %."},
                 "tsb_warn": {"type": "number", "default": -20},
                 "concurrency": {"type": "integer", "default": 3},
+                "week_types": {"type": "object", "additionalProperties": {
+                    "type": "string", "enum": sorted(WEEK_TYPES)}, "description": (
+                    "Per athlete (key = the same string as in `athletes`), from the 速查卡: "
+                    "off_season = 休賽／自由活動週 (optional sessions are not misses), post_race / "
+                    "race_week = load change is not a signal, data_gap = watch not syncing "
+                    "(nothing is called missed). Omitted = normal.")},
+                "detail": {"type": "string", "enum": ["auto", "table", "rows"], "default": "auto",
+                           "description": "auto = table only when save_dir is given, else full rows."},
             },
             "required": ["athletes", "review_start", "review_end", "target_start", "target_end"],
         },
@@ -357,6 +554,8 @@ def register_lo_weekly(tools: list[Any], handlers: dict[str, Any]) -> None:
             ramp_warn_pct=float(args.get("ramp_warn_pct", 15)),
             tsb_warn=float(args.get("tsb_warn", -20)),
             concurrency=int(args.get("concurrency", 3)),
+            week_types=args.get("week_types") or None,
+            detail=str(args.get("detail") or "auto"),
             **{k: args.get(k) for k in keys},
         )
 

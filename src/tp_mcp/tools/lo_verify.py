@@ -876,6 +876,30 @@ async def lo_verify_intervals(
             f"(correlation {shift_info['corr_unshifted']} -> {shift_info['corr']}). "
             f"A step the athlete lengthened or cut still skews the segments after it."
         )
+    # 2026/11/17 週檢: three sessions fell back to elapsed (athlete stopped early / long
+    # warm-up) and the per-segment numbers were unusable; the answer ("3 of 5 reps
+    # done") was sitting in the device laps, one more call away.
+    if used == "elapsed" and source != "manual" and lap_info is not None:
+        try:
+            dl = device_laps(raw, points, axis)
+        except Exception:  # noqa: BLE001 — the fallback must never sink the result
+            dl = []
+        if 1 < len(dl) <= 80:
+            lap_rows: list[dict[str, Any]] = []
+            for lap in dl:
+                inside = [p for p in points
+                          if (val := _axis_value(p, axis)) is not None and lap["start"] <= val < lap["end"]]
+                st = _segment_stats(inside) if inside else {}
+                lap_rows.append({
+                    "lap": lap["n"],
+                    f"len_{'s' if axis == 'time' else 'm'}": round(lap["end"] - lap["start"]),
+                    **{k: st[k] for k in ("avg_power", "avg_speed", "avg_heartrate", "avg_cadence") if k in st},
+                })
+            out["device_laps"] = lap_rows
+            out["device_laps_note"] = (
+                "對齊退回 elapsed（分圈與處方對不上）——segments 只能當參考；"
+                "做了幾趟、每趟數字，以這份裝置分圈為準。"
+            )
     if drift_pct is not None:
         out["drift_pct"] = drift_pct
         if used == "elapsed" and abs(drift_pct) > _DRIFT_WARN * 100:

@@ -30,6 +30,7 @@ numbers.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 import logging
@@ -309,10 +310,44 @@ def append_heat_log(record: dict[str, Any]) -> str | None:
 # ---------------------------------------------------------------------------
 # Fetch
 # ---------------------------------------------------------------------------
+# 2026/11/17 週檢: five analyses fired at once each asked Open-Meteo for three points
+# and every one came back WEATHER_FETCH_FAILED, while a single call minutes later
+# worked. Two requests at a time, and a 429 / 5xx / timeout is retried twice.
+_FETCH_LIMIT = 2
+_FETCH_TRIES = 3
+_fetch_sems: dict[int, asyncio.Semaphore] = {}
+
+
+def _fetch_sem() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _fetch_sems.get(id(loop))
+    if sem is None:
+        _fetch_sems.clear()               # one live loop per server process
+        sem = _fetch_sems[id(loop)] = asyncio.Semaphore(_FETCH_LIMIT)
+    return sem
+
+
 async def _fetch(client: httpx.AsyncClient, url: str) -> dict[str, Any]:
-    r = await client.get(url)
-    r.raise_for_status()
-    return r.json()
+    last: Exception | None = None
+    for attempt in range(_FETCH_TRIES):
+        try:
+            async with _fetch_sem():
+                r = await client.get(url)
+            if r.status_code == 429 or r.status_code >= 500:
+                raise httpx.HTTPStatusError(f"HTTP {r.status_code}", request=r.request, response=r)
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code
+            if code != 429 and code < 500:
+                raise
+            last = e
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            last = e
+        if attempt + 1 < _FETCH_TRIES:
+            await asyncio.sleep(0.6 * (attempt + 1) ** 2)
+    assert last is not None
+    raise last
 
 
 def _sample_from(row: dict[str, float | None], extra: dict[str, Any]) -> dict[str, Any]:
@@ -509,6 +544,7 @@ async def weather_brief(
                 "note": "天氣抓取失敗——判讀前改跑 lo_weather_history（PROC-93）"}
     if res.get("isError"):
         return {"outdoor": None, "error": res.get("error_code"),
+                **({"reason": str(res["message"])[:200]} if res.get("message") else {}),
                 **({"fallback_urls": res["fallback_urls"]} if res.get("fallback_urls") else {}),
                 "note": "天氣抓取失敗——判讀前改跑 lo_weather_history 或用 fallback_urls（PROC-93）"}
     if not res.get("outdoor"):
