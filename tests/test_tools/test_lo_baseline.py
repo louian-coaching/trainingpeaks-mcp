@@ -65,9 +65,11 @@ async def test_baseline_reports_my_plan_vs_the_coachs_week(env):
     assert (w2["easy"], w2["rest"], w2["aerobic"]) == (1, 1, 3)
     assert out["norms"]["ratio_median"] == 1.19                 # the unedited week is left out
     assert out["norms"]["easy_plus_rest_median"] == 2
+    assert out["norms"]["weeks_used"] == ["2026-11-09"]         # the 100-TSS week is not a normal week
     assert [t["title"] for t in out["aerobic_templates_last_week"]] == ["有氧耐力", "有氧耐力", "長跑"]
     pre = out["precheck"]
     assert (pre["tri"], pre["easy"], pre["rest"]) == (140.0, 3, 2)
+    assert (pre["mine_tri"], pre["ratio"], pre["edits"]) == (140.0, 1.0, 0)
     assert len(pre["hints"]) == 2 and "5 堂" in pre["hints"][0]
 
 
@@ -78,3 +80,15 @@ async def test_no_precheck_when_the_target_week_is_empty(env):
 
 async def test_bad_date():
     assert (await lo_load_baseline("nope"))["error_code"] == "INVALID_ARGS"
+
+
+async def test_one_extra_easy_or_rest_session_is_enough_for_a_hint(env):
+    extra = [w for w in CAL if w["date"] <= "2026-11-15"]
+    extra += [_w("2026-11-16", "DayOff", "休息日"), _w("2026-11-17", "Run", "輕鬆跑", 30),
+              _w("2026-11-18", "Run", "輕鬆跑", 30), _w("2026-11-21", "Bike", "有氧耐力", 200)]   # 3 vs norm 2
+    with patch("tp_mcp.tools.workouts.tp_get_workouts",
+               AsyncMock(side_effect=lambda start_date, end_date, workout_filter="all": {
+                   "workouts": [w for w in extra if start_date <= w["date"] <= end_date]})):
+        out = await lo_load_baseline("2026-11-16", weeks=2, today="2026-11-17")
+    assert out["precheck"]["easy"] + out["precheck"]["rest"] == 3
+    assert any("輕鬆課＋休息日 3 堂" in h for h in out["precheck"]["hints"])

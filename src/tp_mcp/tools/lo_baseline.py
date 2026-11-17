@@ -150,10 +150,16 @@ async def lo_load_baseline(week_start: str, weeks: int = 4, today: str | None = 
 
     rows = [p[0] for p in past]
     last_row, last_rows = past[-1]
-    norms = {"ratio_median": _median([r["ratio"] for r in rows if r["edits"]]),
-             "easy_plus_rest_median": _median([r["easy"] + r["rest"] for r in rows]),
-             "aerobic_median": _median([r["aerobic"] for r in rows]),
-             "last_week_coach_tri": last_row["coach_tri"]}
+    # Weeks far below the latest one (before the athlete started, off-season, race week)
+    # are not what a normal week looks like — 11/17 實測: two pre-start weeks halved the
+    # aerobic-session norm of an athlete who had only trained with us for two weeks.
+    usable = [r for r in rows if r["coach_tri"] >= 0.5 * last_row["coach_tri"]] or rows
+    norms = {"ratio_median": _median([r["ratio"] for r in usable if r["edits"]]),
+             "easy_plus_rest_median": _median([r["easy"] + r["rest"] for r in usable]),
+             "aerobic_median": _median([r["aerobic"] for r in usable]),
+             "coach_tri_median": _median([r["coach_tri"] for r in usable]),
+             "last_week_coach_tri": last_row["coach_tri"],
+             "weeks_used": [r["week"] for r in usable]}
     templates = [{k: r.get(k) for k in ("id", "date", "sport", "title", "planned", "unit", "tss_planned")}
                  for r in last_rows
                  if r.get("sport") in _TRI and _has(r.get("title"), _AEROBIC_WORDS)
@@ -165,12 +171,14 @@ async def lo_load_baseline(week_start: str, weeks: int = 4, today: str | None = 
         hints: list[str] = []
         er = target_row["easy"] + target_row["rest"]
         norm = norms["easy_plus_rest_median"]
-        if norm is not None and er > norm + 1:
+        if norm is not None and er - norm >= 1:        # PROC-102 (11/17 教練裁示): 多 1 堂就提
             hints.append(f"輕鬆課＋休息日 {er} 堂，近 {weeks} 週教練改後的中位數是 {norm:g}")
         if last_row["coach_tri"] and target_row["coach_tri"] < 0.95 * last_row["coach_tri"]:
             hints.append(f"三項 {target_row['coach_tri']:g} 低於上週教練改後的 {last_row['coach_tri']:g}"
                          "（減量、比賽、賽後週屬正常）")
-        out["precheck"] = {"tri": target_row["coach_tri"], "easy": target_row["easy"],
+        out["precheck"] = {"tri": target_row["coach_tri"], "mine_tri": target_row["mine_tri"],
+                           "ratio": target_row["ratio"], "edits": target_row["edits"],
+                           "easy": target_row["easy"],
                            "rest": target_row["rest"], "aerobic": target_row["aerobic"], "hints": hints}
     out["note"] = ("coach_tri＝日曆現況（教練改後）；mine_tri＝現況扣掉 coach_edits.jsonl 記到的改動。"
                    "沒被 lo_diff_week 掃過的週 edits=0、比值不列入中位數。數字只供送審，量級與週型由教練決定。")
