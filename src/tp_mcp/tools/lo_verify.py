@@ -894,9 +894,12 @@ async def lo_verify_intervals(
                           if isinstance(p.get("time"), (int, float)) and lap["start"] <= p["time"] < lap["end"]]
                 st = _segment_stats(inside) if inside else {}
                 lap_row: dict[str, Any] = {"lap": lap["n"], "len_s": round(lap["end"] - lap["start"])}
-                dist = [p["Distance"] for p in inside if isinstance(p.get("Distance"), (int, float))]
-                if len(dist) >= 2:
-                    lap_row["km"] = round(max(dist) - min(dist), 2)
+                # first-to-last, zeros dropped: a pause writes a 0 into the distance channel and
+                # max-min then reads a 131 s rest as 7.16 km (11/17 實測).
+                dist = [p["Distance"] for p in inside
+                        if isinstance(p.get("Distance"), (int, float)) and p["Distance"] > 0]
+                if len(dist) >= 2 and dist[-1] >= dist[0]:
+                    lap_row["km"] = round(dist[-1] - dist[0], 2)
                 lap_row.update({k: st[k] for k in ("avg_power", "avg_speed", "avg_heartrate", "avg_cadence")
                                 if k in st})
                 lap_rows.append(lap_row)
