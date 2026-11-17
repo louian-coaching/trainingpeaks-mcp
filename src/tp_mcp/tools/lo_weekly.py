@@ -327,23 +327,30 @@ async def _one(
     finally:
         athlete_override.reset(token)
 
-    row = {"athlete": requested, **ident,
-           **assess(review, prev, target, fitness, ramp_warn_pct=ramp_warn_pct, tsb_warn=tsb_warn,
-                    week_type=week_type)}
-    if not _name_matches(requested, ident.get("athlete_name")):
-        row["flags"].insert(0, f"身分待確認：解析到 {ident.get('athlete_name')}")
-        row["level"] = "red"
-    if save_dir is not None:
-        save_dir.mkdir(parents=True, exist_ok=True)
-        p = save_dir / f"{_slug(str(ident.get('athlete_name') or requested))}.json"
-        p.write_text(json.dumps({"athlete": requested, **ident, "today": today,
-                                 "windows": {"review": [review_start, review_end],
-                                             "prev_full_week": [prev_start, prev_end],
-                                             "target": [target_start, target_end]},
-                                 "review": review, "prev_full_week": prev, "target": target,
-                                 "fitness": fitness, "check": row},
-                                ensure_ascii=False, indent=1), encoding="utf-8")
-        row["saved_to"] = str(p)
+    # 11/17: one batch right after a restart died with a bare 'internal error' — whatever goes
+    # wrong past this point now comes back as that athlete's error row, with the reason.
+    try:
+        row = {"athlete": requested, **ident,
+               **assess(review, prev, target, fitness, ramp_warn_pct=ramp_warn_pct, tsb_warn=tsb_warn,
+                        week_type=week_type)}
+        if not _name_matches(requested, ident.get("athlete_name")):
+            row["flags"].insert(0, f"身分待確認：解析到 {ident.get('athlete_name')}")
+            row["level"] = "red"
+        if save_dir is not None:
+            save_dir.mkdir(parents=True, exist_ok=True)
+            p = save_dir / f"{_slug(str(ident.get('athlete_name') or requested))}.json"
+            p.write_text(json.dumps({"athlete": requested, **ident, "today": today,
+                                     "windows": {"review": [review_start, review_end],
+                                                 "prev_full_week": [prev_start, prev_end],
+                                                 "target": [target_start, target_end]},
+                                     "review": review, "prev_full_week": prev, "target": target,
+                                     "fitness": fitness, "check": row},
+                                    ensure_ascii=False, indent=1), encoding="utf-8")
+            row["saved_to"] = str(p)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("weekly check assess/save failed for %s", requested)
+        return {"athlete": requested, **ident, "level": "error",
+                "flags": [f"判讀或存檔失敗：{type(e).__name__}: {e}"]}
     return row
 
 

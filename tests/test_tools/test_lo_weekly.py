@@ -190,3 +190,16 @@ async def test_with_save_dir_the_response_is_the_table_only(patched, tmp_path):
     bad = await lo_weekly_check(["Alice"], "2026-09-28", "2026-10-03", "2026-10-05", "2026-10-11",
                                 week_types={"Alice": "holiday"})
     assert bad["error_code"] == "INVALID_ARGS"
+
+
+@pytest.mark.asyncio
+async def test_a_failure_while_assessing_is_an_error_row_with_the_reason(patched, monkeypatch):
+    from tp_mcp.tools import lo_weekly
+
+    def boom(*a, **k):
+        raise ValueError("bad row")
+    monkeypatch.setattr(lo_weekly, "assess", boom)
+    out = await lo_weekly_check(["Alice"], "2026-09-28", "2026-10-03", "2026-10-05", "2026-10-11",
+                                today="2026-10-03")
+    row = out["athletes"][0]
+    assert row["level"] == "error" and "ValueError: bad row" in row["flags"][0]

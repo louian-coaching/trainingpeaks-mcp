@@ -881,20 +881,25 @@ async def lo_verify_intervals(
     # done") was sitting in the device laps, one more call away.
     if used == "elapsed" and source != "manual" and lap_info is not None:
         try:
-            dl = device_laps(raw, points, axis)
+            # Always on the clock: converting lap times to distance drifts as soon as the
+            # athlete stands still between reps (11/17 實測: a 0.8 km rep read as 266 W
+            # instead of 298 W, and an 89 s rest as 7160 m).
+            dl = device_laps(raw, points, "time")
         except Exception:  # noqa: BLE001 — the fallback must never sink the result
             dl = []
         if 1 < len(dl) <= 80:
             lap_rows: list[dict[str, Any]] = []
             for lap in dl:
                 inside = [p for p in points
-                          if (val := _axis_value(p, axis)) is not None and lap["start"] <= val < lap["end"]]
+                          if isinstance(p.get("time"), (int, float)) and lap["start"] <= p["time"] < lap["end"]]
                 st = _segment_stats(inside) if inside else {}
-                lap_rows.append({
-                    "lap": lap["n"],
-                    f"len_{'s' if axis == 'time' else 'm'}": round(lap["end"] - lap["start"]),
-                    **{k: st[k] for k in ("avg_power", "avg_speed", "avg_heartrate", "avg_cadence") if k in st},
-                })
+                lap_row: dict[str, Any] = {"lap": lap["n"], "len_s": round(lap["end"] - lap["start"])}
+                dist = [p["Distance"] for p in inside if isinstance(p.get("Distance"), (int, float))]
+                if len(dist) >= 2:
+                    lap_row["km"] = round(max(dist) - min(dist), 2)
+                lap_row.update({k: st[k] for k in ("avg_power", "avg_speed", "avg_heartrate", "avg_cadence")
+                                if k in st})
+                lap_rows.append(lap_row)
             out["device_laps"] = lap_rows
             out["device_laps_note"] = (
                 "對齊退回 elapsed（分圈與處方對不上）——segments 只能當參考；"
