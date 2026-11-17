@@ -1696,6 +1696,7 @@ _ATHLETE_PARAM = {
 # Registered here, before the athlete-param injection and the metadata loop,
 # so both treat them like every other tool; handlers are merged into
 # _TOOL_HANDLERS right after it is created.
+from tp_mcp.tools.lo_baseline import register_lo_baseline  # noqa: E402
 from tp_mcp.tools.lo_capability import register_lo_capability  # noqa: E402
 from tp_mcp.tools.lo_review import register_lo_review  # noqa: E402
 from tp_mcp.tools.lo_sth import LO_STH_TOOLS, register_lo_sth  # noqa: E402
@@ -1715,6 +1716,30 @@ from tp_mcp.tools.lo_weekly import register_lo_weekly  # noqa: E402
 from tp_mcp.tools.lo_plans import register_lo_plans  # noqa: E402
 
 _LO_HANDLERS: dict[str, Any] = {}
+
+
+def _write_tool_error(name: str) -> str | None:
+    """Append the current traceback to _scratch/logs/tool_errors.log (capped at ~1 MB)."""
+    import datetime as _dt
+    import re as _re
+    import traceback as _tb
+    from pathlib import Path as _Path
+    try:
+        scratch = _Path.home() / "trainingpeaks-mcp" / "_scratch"
+        if not scratch.is_dir():
+            return None
+        path = scratch / "logs" / "tool_errors.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        old = path.read_text(encoding="utf-8") if path.exists() else ""
+        if len(old) > 1_000_000:
+            old = old[-500_000:]
+        stamp = _dt.datetime.now().isoformat(timespec="seconds")
+        # token-shaped runs (40+ url-safe chars) never go to a file a session can read
+        body = _re.sub(r"[A-Za-z0-9_\-\.=%]{40,}", "<redacted>", _tb.format_exc())
+        path.write_text(old + f"\n=== {stamp} {name}\n{body}", encoding="utf-8")
+        return str(path)
+    except OSError:
+        return None
 register_lo_tools(TOOLS, _LO_HANDLERS)
 register_lo_strength(TOOLS, _LO_HANDLERS)
 register_lo_review(TOOLS, _LO_HANDLERS)
@@ -1732,6 +1757,7 @@ register_lo_weather(TOOLS, _LO_HANDLERS)  # FORK 2026-10-17: 歷史天氣 PROC-9
 register_lo_forecast(TOOLS, _LO_HANDLERS)  # FORK 2026-10-21: 預報 PROC-85b
 register_lo_race(TOOLS, _LO_HANDLERS)  # FORK 2026-11-02: 鐵人複盤 PROC-41g
 register_lo_plans(TOOLS, _LO_HANDLERS)  # FORK 2026-11-12: 訓練計劃建立／寫課／改課
+register_lo_baseline(TOOLS, _LO_HANDLERS)  # FORK 2026-11-17: 建課前置——教練改後的量級與課型常態
 _ATHLETE_EXEMPT_TOOLS |= set(LO_STH_TOOLS) | set(LO_STH_EXT_TOOLS) | set(LO_STH_MORE_TOOLS)  # STH 用 tri_user_id，不吃 TP athlete
 _ATHLETE_EXEMPT_TOOLS.add("lo_weekly_check")  # takes its own `athletes` list
 _ATHLETE_EXEMPT_TOOLS.add("lo_version")  # local, not athlete-scoped
@@ -1845,7 +1871,7 @@ def _dump_and_summarize(name: str, result: Any, save_to: str) -> dict[str, Any]:
 
 _READ_ONLY_PREFIXES = ("tp_get_", "tp_list_", "tp_download_", "tp_search_", "tp_validate_", "tp_analyze_")
 _READ_ONLY_EXTRA = {  # FORK: lo_ read tools
-    "tp_auth_status", "lo_get_week_for_validate", "lo_diff_week", "lo_weekly_check",
+    "tp_auth_status", "lo_get_week_for_validate", "lo_diff_week", "lo_weekly_check", "lo_load_baseline",
     "lo_version", "lo_capability_scan", "lo_weather_history", "lo_weather_forecast",
     "lo_plan_get_workouts",
 }
@@ -2593,13 +2619,24 @@ async def call_tool(name: str, arguments: dict[str, Any] | None = None) -> list[
 
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
-    except Exception:
+    except Exception as e:
         logger.exception("Error in tool %s", name)
+        # FORK 2026-11-17: "Check server logs" was a dead end — the logs are not readable
+        # from the session that hit the error. Say what it was and keep the traceback.
         error_result = {
             "isError": True,
             "error_code": "API_ERROR",
-            "message": "An internal error occurred. Check server logs.",
+            # str(e) stays out of the response on purpose (upstream contract: an exception
+            # text can carry a secret). The class name and the log path are enough to find it.
+            "message": f"An internal error occurred in {name} ({type(e).__name__}).",
+            "error_type": type(e).__name__,
         }
+        _log_path = _write_tool_error(name)
+        if _log_path:
+            error_result["error_log"] = _log_path
+            error_result["message"] += f" Traceback: {_log_path}"
+        else:
+            error_result["message"] += " Check server logs."
         return [TextContent(type="text", text=json.dumps(error_result, indent=2))]
     finally:
         athlete_override.reset(token)

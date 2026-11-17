@@ -476,6 +476,10 @@ async def lo_update_threshold_verified(
         if kind == "lthr" and (max_hr or resting_hr) and g_after:
             out["anchors"] = {"maximumHeartRate": g_after.get("maximumHeartRate"),
                               "restingHeartRate": g_after.get("restingHeartRate")}
+            # 2026/11/17: resting HR read back 0 after a max-HR-only write and nothing in
+            # the response said whether it had been 0 before.
+            out["anchors_before"] = {"maximumHeartRate": (group or {}).get("maximumHeartRate"),
+                                     "restingHeartRate": (group or {}).get("restingHeartRate")}
 
     # Second half: sessions already built with the old numbers.
     start = today or dt.date.today().isoformat()

@@ -927,6 +927,11 @@ async def lo_verify_intervals(
                                 if k in st})
                 lap_rows.append(lap_row)
             out["device_laps"] = lap_rows
+            if align == "auto":
+                # the misaligned prescription rows were most of the payload and none of the answer
+                out["segments"] = [{k: r[k] for k in ("name", "samples") if k in r} for r in rows]
+                out["segments_note"] = ("對齊失敗，處方分段只留名稱與樣本數；要完整分段請明確傳 "
+                                        "align='elapsed' 或 'scale'。")
             out["device_laps_note"] = (
                 "對齊退回 elapsed（分圈與處方對不上）——segments 只能當參考；"
                 "做了幾趟、每趟數字，以這份裝置分圈為準。"

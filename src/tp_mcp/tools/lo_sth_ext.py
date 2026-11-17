@@ -843,7 +843,58 @@ async def lo_sth_verify_intervals(tri_user_id: str, activity_id: str, class_sche
 # ---------------------------------------------------------------------------
 # 註冊
 # ---------------------------------------------------------------------------
-LO_STH_EXT_TOOLS = ("lo_sth_prep_week", "lo_sth_update_verified", "lo_sth_diff_week", "lo_sth_verify_intervals")
+async def lo_sth_prep_weeks(tri_user_ids: list[str], week_start: str, save_root: str, history_days: int = 7,
+                            template_days: int = 7, intervals: bool = False, concurrency: int = 2,
+                            time_budget_s: float = 55.0, client_factory=_default_factory) -> dict[str, Any]:
+    """``lo_sth_prep_week`` for several athletes in one call (週檢 / batch prep).
+
+    2026/11/17: five single calls fired together and three of them outlived the 80 s
+    bridge timeout. Here two run at a time and nobody is started once ``time_budget_s``
+    is spent — those come back under ``pending`` for the next call, so the call itself
+    always returns in time. Each athlete's files go to ``save_root/<first 8 of id>/``.
+    """
+    import asyncio
+    import time
+    from pathlib import Path
+
+    ids = [str(u).strip() for u in (tri_user_ids or []) if str(u).strip()]
+    if not ids:
+        return {"isError": True, "error_code": "INVALID_ARGS", "message": "tri_user_ids is empty"}
+    root = Path(save_root).expanduser()
+    sem = asyncio.Semaphore(max(1, min(int(concurrency), 3)))
+    t0 = time.monotonic()
+
+    async def one(uid: str) -> dict[str, Any]:
+        async with sem:
+            if time.monotonic() - t0 > time_budget_s:
+                return {"tri_user_id": uid, "pending": True}
+            try:
+                r = await lo_sth_prep_week(uid, week_start, str(root / uid[:8]), history_days, template_days,
+                                           client_factory=client_factory, intervals=intervals)
+            except Exception as e:  # noqa: BLE001 — one athlete never sinks the batch
+                return {"tri_user_id": uid, "isError": True, "message": f"{type(e).__name__}: {e}"}
+            if not isinstance(r, dict) or r.get("isError"):
+                return {"tri_user_id": uid, "isError": True,
+                        "message": str((r or {}).get("message") or (r or {}).get("error_code") or r)[:300]}
+            sm = r.get("summary") or {}
+            return {"tri_user_id": uid, "digest_file": r.get("digest_file"),
+                    "planned_past": sm.get("planned_past"), "done": sm.get("done"),
+                    "missed": sm.get("missed") or [], "unplanned": sm.get("unplanned") or [],
+                    "last_swim": sm.get("last_swim"), "red_flags": sm.get("red_flags") or [],
+                    "next_week_sessions": len(sm.get("next_week_existing") or [])}
+
+    rows = await asyncio.gather(*(one(u) for u in ids))
+    pending = [r["tri_user_id"] for r in rows if r.get("pending")]
+    return {"week_start": week_start, "history_days": history_days, "count": len(ids),
+            "athletes": [r for r in rows if not r.get("pending")],
+            "pending": pending,
+            "elapsed_s": round(time.monotonic() - t0, 1),
+            "next": ("再呼叫一次，tri_user_ids 只帶 pending 那幾位" if pending
+                     else "逐堂明細在各人的 digest_file（plan_vs_actual／health_daily）")}
+
+
+LO_STH_EXT_TOOLS = ("lo_sth_prep_week", "lo_sth_prep_weeks", "lo_sth_update_verified", "lo_sth_diff_week",
+                    "lo_sth_verify_intervals")
 
 
 def register_lo_sth_ext(tools: list[Any], handlers: dict[str, Any]) -> None:
@@ -860,6 +911,19 @@ def register_lo_sth_ext(tools: list[Any], handlers: dict[str, Any]) -> None:
             "history_days": {"type": "integer", "default": 14}, "template_days": {"type": "integer", "default": 7},
             "intervals": {"type": "boolean", "default": True, "description": "質量課逐段驗收（每堂多抓一次逐秒時序）"}},
             "required": ["tri_user_id", "week_start", "save_dir"]}))
+    tools.append(Tool(name="lo_sth_prep_weeks", description=(
+        "多位 StrongTri 選手一次跑 lo_sth_prep_week（週檢／批次前置）：兩位並行、超過 time_budget_s 就不再開新的，"
+        "沒輪到的列在 pending，下一次只帶 pending 再呼叫。每人一列精簡摘要（已排／完成／漏課／未排活動／最後下水／red_flags），"
+        "逐堂明細在各人的 digest_file。預設 history_days=7、intervals=false（週檢用；排課前置請傳 14 與 true）。"),
+        input_schema={"type": "object", "properties": {
+            "tri_user_ids": {"type": "array", "items": {"type": "string"}, "description": "速查卡〈身分〉的 triUserId"},
+            "week_start": {"type": "string", "description": "檢視段之後的那個週一 YYYY-MM-DD"},
+            "save_root": {"type": "string", "description": "Mac 上的資料夾；每人存到 <save_root>/<id 前 8 碼>/"},
+            "history_days": {"type": "integer", "default": 7}, "template_days": {"type": "integer", "default": 7},
+            "intervals": {"type": "boolean", "default": False},
+            "concurrency": {"type": "integer", "default": 2, "description": "上限 3"},
+            "time_budget_s": {"type": "number", "default": 55}},
+            "required": ["tri_user_ids", "week_start", "save_root"]}))
     tools.append(Tool(name="lo_sth_update_verified", description=(
         "StrongTri 改課一步（10/02 提速 B）：`text`（summary／trainingAdvice／title）走 preview→token→patch→讀回逐字比對、確認結構沒動；"
         "`classes_json_file` 走整份替換：自動找 scheduleRef／athleteRef→dry-run 取版本→寫→classesJsonMatches＋獨立讀回比對結構與文字。"
@@ -911,5 +975,10 @@ def register_lo_sth_ext(tools: list[Any], handlers: dict[str, Any]) -> None:
                                                              a.get("classes_json_file"), float(a.get("work_pct", 85)),
                                                              a.get("save_to"))
 
+    async def _h_preps(a): return await lo_sth_prep_weeks(list(a.get("tri_user_ids") or []), a["week_start"], a["save_root"],
+                                                          int(a.get("history_days", 7)), int(a.get("template_days", 7)),
+                                                          bool(a.get("intervals", False)), int(a.get("concurrency", 2)),
+                                                          float(a.get("time_budget_s", 55)))
+    handlers.update({"lo_sth_prep_weeks": _h_preps})
     handlers.update({"lo_sth_prep_week": _h_prep, "lo_sth_update_verified": _h_upd, "lo_sth_diff_week": _h_diff,
                      "lo_sth_verify_intervals": _h_iv})

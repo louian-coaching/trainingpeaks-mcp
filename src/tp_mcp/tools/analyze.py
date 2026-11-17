@@ -47,7 +47,36 @@ logger = logging.getLogger("tp-mcp")
 
 ANALYSIS_API_BASE = "https://api.peakswaresb.com"
 ANALYSIS_TIMEOUT = 60.0
-ANALYSIS_DATA_DIR = Path(tempfile.gettempdir()) / "tp-mcp" / "analysis"
+ANALYSIS_KEEP = 60
+
+
+def _analysis_dir() -> Path:
+    """Where the full dumps go.
+
+    2026/11/17: the dumps lived in the server process's temp dir, so nothing outside
+    the server could replay a real session — a one-line fix to lo_verify_intervals
+    took four commit + restart rounds. ``_scratch`` is readable from the Cowork VM.
+    """
+    env = os.environ.get("TP_MCP_ANALYSIS_DIR")
+    if env:
+        return Path(env).expanduser()
+    scratch = Path.home() / "trainingpeaks-mcp" / "_scratch"
+    if scratch.is_dir():
+        return scratch / "analysis"
+    return Path(tempfile.gettempdir()) / "tp-mcp" / "analysis"
+
+
+def _prune(folder: Path, keep: int = ANALYSIS_KEEP) -> None:
+    """Keep the newest ``keep`` dumps (each is ~1 MB)."""
+    try:
+        files = sorted(folder.glob("workout_*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+        for old in files[keep:]:
+            old.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+ANALYSIS_DATA_DIR = _analysis_dir()
 
 _SUMMARY_PATH = "/workout-analysis/v2/analyze/summary"
 _CHARTS_PATH = "/workout-analysis/v2/analyze/charts"
@@ -88,6 +117,7 @@ def _save_analysis_json(
     else:
         ANALYSIS_DATA_DIR.mkdir(parents=True, exist_ok=True)
         filepath = ANALYSIS_DATA_DIR / f"workout_{workout_id}.json"
+        _prune(ANALYSIS_DATA_DIR)
     filepath.write_text(json.dumps(data, indent=2))
     return str(filepath)
 
