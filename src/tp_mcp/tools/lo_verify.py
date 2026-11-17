@@ -410,6 +410,32 @@ def _time_to_axis(points: list[dict[str, Any]], axis: str):
     return at
 
 
+_LAP_KM_MAX_KM_PER_S = 0.03   # 108 km/h — anything faster is a glitch in the distance channel
+
+
+def _lap_km(points: list[dict[str, Any]]) -> float | None:
+    """Distance covered inside one lap = the sum of plausible forward steps.
+
+    After a pause the distance channel can drop to ~0 for a sample and jump back
+    (11/17 實測: a 131 s rest read 7.16 km by max-min and by first-to-last alike).
+    Backward steps and steps faster than 108 km/h are left out.
+    """
+    total = 0.0
+    prev: tuple[float, float] | None = None
+    seen = False
+    for p in points:
+        d, t = p.get("Distance"), p.get("time")
+        if not isinstance(d, (int, float)) or not isinstance(t, (int, float)):
+            continue
+        if prev is not None:
+            step, dt_s = d - prev[0], t - prev[1]
+            if step > 0 and dt_s > 0 and step / dt_s <= _LAP_KM_MAX_KM_PER_S:
+                total += step
+                seen = True
+        prev = (float(d), float(t))
+    return round(total, 2) if seen else None
+
+
 def device_laps(raw: dict[str, Any], points: list[dict[str, Any]],
                 axis: str) -> list[dict[str, Any]]:
     """Device laps as ``[{n, start, end}]`` on the alignment axis.
@@ -894,12 +920,9 @@ async def lo_verify_intervals(
                           if isinstance(p.get("time"), (int, float)) and lap["start"] <= p["time"] < lap["end"]]
                 st = _segment_stats(inside) if inside else {}
                 lap_row: dict[str, Any] = {"lap": lap["n"], "len_s": round(lap["end"] - lap["start"])}
-                # first-to-last, zeros dropped: a pause writes a 0 into the distance channel and
-                # max-min then reads a 131 s rest as 7.16 km (11/17 實測).
-                dist = [p["Distance"] for p in inside
-                        if isinstance(p.get("Distance"), (int, float)) and p["Distance"] > 0]
-                if len(dist) >= 2 and dist[-1] >= dist[0]:
-                    lap_row["km"] = round(dist[-1] - dist[0], 2)
+                km = _lap_km(inside)
+                if km is not None:
+                    lap_row["km"] = km
                 lap_row.update({k: st[k] for k in ("avg_power", "avg_speed", "avg_heartrate", "avg_cadence")
                                 if k in st})
                 lap_rows.append(lap_row)
