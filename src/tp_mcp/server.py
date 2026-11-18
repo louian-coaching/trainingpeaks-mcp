@@ -1713,6 +1713,7 @@ from tp_mcp.tools.lo_weather import register_lo_weather  # noqa: E402
 from tp_mcp.tools.lo_forecast import register_lo_forecast  # noqa: E402
 from tp_mcp.tools.lo_race import register_lo_race  # noqa: E402
 from tp_mcp.tools.lo_weekly import register_lo_weekly  # noqa: E402
+from tp_mcp.tools.lo_plan_strength import register_lo_plan_strength  # noqa: E402
 from tp_mcp.tools.lo_plans import register_lo_plans  # noqa: E402
 
 _LO_HANDLERS: dict[str, Any] = {}
@@ -1757,6 +1758,7 @@ register_lo_weather(TOOLS, _LO_HANDLERS)  # FORK 2026-10-17: 歷史天氣 PROC-9
 register_lo_forecast(TOOLS, _LO_HANDLERS)  # FORK 2026-10-21: 預報 PROC-85b
 register_lo_race(TOOLS, _LO_HANDLERS)  # FORK 2026-11-02: 鐵人複盤 PROC-41g
 register_lo_plans(TOOLS, _LO_HANDLERS)  # FORK 2026-11-12: 訓練計劃建立／寫課／改課
+register_lo_plan_strength(TOOLS, _LO_HANDLERS)  # FORK 2026-11-18: 計劃裡的 Strength Builder 課
 register_lo_baseline(TOOLS, _LO_HANDLERS)  # FORK 2026-11-17: 建課前置——教練改後的量級與課型常態
 _ATHLETE_EXEMPT_TOOLS |= set(LO_STH_TOOLS) | set(LO_STH_EXT_TOOLS) | set(LO_STH_MORE_TOOLS)  # STH 用 tri_user_id，不吃 TP athlete
 _ATHLETE_EXEMPT_TOOLS.add("lo_weekly_check")  # takes its own `athletes` list
@@ -1768,6 +1770,7 @@ _ATHLETE_EXEMPT_TOOLS |= {
     "tp_list_training_plans", "tp_get_training_plan", "tp_get_training_plan_workouts",
     "lo_plan_get_workouts", "lo_plan_create", "lo_plan_update_meta", "lo_plan_add_workouts",
     "lo_plan_update_workout", "lo_plan_delete_workouts", "lo_plan_replace_workouts",
+    "lo_plan_get_strength_workouts", "lo_plan_add_strength_workouts",  # FORK 2026-11-18
 }
 
 for _tool in TOOLS:
@@ -1873,7 +1876,7 @@ _READ_ONLY_PREFIXES = ("tp_get_", "tp_list_", "tp_download_", "tp_search_", "tp_
 _READ_ONLY_EXTRA = {  # FORK: lo_ read tools
     "tp_auth_status", "lo_get_week_for_validate", "lo_diff_week", "lo_weekly_check", "lo_load_baseline",
     "lo_version", "lo_capability_scan", "lo_weather_history", "lo_weather_forecast",
-    "lo_plan_get_workouts",
+    "lo_plan_get_workouts", "lo_plan_get_strength_workouts",
 }
 
 # Irrecoverable data removal. Everything else that writes is recoverable by a
@@ -1921,6 +1924,7 @@ _NON_IDEMPOTENT_WRITES = {
     # FORK 2026-11-12: lo_plan_create refuses a duplicate title and lo_plan_add_workouts
     # skips same day + sport + title by default, but both append when told not to.
     "lo_plan_create", "lo_plan_add_workouts", "lo_plan_replace_workouts",
+    "lo_plan_add_strength_workouts",  # FORK 2026-11-18: same day + title is skipped by default
 }
 
 _TITLE_ACRONYMS = {"atp": "ATP", "ftp": "FTP", "hr": "HR", "prs": "PRs"}

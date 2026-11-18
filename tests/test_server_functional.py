@@ -78,6 +78,8 @@ class TestListTools:
             "lo_plan_update_workout",
             "lo_plan_delete_workouts",
             "lo_plan_replace_workouts",  # FORK 2026-11-16
+            "lo_plan_get_strength_workouts",  # FORK 2026-11-18
+            "lo_plan_add_strength_workouts",
             "lo_sth_call",
             "lo_sth_calc_loads",
             "lo_sth_create_week",
